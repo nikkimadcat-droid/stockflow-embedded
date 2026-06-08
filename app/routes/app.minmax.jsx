@@ -105,6 +105,7 @@ export const action = async ({ request }) => {
   const updates = JSON.parse(formData.get("updates"));
 
   for (const u of updates) {
+    // Save the main update
     await prisma.minMax.upsert({
       where: {
         shop_variantId_locationId: {
@@ -127,6 +128,20 @@ export const action = async ({ request }) => {
         casePackSize: parseInt(u.casePackSize) || 1,
       },
     });
+
+    // Sync case pack to all other locations for this variant
+    if (u.casePackSize) {
+      await prisma.minMax.updateMany({
+        where: {
+          shop,
+          variantId: u.variantId,
+          NOT: { locationId: u.locationId },
+        },
+        data: {
+          casePackSize: parseInt(u.casePackSize) || 1,
+        },
+      });
+    }
   }
 
   return { ok: true };
@@ -152,9 +167,16 @@ export default function MinMax() {
   const getValue = (variantId, field) => {
     const key = getKey(variantId, selectedLocation);
     if (edits[key]?.[field] !== undefined) return edits[key][field];
+    if (field === "casePackSize") {
+      const anyLocation = Object.values(minMaxMap).find(
+        mm => mm.variantId === variantId && mm.casePackSize > 1
+      );
+      if (anyLocation) return String(anyLocation.casePackSize);
+      return "1";
+    }
     const saved = minMaxMap[key];
     if (saved) return String(saved[field]);
-    return field === "casePackSize" ? "1" : "0";
+    return "0";
   };
 
   const handleChange = useCallback((variantId, field, value) => {

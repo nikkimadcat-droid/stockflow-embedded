@@ -136,9 +136,16 @@ export default function MinMax() {
   const { locations, products, minMaxMap, invMap } = useLoaderData();
   const fetcher = useFetcher();
   const [selectedLocation, setSelectedLocation] = useState(locations[0]?.id || "");
+  const [selectedVendor, setSelectedVendor] = useState("");
   const [edits, setEdits] = useState({});
 
   const locationOptions = locations.map(l => ({ label: l.name, value: l.id }));
+
+  const vendors = [...new Set(products.map(p => p.vendor).filter(Boolean))].sort();
+  const vendorOptions = [
+    { label: "All vendors", value: "" },
+    ...vendors.map(v => ({ label: v, value: v })),
+  ];
 
   const getKey = (variantId, locationId) => `${variantId}__${locationId}`;
 
@@ -158,7 +165,7 @@ export default function MinMax() {
     }));
   }, [selectedLocation]);
 
- const handleSave = () => {
+  const handleSave = () => {
     const updates = [];
     for (const [key, fields] of Object.entries(edits)) {
       const [variantId, locationId] = key.split("__");
@@ -192,6 +199,10 @@ export default function MinMax() {
 
   const saved = fetcher.state === "idle" && fetcher.data?.ok;
 
+  const filteredProducts = selectedVendor
+    ? products.filter(p => p.vendor === selectedVendor)
+    : products;
+
   return (
     <Page
       title="Min / Max Levels"
@@ -216,6 +227,12 @@ export default function MinMax() {
                 value={selectedLocation}
                 onChange={setSelectedLocation}
               />
+              <Select
+                label="Vendor"
+                options={vendorOptions}
+                value={selectedVendor}
+                onChange={setSelectedVendor}
+              />
               <div style={{ overflowX: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead>
@@ -228,7 +245,7 @@ export default function MinMax() {
                     </tr>
                   </thead>
                   <tbody>
-                    {products.flatMap(p =>
+                    {filteredProducts.flatMap(p =>
                       p.variants.edges.map(({ node: v }) => {
                         const onHand = getOnHand(v.id);
                         const status = getStatus(v.id, onHand);

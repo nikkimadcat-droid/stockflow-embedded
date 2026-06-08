@@ -1,21 +1,50 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:dev.sqlite"
+}
+
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
 model MinMax {
-  id             String   @id @default(cuid())
-  shop           String
-  variantId      String
-  locationId     String
-  minLevel       Int      @default(0)
-  maxLevel       Int      @default(0)
-  casePackSize   Int      @default(1)
-  updatedAt      DateTime @updatedAt
+  id           String   @id @default(cuid())
+  shop         String
+  variantId    String
+  locationId   String
+  minLevel     Int      @default(0)
+  maxLevel     Int      @default(0)
+  casePackSize Int      @default(1)
+  updatedAt    DateTime @updatedAt
 
   @@unique([shop, variantId, locationId])
 }
 
 model Supplier {
-  id        String   @id @default(cuid())
+  id        String        @id @default(cuid())
   shop      String
   name      String
-  createdAt DateTime @default(now())
+  createdAt DateTime      @default(now())
   skus      SupplierSku[]
 }
 
@@ -27,14 +56,7 @@ model Vendor {
 }
 
 model SupplierSku {
-  id            String   @id @default(cuid())
-  shop          String
-  supplierId    String
-  supplier      Supplier @relation(fields: [supplierId], references: [id])
-  variantId     String
-  supplierCode  String
-  cost          Float
-  updatedAt     DateTime @updatedAt
-
-  @@unique([supplierId, variantId])
-}
+  id           String   @id @default(cuid())
+  shop         String
+  supplierId   String
+  supplier     Supplier @relation(fields: [supplierId], references: [id])

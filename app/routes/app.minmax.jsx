@@ -26,7 +26,7 @@ import { useState, useCallback } from "react";export const loader = async ({ req
   const locData = await locResponse.json();
   const locations = locData.data.locations.edges.map(e => e.node);
 
-  const prodResponse = await admin.graphql(`
+ const prodResponse = await admin.graphql(`
     query {
       products(first: 250) {
         edges {
@@ -39,6 +39,20 @@ import { useState, useCallback } from "react";export const loader = async ({ req
                 node {
                   id
                   sku
+                  inventoryItem {
+                    id
+                    inventoryLevels(first: 10) {
+                      edges {
+                        node {
+                          location { id name }
+                          quantities(names: ["available"]) {
+                            name
+                            quantity
+                          }
+                        }
+                      }
+                    }
+                  }
                 }
               }
             }

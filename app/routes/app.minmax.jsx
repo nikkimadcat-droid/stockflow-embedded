@@ -158,16 +158,17 @@ export default function MinMax() {
     }));
   }, [selectedLocation]);
 
-  const handleSave = () => {
+ const handleSave = () => {
     const updates = [];
     for (const [key, fields] of Object.entries(edits)) {
       const [variantId, locationId] = key.split("__");
+      const saved = minMaxMap[key];
       updates.push({
         variantId,
         locationId,
-        minLevel: fields.minLevel ?? "0",
-        maxLevel: fields.maxLevel ?? "0",
-        casePackSize: fields.casePackSize ?? "1",
+        minLevel: fields.minLevel ?? saved?.minLevel ?? 0,
+        maxLevel: fields.maxLevel ?? saved?.maxLevel ?? 0,
+        casePackSize: fields.casePackSize ?? saved?.casePackSize ?? 1,
       });
     }
     if (updates.length === 0) return;

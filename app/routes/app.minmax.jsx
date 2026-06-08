@@ -150,7 +150,12 @@ export default function MinMax() {
     fetcher.submit(form, { method: "POST" });
     setEdits({});
   };
-
+const getOnHand = (variant) => {
+  const levels = variant.inventoryItem?.inventoryLevels?.edges ?? [];
+  const level = levels.find(e => e.node.location.id === selectedLocation);
+  const qty = level?.node?.quantities?.find(q => q.name === "available");
+  return qty?.quantity ?? 0;
+};
   const getStatus = (variantId, onHand) => {
     const key = getKey(variantId, selectedLocation);
     const min = parseInt(edits[key]?.minLevel ?? minMaxMap[key]?.minLevel ?? 0);

@@ -7,7 +7,6 @@ import {
   Card,
   Text,
   BlockStack,
-  InlineGrid,
   Button,
   Select,
   TextField,
@@ -31,31 +30,17 @@ export const loader = async ({ request }) => {
 
   const prodResponse = await admin.graphql(`
     query {
-      products(first: 250) {
+      products(first: 50) {
         edges {
           node {
             id
             title
             vendor
-            variants(first: 100) {
+            variants(first: 10) {
               edges {
                 node {
                   id
                   sku
-                  inventoryItem {
-                    id
-                    inventoryLevels(first: 10) {
-                      edges {
-                        node {
-                          location { id name }
-                          quantities(names: ["available"]) {
-                            name
-                            quantity
-                          }
-                        }
-                      }
-                    }
-                  }
                 }
               }
             }
@@ -67,7 +52,6 @@ export const loader = async ({ request }) => {
   const prodData = await prodResponse.json();
   const products = prodData.data.products.edges.map(e => e.node);
 
-  // Load saved min/max from DB
   const savedMinMax = await prisma.minMax.findMany({ where: { shop } });
   const minMaxMap = {};
   for (const mm of savedMinMax) {
@@ -156,13 +140,6 @@ export default function MinMax() {
     setEdits({});
   };
 
-  const getOnHand = (variant) => {
-    const levels = variant.inventoryItem?.inventoryLevels?.edges ?? [];
-    const level = levels.find(e => e.node.location.id === selectedLocation);
-    const qty = level?.node?.quantities?.find(q => q.name === "available");
-    return qty?.quantity ?? 0;
-  };
-
   const getStatus = (variantId, onHand) => {
     const key = getKey(variantId, selectedLocation);
     const min = parseInt(edits[key]?.minLevel ?? minMaxMap[key]?.minLevel ?? 0);
@@ -201,7 +178,7 @@ export default function MinMax() {
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead>
                     <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                      {["Product", "SKU", "On Hand", "Min", "Max", "Case Pack", "Status"].map(h => (
+                      {["Product", "SKU", "Min", "Max", "Case Pack", "Status"].map(h => (
                         <th key={h} style={{ padding: "8px 12px", textAlign: "left" }}>
                           <Text variant="headingSm">{h}</Text>
                         </th>
@@ -211,8 +188,7 @@ export default function MinMax() {
                   <tbody>
                     {products.flatMap(p =>
                       p.variants.edges.map(({ node: v }) => {
-                        const onHand = getOnHand(v);
-                        const status = getStatus(v.id, onHand);
+                        const status = getStatus(v.id, 0);
                         return (
                           <tr key={v.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
                             <td style={{ padding: "8px 12px" }}>
@@ -221,9 +197,6 @@ export default function MinMax() {
                             </td>
                             <td style={{ padding: "8px 12px" }}>
                               <Text>{v.sku || "—"}</Text>
-                            </td>
-                            <td style={{ padding: "8px 12px" }}>
-                              <Text>{onHand}</Text>
                             </td>
                             <td style={{ padding: "8px 12px", width: "80px" }}>
                               <TextField

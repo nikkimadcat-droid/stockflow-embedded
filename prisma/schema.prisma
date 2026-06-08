@@ -63,4 +63,7 @@ model SupplierSku {
   variantId    String
   supplierCode String
   cost         Float
-  updatedAt    DateTime @updat
+  updatedAt    DateTime @updatedAt
+
+  @@unique([supplierId, variantId])
+}

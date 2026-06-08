@@ -2,38 +2,13 @@
 
 client_id = "440f26cddcd3be98f146880eca0c665d"
 name = "madcatstockflow - 3"
-application_url = "https://madcatstockflow-3-5.shopifyapps.com"
+application_url = "https://stockflow-embedded-production.up.railway.app"
 embedded = true
 
 [access_scopes]
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_price_rules,write_price_rules,read_discounts,write_inventory,read_inventory,write_inventory_transfers,read_inventory_transfers,write_locations,read_locations,read_orders,read_products,write_products"
 optional_scopes = [ ]
 use_legacy_install_flow = false
-
-[product.metafields.app.demo_info]
-type = "single_line_text_field"
-name = "Demo Source Info"
-description = "Tracks products created by the Shopify app template for development"
-
-  [product.metafields.app.demo_info.access]
-  admin = "merchant_read_write"
-
-[metaobjects.app.example]
-name = "Example"
-description = "An example metaobject definition created by this template"
-
-  [metaobjects.app.example.access]
-  admin = "merchant_read_write"
-
-[metaobjects.app.example.fields.title]
-name = "Title"
-type = "single_line_text_field"
-required = true
-
-[metaobjects.app.example.fields.description]
-name = "Description"
-type = "multi_line_text_field"
 
 [webhooks]
 api_version = "2026-04"
@@ -48,7 +23,7 @@ api_version = "2026-04"
 
 [auth]
 redirect_urls = [
-  "https://madcatstockflow-3-5.shopifyapps.com/auth/callback"
+  "https://stockflow-embedded-production.up.railway.app/auth/callback"
 ]
 
 [build]

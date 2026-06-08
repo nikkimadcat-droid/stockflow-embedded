@@ -1,34 +1,40 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
+model MinMax {
+  id             String   @id @default(cuid())
+  shop           String
+  variantId      String
+  locationId     String
+  minLevel       Int      @default(0)
+  maxLevel       Int      @default(0)
+  casePackSize   Int      @default(1)
+  updatedAt      DateTime @updatedAt
 
-generator client {
-  provider = "prisma-client-js"
+  @@unique([shop, variantId, locationId])
 }
 
-// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
-// enough when changing adapters.
-// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
-datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+model Supplier {
+  id        String   @id @default(cuid())
+  shop      String
+  name      String
+  createdAt DateTime @default(now())
+  skus      SupplierSku[]
 }
 
-model Session {
-  id            String    @id
+model Vendor {
+  id        String   @id @default(cuid())
+  shop      String
+  name      String
+  createdAt DateTime @default(now())
+}
+
+model SupplierSku {
+  id            String   @id @default(cuid())
   shop          String
-  state         String
-  isOnline      Boolean   @default(false)
-  scope         String?
-  expires       DateTime?
-  accessToken   String
-  userId        BigInt?
-  firstName     String?
-  lastName      String?
-  email         String?
-  accountOwner  Boolean   @default(false)
-  locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
-  refreshToken        String?
-  refreshTokenExpires DateTime?
+  supplierId    String
+  supplier      Supplier @relation(fields: [supplierId], references: [id])
+  variantId     String
+  supplierCode  String
+  cost          Float
+  updatedAt     DateTime @updatedAt
+
+  @@unique([supplierId, variantId])
 }

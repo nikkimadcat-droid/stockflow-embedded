@@ -5,56 +5,31 @@ import { Page, Layout, Card, Text, BlockStack } from "@shopify/polaris";
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
 
-  try {
-    const response = await admin.graphql(`
-      query {
-        productVariants(first: 1) {
-          edges {
-            node {
-              sku
-              inventoryItem {
-                id
-                metafields(first: 20) {
-                  edges {
-                    node {
-                      namespace
-                      key
-                      value
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+  const response = await admin.graphql(`
+    query {
+      shop {
+        name
       }
-    `);
+    }
+  `);
 
-    const data = await response.json();
-    const variant = data.data.productVariants.edges[0]?.node;
-
-    return {
-      sku: variant?.sku ?? "none",
-      inventoryItemId: variant?.inventoryItem?.id ?? "none",
-      metafields: variant?.inventoryItem?.metafields?.edges?.map(e => e.node) ?? [],
-      error: null,
-    };
-  } catch (e) {
-    return { sku: null, inventoryItemId: null, metafields: [], error: e.message };
-  }
+  const data = await response.json();
+  return { shopName: data.data.shop.name };
 };
 
 export default function DebugMetafields() {
-  const { sku, inventoryItemId, metafields, error } = useLoaderData();
-
+  const { shopName } = useLoaderData();
   return (
-    <Page title="Metafield Debug">
+    <Page title="Debug">
       <Layout>
         <Layout.Section>
           <Card>
             <BlockStack gap="200">
-              {error && <Text tone="critical">Error: {error}</Text>}
-              <Text variant="headingMd">SKU: {sku}</Text>
-              <Text tone="subdued">Inventory Item ID: {inventoryItemId}</Text>
-              <Text variant="headingMd">Metafields found: {metafields.length}</Text>
-              {metafields.length > 0 && (
+              <Text variant="headingMd">Connected to: {shopName}</Text>
+            </BlockStack>
+          </Card>
+        </Layout.Section>
+      </Layout>
+    </Page>
+  );
+}

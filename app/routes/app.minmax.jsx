@@ -1,4 +1,18 @@
-export const loader = async ({ request }) => {
+import { useLoaderData, useFetcher } from "react-router";
+import { authenticate } from "../shopify.server";
+import prisma from "../db.server";
+import {
+  Page,
+  Layout,
+  Card,
+  Text,
+  BlockStack,
+  Button,
+  Select,
+  TextField,
+  Banner,
+} from "@shopify/polaris";
+import { useState, useCallback } from "react";export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
 

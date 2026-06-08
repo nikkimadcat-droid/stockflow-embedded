@@ -30,7 +30,7 @@ export const loader = async ({ request }) => {
 
   const prodResponse = await admin.graphql(`
     query {
-      products(first: 50 {
+      products(first: 250) {
         edges {
           node {
             id
@@ -41,20 +41,6 @@ export const loader = async ({ request }) => {
                 node {
                   id
                   sku
-                  inventoryItem {
-                    id
-                    inventoryLevels(first: 10) {
-                      edges {
-                        node {
-                          location { id name }
-                          quantities(names: ["available"]) {
-                            name
-                            quantity
-                          }
-                        }
-                      }
-                    }
-                  }
                 }
               }
             }
@@ -66,13 +52,50 @@ export const loader = async ({ request }) => {
   const prodData = await prodResponse.json();
   const products = prodData.data.products.edges.map(e => e.node);
 
+  const invResponse = await admin.graphql(`
+    query {
+      locations(first: 10) {
+        edges {
+          node {
+            id
+            name
+            inventoryLevels(first: 250) {
+              edges {
+                node {
+                  item { variant { id } }
+                  quantities(names: ["available"]) {
+                    name
+                    quantity
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `);
+  const invData = await invResponse.json();
+
+  const invMap = {};
+  for (const locEdge of invData.data.locations.edges) {
+    const locId = locEdge.node.id;
+    for (const lvlEdge of locEdge.node.inventoryLevels.edges) {
+      const variantId = lvlEdge.node.item?.variant?.id;
+      if (!variantId) continue;
+      if (!invMap[variantId]) invMap[variantId] = {};
+      const qty = lvlEdge.node.quantities?.find(q => q.name === "available")?.quantity ?? 0;
+      invMap[variantId][locId] = qty;
+    }
+  }
+
   const savedMinMax = await prisma.minMax.findMany({ where: { shop } });
   const minMaxMap = {};
   for (const mm of savedMinMax) {
     minMaxMap[`${mm.variantId}__${mm.locationId}`] = mm;
   }
 
-  return { locations, products, minMaxMap, shop };
+  return { locations, products, minMaxMap, invMap, shop };
 };
 
 export const action = async ({ request }) => {
@@ -110,7 +133,7 @@ export const action = async ({ request }) => {
 };
 
 export default function MinMax() {
-  const { locations, products, minMaxMap } = useLoaderData();
+  const { locations, products, minMaxMap, invMap } = useLoaderData();
   const fetcher = useFetcher();
   const [selectedLocation, setSelectedLocation] = useState(locations[0]?.id || "");
   const [edits, setEdits] = useState({});
@@ -154,11 +177,8 @@ export default function MinMax() {
     setEdits({});
   };
 
-  const getOnHand = (variant) => {
-    const levels = variant.inventoryItem?.inventoryLevels?.edges ?? [];
-    const level = levels.find(e => e.node.location.id === selectedLocation);
-    const qty = level?.node?.quantities?.find(q => q.name === "available");
-    return qty?.quantity ?? 0;
+  const getOnHand = (variantId) => {
+    return invMap[variantId]?.[selectedLocation] ?? 0;
   };
 
   const getStatus = (variantId, onHand) => {
@@ -209,7 +229,7 @@ export default function MinMax() {
                   <tbody>
                     {products.flatMap(p =>
                       p.variants.edges.map(({ node: v }) => {
-                        const onHand = getOnHand(v);
+                        const onHand = getOnHand(v.id);
                         const status = getStatus(v.id, onHand);
                         return (
                           <tr key={v.id} style={{ borderBottom: "1px solid #f1f2f3" }}>

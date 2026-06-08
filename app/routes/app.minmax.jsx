@@ -12,7 +12,9 @@ import {
   TextField,
   Banner,
 } from "@shopify/polaris";
-import { useState, useCallback } from "react";export const loader = async ({ request }) => {
+import { useState, useCallback } from "react";
+
+export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
 
@@ -26,7 +28,7 @@ import { useState, useCallback } from "react";export const loader = async ({ req
   const locData = await locResponse.json();
   const locations = locData.data.locations.edges.map(e => e.node);
 
- const prodResponse = await admin.graphql(`
+  const prodResponse = await admin.graphql(`
     query {
       products(first: 250) {
         edges {
@@ -72,6 +74,7 @@ import { useState, useCallback } from "react";export const loader = async ({ req
 
   return { locations, products, minMaxMap, shop };
 };
+
 export const action = async ({ request }) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
@@ -150,12 +153,14 @@ export default function MinMax() {
     fetcher.submit(form, { method: "POST" });
     setEdits({});
   };
-const getOnHand = (variant) => {
-  const levels = variant.inventoryItem?.inventoryLevels?.edges ?? [];
-  const level = levels.find(e => e.node.location.id === selectedLocation);
-  const qty = level?.node?.quantities?.find(q => q.name === "available");
-  return qty?.quantity ?? 0;
-};
+
+  const getOnHand = (variant) => {
+    const levels = variant.inventoryItem?.inventoryLevels?.edges ?? [];
+    const level = levels.find(e => e.node.location.id === selectedLocation);
+    const qty = level?.node?.quantities?.find(q => q.name === "available");
+    return qty?.quantity ?? 0;
+  };
+
   const getStatus = (variantId, onHand) => {
     const key = getKey(variantId, selectedLocation);
     const min = parseInt(edits[key]?.minLevel ?? minMaxMap[key]?.minLevel ?? 0);
@@ -194,7 +199,7 @@ const getOnHand = (variant) => {
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead>
                     <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                      {["Product", "SKU", "Min", "Max", "Case Pack", "Status"].map(h => (
+                      {["Product", "SKU", "On Hand", "Min", "Max", "Case Pack", "Status"].map(h => (
                         <th key={h} style={{ padding: "8px 12px", textAlign: "left" }}>
                           <Text variant="headingSm">{h}</Text>
                         </th>
@@ -204,7 +209,8 @@ const getOnHand = (variant) => {
                   <tbody>
                     {products.flatMap(p =>
                       p.variants.edges.map(({ node: v }) => {
-                        const status = getStatus(v.id, 0);
+                        const onHand = getOnHand(v);
+                        const status = getStatus(v.id, onHand);
                         return (
                           <tr key={v.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
                             <td style={{ padding: "8px 12px" }}>
@@ -213,6 +219,9 @@ const getOnHand = (variant) => {
                             </td>
                             <td style={{ padding: "8px 12px" }}>
                               <Text>{v.sku || "—"}</Text>
+                            </td>
+                            <td style={{ padding: "8px 12px" }}>
+                              <Text>{onHand}</Text>
                             </td>
                             <td style={{ padding: "8px 12px", width: "120px" }}>
                               <TextField

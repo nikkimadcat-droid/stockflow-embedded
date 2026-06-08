@@ -52,14 +52,19 @@ export const loader = async ({ request }) => {
   const prodData = await prodResponse.json();
   const products = prodData.data.products.edges.map(e => e.node);
 
-  const invResponse = await admin.graphql(`
-    query {
-      locations(first: 10) {
-        edges {
-          node {
-            id
-            name
-            inventoryLevels(first: 250) {
+  // Fetch all inventory levels with pagination per location
+  const invMap = {};
+
+  for (const location of locations) {
+    let hasNextPage = true;
+    let cursor = null;
+
+    while (hasNextPage) {
+      const invResponse = await admin.graphql(`
+        query($locationId: ID!, $cursor: String) {
+          location(id: $locationId) {
+            inventoryLevels(first: 250, after: $cursor) {
+              pageInfo { hasNextPage endCursor }
               edges {
                 node {
                   item { variant { id } }
@@ -72,20 +77,21 @@ export const loader = async ({ request }) => {
             }
           }
         }
-      }
-    }
-  `);
-  const invData = await invResponse.json();
+      `, { variables: { locationId: location.id, cursor } });
 
-  const invMap = {};
-  for (const locEdge of invData.data.locations.edges) {
-    const locId = locEdge.node.id;
-    for (const lvlEdge of locEdge.node.inventoryLevels.edges) {
-      const variantId = lvlEdge.node.item?.variant?.id;
-      if (!variantId) continue;
-      if (!invMap[variantId]) invMap[variantId] = {};
-      const qty = lvlEdge.node.quantities?.find(q => q.name === "available")?.quantity ?? 0;
-      invMap[variantId][locId] = qty;
+      const invData = await invResponse.json();
+      const levels = invData.data.location.inventoryLevels;
+
+      for (const edge of levels.edges) {
+        const variantId = edge.node.item?.variant?.id;
+        if (!variantId) continue;
+        if (!invMap[variantId]) invMap[variantId] = {};
+        const qty = edge.node.quantities?.find(q => q.name === "available")?.quantity ?? 0;
+        invMap[variantId][location.id] = qty;
+      }
+
+      hasNextPage = levels.pageInfo.hasNextPage;
+      cursor = levels.pageInfo.endCursor;
     }
   }
 
@@ -105,7 +111,6 @@ export const action = async ({ request }) => {
   const updates = JSON.parse(formData.get("updates"));
 
   for (const u of updates) {
-    // Save the main update
     await prisma.minMax.upsert({
       where: {
         shop_variantId_locationId: {
@@ -129,7 +134,6 @@ export const action = async ({ request }) => {
       },
     });
 
-    // Sync case pack to all other locations for this variant
     if (u.casePackSize) {
       await prisma.minMax.updateMany({
         where: {

@@ -195,7 +195,7 @@ export default function MinMax() {
                             <td style={{ padding: "8px 12px" }}>
                               <Text>{v.sku || "—"}</Text>
                             </td>
-                            <td style={{ padding: "8px 12px", width: "80px" }}>
+                            <td style={{ padding: "8px 12px", width: "120px" }}>
                               <TextField
                                 label=""
                                 labelHidden
@@ -205,7 +205,7 @@ export default function MinMax() {
                                 autoComplete="off"
                               />
                             </td>
-                            <td style={{ padding: "8px 12px", width: "80px" }}>
+                            <td style={{ padding: "8px 12px", width: "120px" }}>
                               <TextField
                                 label=""
                                 labelHidden
@@ -215,7 +215,7 @@ export default function MinMax() {
                                 autoComplete="off"
                               />
                             </td>
-                            <td style={{ padding: "8px 12px", width: "80px" }}>
+                            <td style={{ padding: "8px 12px", width: "120px" }}>
                               <TextField
                                 label=""
                                 labelHidden

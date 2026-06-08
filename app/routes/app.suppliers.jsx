@@ -1,4 +1,4 @@
-import { useLoaderData, useFetcher } from "react-router";
+import { useLoaderData, useFetcher, Link } from "react-router";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import {
@@ -103,9 +103,9 @@ export default function Suppliers() {
                     {suppliers.map(s => (
                       <tr key={s.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
                         <td style={{ padding: "8px 12px" }}>
-                          <a href={`/app/suppliers/${s.id}`} style={{ textDecoration: "none", color: "inherit" }}>
+                          <Link to={`/app/suppliers/${s.id}`} style={{ textDecoration: "none", color: "inherit" }}>
                             <Text variant="bodyMd">{s.name}</Text>
-                          </a>
+                          </Link>
                         </td>
                         <td style={{ padding: "8px 12px" }}>
                           <Badge>{String(s.skus.length)}</Badge>

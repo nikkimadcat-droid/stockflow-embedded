@@ -5,27 +5,64 @@ import { Page, Layout, Card, Text, BlockStack } from "@shopify/polaris";
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
 
-  const response = await admin.graphql(`
-    query {
-      shop {
-        name
+  try {
+    const response = await admin.graphql(`
+      query {
+        productVariants(first: 1) {
+          edges {
+            node {
+              sku
+              inventoryItem {
+                id
+                metafields(first: 20) {
+                  edges {
+                    node {
+                      namespace
+                      key
+                      value
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
-    }
-  `);
+    `);
 
-  const data = await response.json();
-  return { shopName: data.data.shop.name };
+    const data = await response.json();
+    const variant = data.data.productVariants.edges[0]?.node;
+
+    return {
+      sku: variant?.sku ?? "none",
+      inventoryItemId: variant?.inventoryItem?.id ?? "none",
+      metafields: variant?.inventoryItem?.metafields?.edges?.map(e => e.node) ?? [],
+      error: null,
+    };
+  } catch (e) {
+    return { sku: null, inventoryItemId: null, metafields: [], error: e.message };
+  }
 };
 
 export default function DebugMetafields() {
-  const { shopName } = useLoaderData();
+  const { sku, inventoryItemId, metafields, error } = useLoaderData();
+
   return (
-    <Page title="Debug">
+    <Page title="Metafield Debug">
       <Layout>
         <Layout.Section>
           <Card>
             <BlockStack gap="200">
-              <Text variant="headingMd">Connected to: {shopName}</Text>
+              {error && <Text tone="critical">Error: {error}</Text>}
+              <Text variant="headingMd">SKU: {sku}</Text>
+              <Text tone="subdued">Inventory Item ID: {inventoryItemId}</Text>
+              <Text variant="headingMd">Metafields found: {metafields.length}</Text>
+              {metafields.length === 0 && (
+                <Text tone="critical">No metafields — Stocky data is gone.</Text>
+              )}
+              {metafields.map((mf, i) => (
+                <Text key={i}>{mf.namespace} / {mf.key}: {mf.value}</Text>
+              ))}
             </BlockStack>
           </Card>
         </Layout.Section>

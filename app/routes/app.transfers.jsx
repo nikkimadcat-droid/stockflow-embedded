@@ -18,6 +18,7 @@ import {
   Banner,
   EmptyState,
   Spinner,
+  Checkbox,
 } from "@shopify/polaris";
 
 function transferNumberGen() {
@@ -30,21 +31,97 @@ function statusBadge(status) {
   return <Badge tone={map[status] ?? "info"}>{status.charAt(0).toUpperCase() + status.slice(1)}</Badge>;
 }
 
-async function buildMinmaxItems(admin, db, shop, fromLocationId, toLocationId) {
-  // get what's below min at the destination
+function downloadPickListCSV(transfer, locationName, items) {
+  const rows = [
+    [`Pick List — ${locationName}`],
+    [`Transfer: ${transfer.transferNumber}`],
+    [`Date: ${new Date().toLocaleDateString()}`],
+    [],
+    ["Vendor", "Product", "SKU", "Qty to Pull"],
+    ...items.map(i => [i.vendor, i.productTitle, i.sku, i.qty]),
+  ];
+  const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${transfer.transferNumber}-${locationName.replace(/\s+/g, "-")}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function buildDistributionItems(admin, db, shop, fromLocationId, toLocationId, vendorNames) {
+  // get all products for these vendors
+  const products = [];
+  for (const vendor of vendorNames) {
+    let cursor = null;
+    let hasMore = true;
+    while (hasMore) {
+      const res = await admin.graphql(`
+        query($cursor: String, $query: String!) {
+          products(first: 250, after: $cursor, query: $query) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                id
+                title
+                vendor
+                variants(first: 100) {
+                  edges {
+                    node { id sku }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `, { variables: { cursor, query: `vendor:'${vendor}'` } });
+      const json = await res.json();
+      const page = json.data.products;
+      products.push(...page.edges.map(e => e.node));
+      hasMore = page.pageInfo.hasNextPage;
+      cursor = page.pageInfo.endCursor;
+    }
+  }
+
+  // build variant map
+  const variantMap = {};
+  for (const p of products) {
+    for (const { node: v } of p.variants.edges) {
+      variantMap[v.id] = {
+        variantId: v.id,
+        productTitle: p.title,
+        vendor: p.vendor,
+        sku: v.sku || "—",
+      };
+    }
+  }
+  const variantIds = new Set(Object.keys(variantMap));
+
+  // get min/max at destination
+  const destMinMax = {};
   const minmaxRows = await db.minMax.findMany({
-    where: { shop, locationId: toLocationId },
+    where: { shop, locationId: toLocationId, variantId: { in: [...variantIds] } },
   });
-  if (minmaxRows.length === 0) return [];
+  for (const mm of minmaxRows) {
+    destMinMax[mm.variantId] = mm;
+  }
 
-  const variantIds = minmaxRows.map(m => m.variantId);
+  // get min/max at source (for floor)
+  const srcMinMax = {};
+  const srcMinmaxRows = await db.minMax.findMany({
+    where: { shop, locationId: fromLocationId, variantId: { in: [...variantIds] } },
+  });
+  for (const mm of srcMinmaxRows) {
+    srcMinMax[mm.variantId] = mm;
+  }
 
-  // get on-hand at destination
-  const destInvMap = {};
+  // paginate inventory at destination
+  const destInv = {};
   let cursor = null;
   let hasMore = true;
   while (hasMore) {
-    const invRes = await admin.graphql(`
+    const res = await admin.graphql(`
       query($locationId: ID!, $cursor: String) {
         location(id: $locationId) {
           inventoryLevels(first: 250, after: $cursor) {
@@ -52,35 +129,31 @@ async function buildMinmaxItems(admin, db, shop, fromLocationId, toLocationId) {
             edges {
               node {
                 quantities(names: ["available"]) { quantity }
-                item { variant { id title product { title } } sku }
+                item { variant { id } }
               }
             }
           }
         }
       }
     `, { variables: { locationId: toLocationId, cursor } });
-    const invJson = await invRes.json();
-    const levels = invJson.data?.location?.inventoryLevels;
+    const json = await res.json();
+    const levels = json.data?.location?.inventoryLevels;
     hasMore = levels?.pageInfo?.hasNextPage ?? false;
     cursor = levels?.pageInfo?.endCursor ?? null;
     for (const e of levels?.edges ?? []) {
-      const n = e.node;
-      const vid = n.item?.variant?.id;
-      if (vid) destInvMap[vid] = {
-        qty: n.quantities?.[0]?.quantity ?? 0,
-        productTitle: n.item?.variant?.product?.title ?? "",
-        variantTitle: n.item?.variant?.title ?? "",
-        sku: n.item?.sku ?? "",
-      };
+      const vid = e.node.item?.variant?.id;
+      if (vid && variantIds.has(vid)) {
+        destInv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
+      }
     }
   }
 
-  // get on-hand at source so we know what's available to send
-  const srcInvMap = {};
+  // paginate inventory at source
+  const srcInv = {};
   let srcCursor = null;
   let srcHasMore = true;
   while (srcHasMore) {
-    const invRes = await admin.graphql(`
+    const res = await admin.graphql(`
       query($locationId: ID!, $cursor: String) {
         location(id: $locationId) {
           inventoryLevels(first: 250, after: $cursor) {
@@ -95,40 +168,63 @@ async function buildMinmaxItems(admin, db, shop, fromLocationId, toLocationId) {
         }
       }
     `, { variables: { locationId: fromLocationId, cursor: srcCursor } });
-    const invJson = await invRes.json();
-    const levels = invJson.data?.location?.inventoryLevels;
+    const json = await res.json();
+    const levels = json.data?.location?.inventoryLevels;
     srcHasMore = levels?.pageInfo?.hasNextPage ?? false;
     srcCursor = levels?.pageInfo?.endCursor ?? null;
     for (const e of levels?.edges ?? []) {
-      const n = e.node;
-      const vid = n.item?.variant?.id;
-      if (vid) srcInvMap[vid] = n.quantities?.[0]?.quantity ?? 0;
+      const vid = e.node.item?.variant?.id;
+      if (vid && variantIds.has(vid)) {
+        srcInv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
+      }
     }
   }
 
+  // calculate transfer quantities
   const items = [];
-  for (const mm of minmaxRows) {
-    const dest = destInvMap[mm.variantId];
-    if (!dest) continue;
-    const needed = mm.maxLevel - dest.qty;
-    if (needed <= 0) continue;
-    const srcQty = srcInvMap[mm.variantId] ?? 0;
-    if (srcQty <= 0) continue; // nothing to send
-    const qty = mm.casePackSize > 1
-      ? Math.ceil(needed / mm.casePackSize) * mm.casePackSize
-      : needed;
-    // cap at what source actually has
-    const finalQty = Math.min(qty, srcQty);
+  for (const [vid, info] of Object.entries(variantMap)) {
+    const mm = destMinMax[vid];
+    if (!mm) continue; // no min/max set at destination — skip
+
+    const destOnHand = destInv[vid] ?? 0;
+    const destNeed = mm.maxLevel - destOnHand;
+    if (destNeed <= 0) continue; // destination is stocked up
+
+    const srcOnHand = srcInv[vid] ?? 0;
+    const srcMin = srcMinMax[vid]?.minLevel ?? 0;
+    const available = srcOnHand - srcMin;
+    if (available <= 0) continue; // source has nothing above their own min
+
+    // round need up to case pack
+    const casePack = mm.casePackSize || 1;
+    const rawQty = Math.min(destNeed, available);
+    const qty = casePack > 1
+      ? Math.min(Math.ceil(rawQty / casePack) * casePack, available)
+      : rawQty;
+
+    if (qty <= 0) continue;
+
     items.push({
-      variantId: mm.variantId,
-      productTitle: dest.productTitle,
-      variantTitle: dest.variantTitle,
-      sku: dest.sku,
-      qty: finalQty,
-      srcQty,
-      destQty: dest.qty,
+      variantId: vid,
+      productTitle: info.productTitle,
+      variantTitle: "",
+      vendor: info.vendor,
+      sku: info.sku,
+      qty,
+      srcOnHand,
+      srcMin,
+      available,
+      destOnHand,
+      destNeed,
     });
   }
+
+  // sort by vendor then product title
+  items.sort((a, b) => {
+    if (a.vendor !== b.vendor) return a.vendor.localeCompare(b.vendor);
+    return a.productTitle.localeCompare(b.productTitle);
+  });
+
   return items;
 }
 
@@ -142,8 +238,31 @@ export const loader = async ({ request }) => {
   const locJson = await locRes.json();
   const locations = locJson.data.locations.edges.map(e => e.node);
 
+  // get all vendors from Shopify
+  const vendors = new Set();
+  let cursor = null;
+  let hasMore = true;
+  while (hasMore) {
+    const res = await admin.graphql(`
+      query($cursor: String) {
+        products(first: 250, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          edges { node { vendor } }
+        }
+      }
+    `, { variables: { cursor } });
+    const json = await res.json();
+    const page = json.data.products;
+    for (const { node: p } of page.edges) {
+      if (p.vendor) vendors.add(p.vendor);
+    }
+    hasMore = page.pageInfo.hasNextPage;
+    cursor = page.pageInfo.endCursor;
+  }
+
   const templates = await db.transferTemplate.findMany({
     where: { shop },
+    include: { vendors: true },
     orderBy: { name: "asc" },
   });
 
@@ -153,7 +272,13 @@ export const loader = async ({ request }) => {
     orderBy: { createdAt: "desc" },
   });
 
-  return { locations, templates, transfers, shop };
+  return {
+    locations,
+    allVendors: [...vendors].sort(),
+    templates,
+    transfers,
+    shop,
+  };
 };
 
 export const action = async ({ request }) => {
@@ -162,55 +287,71 @@ export const action = async ({ request }) => {
   const form = await request.formData();
   const intent = form.get("intent");
 
-  // ── CREATE TEMPLATE ───────────────────────────────────────────
   if (intent === "createTemplate") {
     const name = form.get("name");
     const fromLocationId = form.get("fromLocationId");
     const toLocationId = form.get("toLocationId");
+    const vendorList = JSON.parse(form.get("vendors") || "[]");
+
     await db.transferTemplate.create({
-      data: { shop, name, fromLocationId, toLocationId, updatedAt: new Date() },
+      data: {
+        shop, name,
+        type: "distribution",
+        fromLocationId,
+        toLocationId,
+        updatedAt: new Date(),
+        vendors: {
+          create: vendorList.map(v => ({ vendor: v })),
+        },
+      },
     });
     return { ok: true };
   }
 
-  // ── DELETE TEMPLATE ───────────────────────────────────────────
+  if (intent === "updateTemplate") {
+    const id = form.get("id");
+    const vendorList = JSON.parse(form.get("vendors") || "[]");
+    await db.transferTemplateVendor.deleteMany({ where: { templateId: id } });
+    await db.transferTemplateVendor.createMany({
+      data: vendorList.map(v => ({ id: `${id}-${v}`, templateId: id, vendor: v })),
+    });
+    return { ok: true };
+  }
+
   if (intent === "deleteTemplate") {
     const id = form.get("id");
     await db.transferTemplate.delete({ where: { id } });
     return { ok: true };
   }
 
-  // ── CREATE TRANSFER ───────────────────────────────────────────
   if (intent === "create") {
+    const templateId = form.get("templateId");
     const fromLocationId = form.get("fromLocationId");
     const toLocationId = form.get("toLocationId");
-    const templateId = form.get("templateId") || null;
-    const mode = form.get("mode");
     const notes = form.get("notes") || "";
     const transferNumber = transferNumberGen();
 
-    let items = [];
-    if (mode === "minmax") {
-      items = await buildMinmaxItems(admin, db, shop, fromLocationId, toLocationId);
-    }
-    if (mode === "manual") {
-      try { items = JSON.parse(form.get("items") || "[]"); } catch { items = []; }
-    }
+    const template = await db.transferTemplate.findUnique({
+      where: { id: templateId },
+      include: { vendors: true },
+    });
+    const vendorNames = template?.vendors.map(v => v.vendor) ?? [];
+
+    const items = await buildDistributionItems(
+      admin, db, shop, fromLocationId, toLocationId, vendorNames
+    );
 
     await db.transfer.create({
       data: {
-        shop,
-        transferNumber,
-        templateId,
-        fromLocationId,
-        toLocationId,
-        status: "draft",
-        notes,
+        shop, transferNumber, templateId,
+        fromLocationId, toLocationId,
+        status: "draft", notes,
         items: {
           create: items.map(i => ({
             variantId: i.variantId,
             productTitle: i.productTitle,
-            variantTitle: i.variantTitle,
+            variantTitle: i.variantTitle || "",
+            vendor: i.vendor,
             sku: i.sku,
             qty: Number(i.qty),
             updatedAt: new Date(),
@@ -222,13 +363,22 @@ export const action = async ({ request }) => {
     return { ok: true };
   }
 
-  // ── REGENERATE ────────────────────────────────────────────────
   if (intent === "regenerate") {
     const id = form.get("id");
-    const transfer = await db.transfer.findUnique({ where: { id } });
+    const transfer = await db.transfer.findUnique({
+      where: { id },
+      include: { template: { include: { vendors: true } } },
+    });
     if (!transfer) return { ok: false };
 
-    const items = await buildMinmaxItems(admin, db, shop, transfer.fromLocationId, transfer.toLocationId);
+    const vendorNames = transfer.template?.vendors.map(v => v.vendor) ?? [];
+    const items = await buildDistributionItems(
+      admin, db, shop,
+      transfer.fromLocationId,
+      transfer.toLocationId,
+      vendorNames
+    );
+
     await db.transferItem.deleteMany({ where: { transferId: id } });
     await db.transfer.update({
       where: { id },
@@ -238,7 +388,8 @@ export const action = async ({ request }) => {
           create: items.map(i => ({
             variantId: i.variantId,
             productTitle: i.productTitle,
-            variantTitle: i.variantTitle,
+            variantTitle: i.variantTitle || "",
+            vendor: i.vendor,
             sku: i.sku,
             qty: Number(i.qty),
             updatedAt: new Date(),
@@ -249,7 +400,6 @@ export const action = async ({ request }) => {
     return { ok: true, regenerated: true };
   }
 
-  // ── UPDATE ITEMS ──────────────────────────────────────────────
   if (intent === "updateItems") {
     const id = form.get("id");
     const updates = JSON.parse(form.get("updates"));
@@ -267,7 +417,6 @@ export const action = async ({ request }) => {
     return { ok: true };
   }
 
-  // ── UPDATE STATUS ─────────────────────────────────────────────
   if (intent === "updateStatus") {
     const id = form.get("id");
     const status = form.get("status");
@@ -275,7 +424,6 @@ export const action = async ({ request }) => {
     return { ok: true };
   }
 
-  // ── PUSH TO SHOPIFY ───────────────────────────────────────────
   if (intent === "pushToShopify") {
     const id = form.get("id");
     const transfer = await db.transfer.findUnique({
@@ -284,30 +432,21 @@ export const action = async ({ request }) => {
     });
     if (!transfer) return { ok: false };
 
-    // get inventory item IDs for each variant
-    const variantIds = transfer.items.map(i => i.variantId);
-    const invItemMap = {};
-
-    for (const vid of variantIds) {
+    const errors = [];
+    for (const item of transfer.items) {
+      // get inventory item ID
       const res = await admin.graphql(`
         query($id: ID!) {
           productVariant(id: $id) {
             inventoryItem { id }
           }
         }
-      `, { variables: { id: vid } });
+      `, { variables: { id: item.variantId } });
       const json = await res.json();
-      const iid = json.data?.productVariant?.inventoryItem?.id;
-      if (iid) invItemMap[vid] = iid;
-    }
-
-    // move inventory for each item
-    const errors = [];
-    for (const item of transfer.items) {
-      const inventoryItemId = invItemMap[item.variantId];
+      const inventoryItemId = json.data?.productVariant?.inventoryItem?.id;
       if (!inventoryItemId) continue;
 
-      const res = await admin.graphql(`
+      const moveRes = await admin.graphql(`
         mutation($input: InventoryMoveQuantitiesInput!) {
           inventoryMoveQuantities(input: $input) {
             userErrors { field message }
@@ -328,8 +467,8 @@ export const action = async ({ request }) => {
         },
       });
 
-      const json = await res.json();
-      const errs = json.data?.inventoryMoveQuantities?.userErrors ?? [];
+      const moveJson = await moveRes.json();
+      const errs = moveJson.data?.inventoryMoveQuantities?.userErrors ?? [];
       if (errs.length > 0) errors.push(...errs.map(e => e.message));
     }
 
@@ -342,7 +481,6 @@ export const action = async ({ request }) => {
     return { ok: true, pushed: true };
   }
 
-  // ── DELETE ────────────────────────────────────────────────────
   if (intent === "delete") {
     const id = form.get("id");
     await db.transfer.delete({ where: { id } });
@@ -353,46 +491,43 @@ export const action = async ({ request }) => {
 };
 
 export default function Transfers() {
-  const { locations, templates, transfers } = useLoaderData();
+  const { locations, allVendors, templates, transfers } = useLoaderData();
   const fetcher = useFetcher();
 
   const [showCreate, setShowCreate] = useState(false);
   const [showTemplates, setShowTemplates] = useState(false);
-  const [mode, setMode] = useState("minmax");
-  const [selectedTemplateId, setSelectedTemplateId] = useState("");
-  const [fromLocationId, setFromLocationId] = useState(locations[0]?.id ?? "");
-  const [toLocationId, setToLocationId] = useState(locations[1]?.id ?? "");
+  const [showEditTemplate, setShowEditTemplate] = useState(null);
+  const [selectedTemplateId, setSelectedTemplateId] = useState(templates[0]?.id ?? "");
   const [notes, setNotes] = useState("");
   const [expandedId, setExpandedId] = useState(null);
   const [qtyEdits, setQtyEdits] = useState({});
   const [removedItems, setRemovedItems] = useState({});
 
-  // template form
+  // template form state
   const [newTemplateName, setNewTemplateName] = useState("");
   const [newTemplateFrom, setNewTemplateFrom] = useState(locations[0]?.id ?? "");
   const [newTemplateTo, setNewTemplateTo] = useState(locations[1]?.id ?? "");
+  const [newTemplateVendors, setNewTemplateVendors] = useState(new Set());
+  const [editVendors, setEditVendors] = useState(new Set());
 
   const isSubmitting = fetcher.state !== "idle";
 
-  function applyTemplate(templateId) {
-    const t = templates.find(t => t.id === templateId);
-    if (!t) return;
-    setSelectedTemplateId(templateId);
-    setFromLocationId(t.fromLocationId);
-    setToLocationId(t.toLocationId);
+  const selectedTemplate = templates.find(t => t.id === selectedTemplateId);
+
+  function toggleNewVendor(v) {
+    setNewTemplateVendors(prev => {
+      const s = new Set(prev);
+      s.has(v) ? s.delete(v) : s.add(v);
+      return s;
+    });
   }
 
-  function handleCreate() {
-    const fd = new FormData();
-    fd.append("intent", "create");
-    fd.append("fromLocationId", fromLocationId);
-    fd.append("toLocationId", toLocationId);
-    fd.append("templateId", selectedTemplateId);
-    fd.append("mode", mode);
-    fd.append("notes", notes);
-    fetcher.submit(fd, { method: "post" });
-    setShowCreate(false);
-    setNotes("");
+  function toggleEditVendor(v) {
+    setEditVendors(prev => {
+      const s = new Set(prev);
+      s.has(v) ? s.delete(v) : s.add(v);
+      return s;
+    });
   }
 
   function handleCreateTemplate() {
@@ -402,8 +537,24 @@ export default function Transfers() {
     fd.append("name", newTemplateName);
     fd.append("fromLocationId", newTemplateFrom);
     fd.append("toLocationId", newTemplateTo);
+    fd.append("vendors", JSON.stringify([...newTemplateVendors]));
     fetcher.submit(fd, { method: "post" });
     setNewTemplateName("");
+    setNewTemplateVendors(new Set());
+  }
+
+  function handleOpenEditTemplate(template) {
+    setEditVendors(new Set(template.vendors.map(v => v.vendor)));
+    setShowEditTemplate(template);
+  }
+
+  function handleSaveEditTemplate() {
+    const fd = new FormData();
+    fd.append("intent", "updateTemplate");
+    fd.append("id", showEditTemplate.id);
+    fd.append("vendors", JSON.stringify([...editVendors]));
+    fetcher.submit(fd, { method: "post" });
+    setShowEditTemplate(null);
   }
 
   function handleDeleteTemplate(id) {
@@ -414,8 +565,21 @@ export default function Transfers() {
     fetcher.submit(fd, { method: "post" });
   }
 
+  function handleCreate() {
+    if (!selectedTemplate) return;
+    const fd = new FormData();
+    fd.append("intent", "create");
+    fd.append("templateId", selectedTemplateId);
+    fd.append("fromLocationId", selectedTemplate.fromLocationId);
+    fd.append("toLocationId", selectedTemplate.toLocationId);
+    fd.append("notes", notes);
+    fetcher.submit(fd, { method: "post" });
+    setShowCreate(false);
+    setNotes("");
+  }
+
   function handleRegenerate(id) {
-    if (!confirm("Regenerate this transfer? Current items will be replaced with fresh min/max data.")) return;
+    if (!confirm("Regenerate this transfer? Current items will be replaced with fresh inventory data.")) return;
     const fd = new FormData();
     fd.append("intent", "regenerate");
     fd.append("id", id);
@@ -492,14 +656,7 @@ export default function Transfers() {
   }
 
   const locationOptions = locations.map(l => ({ label: l.name, value: l.id }));
-  const templateOptions = [
-    { label: "— No template (custom) —", value: "" },
-    ...templates.map(t => ({ label: t.name, value: t.id })),
-  ];
-  const modeOptions = [
-    { label: "Auto-fill from Min/Max levels", value: "minmax" },
-    { label: "Manual — blank transfer", value: "manual" },
-  ];
+  const templateOptions = templates.map(t => ({ label: t.name, value: t.id }));
   const statusOptions = [
     { label: "Draft", value: "draft" },
     { label: "Sent", value: "sent" },
@@ -513,7 +670,9 @@ export default function Transfers() {
     <Page
       title="Transfers"
       primaryAction={
-        <Button variant="primary" onClick={() => setShowCreate(true)}>+ New Transfer</Button>
+        <Button variant="primary" onClick={() => setShowCreate(true)} disabled={templates.length === 0}>
+          + New Transfer
+        </Button>
       }
       secondaryActions={[
         { content: "Manage Templates", onAction: () => setShowTemplates(true) },
@@ -523,7 +682,15 @@ export default function Transfers() {
         <Layout.Section>
 
           {pushError?.length > 0 && (
-            <Banner tone="critical">{pushError.join(", ")}</Banner>
+            <div style={{ marginBottom: "1rem" }}>
+              <Banner tone="critical">{pushError.join(", ")}</Banner>
+            </div>
+          )}
+
+          {templates.length === 0 && (
+            <Banner tone="info">
+              Set up a transfer template first — click "Manage Templates" to get started.
+            </Banner>
           )}
 
           {/* ── create transfer modal ── */}
@@ -531,41 +698,21 @@ export default function Transfers() {
             open={showCreate}
             onClose={() => setShowCreate(false)}
             title="New Transfer"
-            primaryAction={{ content: "Generate Transfer", onAction: handleCreate }}
+            primaryAction={{ content: "Generate Transfer", onAction: handleCreate, disabled: !selectedTemplateId }}
             secondaryActions={[{ content: "Cancel", onAction: () => setShowCreate(false) }]}
           >
             <Modal.Section>
               <BlockStack gap="400">
                 <Select
-                  label="Use a template"
+                  label="Template"
                   options={templateOptions}
                   value={selectedTemplateId}
-                  onChange={applyTemplate}
-                  helpText="Templates pre-fill the from/to locations"
+                  onChange={setSelectedTemplateId}
+                  helpText={selectedTemplate ? `${locationName(selectedTemplate.fromLocationId)} → ${locationName(selectedTemplate.toLocationId)} · ${selectedTemplate.vendors.length} vendors` : ""}
                 />
-                <Select
-                  label="From location"
-                  options={locationOptions}
-                  value={fromLocationId}
-                  onChange={setFromLocationId}
-                />
-                <Select
-                  label="To location"
-                  options={locationOptions}
-                  value={toLocationId}
-                  onChange={setToLocationId}
-                />
-                <Select
-                  label="How to populate items"
-                  options={modeOptions}
-                  value={mode}
-                  onChange={setMode}
-                />
-                {mode === "minmax" && (
-                  <Banner tone="info">
-                    Items below min at the destination will be auto-populated, capped by available stock at the source.
-                  </Banner>
-                )}
+                <Banner tone="info">
+                  Items below min at the destination will be auto-populated based on current inventory at the source, capped by the source's own min level.
+                </Banner>
                 <TextField
                   label="Notes (optional)"
                   value={notes}
@@ -586,44 +733,101 @@ export default function Transfers() {
           >
             <Modal.Section>
               <BlockStack gap="400">
-                <Text variant="headingSm">Existing templates</Text>
                 {templates.length === 0 && (
-                  <Text tone="subdued">No templates yet.</Text>
+                  <Text tone="subdued">No templates yet — create one below.</Text>
                 )}
                 {templates.map(t => (
-                  <InlineStack key={t.id} align="space-between" blockAlign="center">
-                    <Text>{t.name} — {locationName(t.fromLocationId)} → {locationName(t.toLocationId)}</Text>
-                    <Button variant="plain" tone="critical" onClick={() => handleDeleteTemplate(t.id)}>Delete</Button>
-                  </InlineStack>
+                  <Card key={t.id}>
+                    <BlockStack gap="200">
+                      <InlineStack align="space-between" blockAlign="center">
+                        <BlockStack gap="100">
+                          <Text variant="headingSm">{t.name}</Text>
+                          <Text tone="subdued">{locationName(t.fromLocationId)} → {locationName(t.toLocationId)}</Text>
+                          <Text tone="subdued" variant="bodySm">{t.vendors.length} vendors: {t.vendors.map(v => v.vendor).sort().join(", ")}</Text>
+                        </BlockStack>
+                        <InlineStack gap="200">
+                          <Button variant="plain" onClick={() => handleOpenEditTemplate(t)}>Edit vendors</Button>
+                          <Button variant="plain" tone="critical" onClick={() => handleDeleteTemplate(t.id)}>Delete</Button>
+                        </InlineStack>
+                      </InlineStack>
+                    </BlockStack>
+                  </Card>
                 ))}
+
                 <Divider />
-                <Text variant="headingSm">Add new template</Text>
+                <Text variant="headingSm">Create new template</Text>
                 <TextField
                   label="Template name"
                   value={newTemplateName}
                   onChange={setNewTemplateName}
-                  placeholder="e.g. Mineral Point → Willy Street (regular)"
+                  placeholder="e.g. Mineral Point → Monroe Street"
                   autoComplete="off"
                 />
                 <Select label="From location" options={locationOptions} value={newTemplateFrom} onChange={setNewTemplateFrom} />
                 <Select label="To location" options={locationOptions} value={newTemplateTo} onChange={setNewTemplateTo} />
-                <Button variant="primary" onClick={handleCreateTemplate} disabled={!newTemplateName}>
+                <Text variant="headingSm">Vendors included ({newTemplateVendors.size} selected)</Text>
+                <div style={{ maxHeight: "300px", overflowY: "auto", border: "1px solid #e1e3e5", borderRadius: "8px", padding: "8px" }}>
+                  {allVendors.map(v => (
+                    <div key={v} style={{ padding: "4px 0" }}>
+                      <Checkbox
+                        label={v}
+                        checked={newTemplateVendors.has(v)}
+                        onChange={() => toggleNewVendor(v)}
+                      />
+                    </div>
+                  ))}
+                </div>
+                <Button
+                  variant="primary"
+                  onClick={handleCreateTemplate}
+                  disabled={!newTemplateName || newTemplateVendors.size === 0}
+                >
                   Save template
                 </Button>
               </BlockStack>
             </Modal.Section>
           </Modal>
 
+          {/* ── edit template vendors modal ── */}
+          {showEditTemplate && (
+            <Modal
+              open={!!showEditTemplate}
+              onClose={() => setShowEditTemplate(null)}
+              title={`Edit vendors — ${showEditTemplate.name}`}
+              primaryAction={{ content: "Save vendors", onAction: handleSaveEditTemplate }}
+              secondaryActions={[{ content: "Cancel", onAction: () => setShowEditTemplate(null) }]}
+            >
+              <Modal.Section>
+                <BlockStack gap="300">
+                  <Text tone="subdued">{editVendors.size} vendors selected</Text>
+                  <div style={{ maxHeight: "400px", overflowY: "auto", border: "1px solid #e1e3e5", borderRadius: "8px", padding: "8px" }}>
+                    {allVendors.map(v => (
+                      <div key={v} style={{ padding: "4px 0" }}>
+                        <Checkbox
+                          label={v}
+                          checked={editVendors.has(v)}
+                          onChange={() => toggleEditVendor(v)}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </BlockStack>
+              </Modal.Section>
+            </Modal>
+          )}
+
           {/* ── loading ── */}
           {isSubmitting && (
             <div style={{ textAlign: "center", padding: "2rem" }}>
               <Spinner size="large" />
-              <Text>Working on it — checking min/max levels across locations…</Text>
+              <div style={{ marginTop: "1rem" }}>
+                <Text>Calculating transfer — checking inventory across locations…</Text>
+              </div>
             </div>
           )}
 
           {/* ── empty state ── */}
-          {!isSubmitting && transfers.length === 0 && (
+          {!isSubmitting && transfers.length === 0 && templates.length > 0 && (
             <Card>
               <EmptyState heading="No transfers yet" image="">
                 <p>Create a transfer to move inventory between your locations.</p>
@@ -646,6 +850,14 @@ export default function Transfers() {
             const activeItems = displayItems.filter(i => !i.removed);
             const totalUnits = activeItems.reduce((s, i) => s + i.qty, 0);
 
+            // group by vendor for display
+            const byVendor = {};
+            for (const item of activeItems) {
+              const v = item.vendor || "Other";
+              if (!byVendor[v]) byVendor[v] = [];
+              byVendor[v].push(item);
+            }
+
             return (
               <div key={transfer.id} style={{ marginBottom: "1rem" }}>
                 <Card>
@@ -666,7 +878,7 @@ export default function Transfers() {
                           {transfer.notes ? ` · ${transfer.notes}` : ""}
                         </Text>
                       </BlockStack>
-                      <InlineStack gap="200">
+                      <InlineStack gap="200" wrap>
                         <Select
                           label=""
                           labelHidden
@@ -678,8 +890,17 @@ export default function Transfers() {
                           ↺ Regenerate
                         </Button>
                         <Button
+                          variant="plain"
+                          onClick={() => downloadPickListCSV(
+                            transfer,
+                            locationName(transfer.toLocationId),
+                            activeItems
+                          )}
+                        >
+                          ↓ Pick List CSV
+                        </Button>
+                        <Button
                           variant="primary"
-                          tone="success"
                           onClick={() => handlePushToShopify(transfer.id)}
                           disabled={transfer.status === "received" || transfer.status === "cancelled" || activeItems.length === 0}
                         >
@@ -699,81 +920,65 @@ export default function Transfers() {
                         <Divider />
                         {transfer.items.length === 0 ? (
                           <Banner tone="info">
-                            No items needed — all SKUs at the destination are at or above minimum levels.
+                            No items needed — all SKUs at the destination are at or above minimum levels, or the source has no stock above its own minimum.
                           </Banner>
                         ) : (
-                          <BlockStack gap="300">
-                            <div style={{ overflowX: "auto" }}>
-                              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                                <thead>
-                                  <tr style={{ borderBottom: "2px solid #e1e3e5" }}>
-                                    {["Product", "SKU", "Qty to Transfer", ""].map((h, i) => (
-                                      <th key={i} style={{ padding: "8px 12px", textAlign: "left" }}>
-                                        <Text variant="headingSm">{h}</Text>
-                                      </th>
-                                    ))}
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {displayItems.map(item => {
-                                    const qty = poEdits[item.id] !== undefined ? poEdits[item.id] : String(item.qty);
+                          <BlockStack gap="400">
+                            {/* removed items at top */}
+                            {displayItems.filter(i => i.removed).map(item => (
+                              <div key={item.id} style={{ opacity: 0.4 }}>
+                                <InlineStack align="space-between">
+                                  <Text tone="subdued"><s>{item.vendor} · {item.productTitle} · {item.sku}</s></Text>
+                                  <Button variant="plain" onClick={() => handleRestoreItem(transfer.id, item.id)}>Restore</Button>
+                                </InlineStack>
+                              </div>
+                            ))}
 
-                                    if (item.removed) {
+                            {/* grouped by vendor */}
+                            {Object.entries(byVendor).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) => (
+                              <BlockStack key={vendor} gap="200">
+                                <div style={{ background: "#f6f6f7", padding: "6px 12px", borderRadius: "6px" }}>
+                                  <Text variant="headingSm">{vendor}</Text>
+                                </div>
+                                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                                  <thead>
+                                    <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
+                                      <th style={{ padding: "6px 12px", textAlign: "left" }}><Text variant="headingSm">Product</Text></th>
+                                      <th style={{ padding: "6px 12px", textAlign: "left" }}><Text variant="headingSm">SKU</Text></th>
+                                      <th style={{ padding: "6px 12px", textAlign: "right" }}><Text variant="headingSm">Qty</Text></th>
+                                      <th style={{ padding: "6px 12px" }}></th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {items.map(item => {
+                                      const qty = poEdits[item.id] !== undefined ? poEdits[item.id] : String(item.qty);
                                       return (
-                                        <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3", opacity: 0.4 }}>
-                                          <td colSpan={3} style={{ padding: "8px 12px" }}>
-                                            <Text tone="subdued"><s>{item.productTitle} — {item.variantTitle}</s></Text>
+                                        <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
+                                          <td style={{ padding: "6px 12px" }}><Text>{item.productTitle}</Text></td>
+                                          <td style={{ padding: "6px 12px" }}><Text>{item.sku}</Text></td>
+                                          <td style={{ padding: "6px 12px", width: "100px" }}>
+                                            <TextField
+                                              label=""
+                                              labelHidden
+                                              type="number"
+                                              value={qty}
+                                              onChange={val => handleQtyEdit(transfer.id, item.id, val)}
+                                              autoComplete="off"
+                                            />
                                           </td>
-                                          <td style={{ padding: "8px 12px" }}>
-                                            <Button variant="plain" onClick={() => handleRestoreItem(transfer.id, item.id)}>
-                                              Restore
+                                          <td style={{ padding: "6px 12px" }}>
+                                            <Button variant="plain" tone="critical" onClick={() => handleRemoveItem(transfer.id, item.id)}>
+                                              Remove
                                             </Button>
                                           </td>
                                         </tr>
                                       );
-                                    }
+                                    })}
+                                  </tbody>
+                                </table>
+                              </BlockStack>
+                            ))}
 
-                                    return (
-                                      <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
-                                        <td style={{ padding: "8px 12px" }}>
-                                          <Text>{item.productTitle}</Text>
-                                          <Text tone="subdued" variant="bodySm">{item.variantTitle} · {item.sku}</Text>
-                                        </td>
-                                        <td style={{ padding: "8px 12px" }}><Text>{item.sku}</Text></td>
-                                        <td style={{ padding: "8px 12px", width: "120px" }}>
-                                          <TextField
-                                            label=""
-                                            labelHidden
-                                            type="number"
-                                            value={qty}
-                                            onChange={val => handleQtyEdit(transfer.id, item.id, val)}
-                                            autoComplete="off"
-                                          />
-                                        </td>
-                                        <td style={{ padding: "8px 12px" }}>
-                                          <Button
-                                            variant="plain"
-                                            tone="critical"
-                                            onClick={() => handleRemoveItem(transfer.id, item.id)}
-                                          >
-                                            Remove
-                                          </Button>
-                                        </td>
-                                      </tr>
-                                    );
-                                  })}
-                                  <tr style={{ borderTop: "2px solid #e1e3e5" }}>
-                                    <td colSpan={2} style={{ padding: "8px 12px" }}>
-                                      <Text variant="headingSm">Total units</Text>
-                                    </td>
-                                    <td style={{ padding: "8px 12px" }}>
-                                      <Text variant="headingSm">{totalUnits}</Text>
-                                    </td>
-                                    <td />
-                                  </tr>
-                                </tbody>
-                              </table>
-                            </div>
                             {hasChanges && (
                               <InlineStack align="end">
                                 <Button variant="primary" onClick={() => handleSaveItems(transfer)}>

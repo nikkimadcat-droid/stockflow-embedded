@@ -11,7 +11,6 @@ import {
   Button,
   Text,
   Badge,
-  DataTable,
   Modal,
   Select,
   TextField,
@@ -31,7 +30,34 @@ function statusBadge(status) {
   return <Badge tone={map[status] ?? "info"}>{status.charAt(0).toUpperCase() + status.slice(1)}</Badge>;
 }
 
-// ── shared helper: build items from minmax ─────────────────────────────────
+function downloadCSV(po) {
+  const rows = [
+    ["PO Number", "Supplier", "Status", "Created"],
+    [po.poNumber, po.supplier?.name ?? "", po.status, new Date(po.createdAt).toLocaleDateString()],
+    [],
+    ["Product", "Variant", "SKU", "Qty Ordered", "Unit Cost", "Line Total"],
+    ...po.items.map((i) => [
+      i.productTitle,
+      i.variantTitle,
+      i.sku,
+      i.qtyOrdered,
+      i.qtyCost.toFixed(2),
+      (i.qtyOrdered * i.qtyCost).toFixed(2),
+    ]),
+    [],
+    ["", "", "", "TOTAL", "", po.items.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0).toFixed(2)],
+  ];
+
+  const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${po.poNumber}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
   const supplierSkus = await db.supplierSku.findMany({ where: { shop, supplierId } });
   const variantIds = supplierSkus.map((s) => s.variantId);
@@ -42,7 +68,6 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
   });
   if (minmaxRows.length === 0) return [];
 
-  // paginate inventory levels
   const onHandMap = {};
   let cursor = null;
   let hasMore = true;
@@ -100,7 +125,6 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
   return items;
 }
 
-// ── shared helper: build items from 30-day sales ───────────────────────────
 async function buildSalesItems(admin, db, shop, supplierId) {
   const supplierSkus = await db.supplierSku.findMany({ where: { shop, supplierId } });
   const variantIds = new Set(supplierSkus.map((s) => s.variantId));
@@ -172,7 +196,6 @@ async function buildSalesItems(admin, db, shop, supplierId) {
   return items;
 }
 
-// ── loader ─────────────────────────────────────────────────────────────────
 export const loader = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
@@ -197,14 +220,12 @@ export const loader = async ({ request }) => {
   return { purchaseOrders, suppliers, locations, shop };
 };
 
-// ── action ─────────────────────────────────────────────────────────────────
 export const action = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
   const form = await request.formData();
   const intent = form.get("intent");
 
-  // ── CREATE ────────────────────────────────────────────────────
   if (intent === "create") {
     const supplierId = form.get("supplierId");
     const notes = form.get("notes") || "";
@@ -237,11 +258,9 @@ export const action = async ({ request }) => {
         updatedAt: new Date(),
       },
     });
-
     return { ok: true, poId: po.id };
   }
 
-  // ── REGENERATE ────────────────────────────────────────────────
   if (intent === "regenerate") {
     const id = form.get("id");
     const po = await db.purchaseOrder.findUnique({ where: { id } });
@@ -251,7 +270,6 @@ export const action = async ({ request }) => {
     if (po.mode === "minmax") items = await buildMinmaxItems(admin, db, shop, po.supplierId, po.locationId);
     if (po.mode === "sales") items = await buildSalesItems(admin, db, shop, po.supplierId);
 
-    // delete old items and replace
     await db.purchaseOrderItem.deleteMany({ where: { purchaseOrderId: id } });
     await db.purchaseOrder.update({
       where: { id },
@@ -270,11 +288,9 @@ export const action = async ({ request }) => {
         },
       },
     });
-
     return { ok: true, regenerated: true };
   }
 
-  // ── UPDATE STATUS ─────────────────────────────────────────────
   if (intent === "updateStatus") {
     const id = form.get("id");
     const status = form.get("status");
@@ -282,7 +298,18 @@ export const action = async ({ request }) => {
     return { ok: true };
   }
 
-  // ── DELETE ────────────────────────────────────────────────────
+  if (intent === "updateItems") {
+    const id = form.get("id");
+    const updates = JSON.parse(form.get("updates"));
+    for (const u of updates) {
+      await db.purchaseOrderItem.update({
+        where: { id: u.id },
+        data: { qtyOrdered: Number(u.qtyOrdered), updatedAt: new Date() },
+      });
+    }
+    return { ok: true, saved: true };
+  }
+
   if (intent === "delete") {
     const id = form.get("id");
     await db.purchaseOrder.delete({ where: { id } });
@@ -292,7 +319,6 @@ export const action = async ({ request }) => {
   return { ok: false };
 };
 
-// ── component ──────────────────────────────────────────────────────────────
 export default function PurchaseOrders() {
   const { purchaseOrders, suppliers, locations } = useLoaderData();
   const fetcher = useFetcher();
@@ -303,6 +329,7 @@ export default function PurchaseOrders() {
   const [locationId, setLocationId] = useState(locations[0]?.id ?? "");
   const [notes, setNotes] = useState("");
   const [expandedId, setExpandedId] = useState(null);
+  const [qtyEdits, setQtyEdits] = useState({});
 
   const isSubmitting = fetcher.state !== "idle";
 
@@ -319,11 +346,12 @@ export default function PurchaseOrders() {
   }
 
   function handleRegenerate(id) {
-    if (!confirm("Regenerate this PO? Current line items will be replaced with fresh data.")) return;
+    if (!confirm("Regenerate this PO? Current line items will be replaced with fresh inventory data.")) return;
     const fd = new FormData();
     fd.append("intent", "regenerate");
     fd.append("id", id);
     fetcher.submit(fd, { method: "post" });
+    setQtyEdits((prev) => { const n = { ...prev }; delete n[id]; return n; });
   }
 
   function handleStatusChange(id, status) {
@@ -332,6 +360,28 @@ export default function PurchaseOrders() {
     fd.append("id", id);
     fd.append("status", status);
     fetcher.submit(fd, { method: "post" });
+  }
+
+  function handleQtyChange(poId, itemId, val) {
+    setQtyEdits((prev) => ({
+      ...prev,
+      [poId]: { ...prev[poId], [itemId]: val },
+    }));
+  }
+
+  function handleSaveQtys(po) {
+    const edits = qtyEdits[po.id];
+    if (!edits) return;
+    const updates = po.items
+      .filter((i) => edits[i.id] !== undefined)
+      .map((i) => ({ id: i.id, qtyOrdered: edits[i.id] }));
+    if (updates.length === 0) return;
+    const fd = new FormData();
+    fd.append("intent", "updateItems");
+    fd.append("id", po.id);
+    fd.append("updates", JSON.stringify(updates));
+    fetcher.submit(fd, { method: "post" });
+    setQtyEdits((prev) => { const n = { ...prev }; delete n[po.id]; return n; });
   }
 
   function handleDelete(id) {
@@ -426,8 +476,15 @@ export default function PurchaseOrders() {
 
           {!isSubmitting && purchaseOrders.map((po) => {
             const isExpanded = expandedId === po.id;
-            const totalCost = po.items.reduce((sum, i) => sum + i.qtyOrdered * i.qtyCost, 0);
-            const totalUnits = po.items.reduce((sum, i) => sum + i.qtyOrdered, 0);
+            const poEdits = qtyEdits[po.id] ?? {};
+            const hasEdits = Object.keys(poEdits).length > 0;
+
+            const displayItems = po.items.map((i) => ({
+              ...i,
+              qtyOrdered: poEdits[i.id] !== undefined ? Number(poEdits[i.id]) : i.qtyOrdered,
+            }));
+            const totalCost = displayItems.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0);
+            const totalUnits = displayItems.reduce((s, i) => s + i.qtyOrdered, 0);
 
             return (
               <div key={po.id} style={{ marginBottom: "1rem" }}>
@@ -461,6 +518,9 @@ export default function PurchaseOrders() {
                             ↺ Regenerate
                           </Button>
                         )}
+                        <Button variant="plain" onClick={() => downloadCSV({ ...po, items: displayItems })}>
+                          ↓ CSV
+                        </Button>
                         <Button variant="plain" onClick={() => setExpandedId(isExpanded ? null : po.id)}>
                           {isExpanded ? "Hide items" : "View items"}
                         </Button>
@@ -478,19 +538,59 @@ export default function PurchaseOrders() {
                             No items needed — all SKUs for this supplier are at or above their minimum levels.
                           </Banner>
                         ) : (
-                          <DataTable
-                            columnContentTypes={["text", "text", "text", "numeric", "numeric", "numeric"]}
-                            headings={["Product", "Variant", "SKU", "Qty", "Unit Cost", "Line Total"]}
-                            rows={po.items.map((item) => [
-                              item.productTitle,
-                              item.variantTitle,
-                              item.sku,
-                              item.qtyOrdered,
-                              `$${item.qtyCost.toFixed(2)}`,
-                              `$${(item.qtyOrdered * item.qtyCost).toFixed(2)}`,
-                            ])}
-                            totals={["", "", "", totalUnits, "", `$${totalCost.toFixed(2)}`]}
-                          />
+                          <BlockStack gap="300">
+                            <div style={{ overflowX: "auto" }}>
+                              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                                <thead>
+                                  <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
+                                    {["Product", "Variant", "SKU", "Qty", "Unit Cost", "Line Total"].map((h) => (
+                                      <th key={h} style={{ padding: "8px 12px", textAlign: "left" }}>
+                                        <Text variant="headingSm">{h}</Text>
+                                      </th>
+                                    ))}
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {po.items.map((item) => {
+                                    const qty = poEdits[item.id] !== undefined ? poEdits[item.id] : String(item.qtyOrdered);
+                                    const lineTotal = (Number(qty) * item.qtyCost).toFixed(2);
+                                    return (
+                                      <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
+                                        <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>
+                                        <td style={{ padding: "8px 12px" }}><Text>{item.variantTitle}</Text></td>
+                                        <td style={{ padding: "8px 12px" }}><Text>{item.sku}</Text></td>
+                                        <td style={{ padding: "8px 12px", width: "100px" }}>
+                                          <TextField
+                                            label=""
+                                            labelHidden
+                                            type="number"
+                                            value={qty}
+                                            onChange={(val) => handleQtyChange(po.id, item.id, val)}
+                                            autoComplete="off"
+                                          />
+                                        </td>
+                                        <td style={{ padding: "8px 12px" }}><Text>${item.qtyCost.toFixed(2)}</Text></td>
+                                        <td style={{ padding: "8px 12px" }}><Text>${lineTotal}</Text></td>
+                                      </tr>
+                                    );
+                                  })}
+                                  <tr style={{ borderTop: "2px solid #e1e3e5", fontWeight: "bold" }}>
+                                    <td colSpan={3} style={{ padding: "8px 12px" }}><Text variant="headingSm">Total</Text></td>
+                                    <td style={{ padding: "8px 12px" }}><Text variant="headingSm">{totalUnits}</Text></td>
+                                    <td />
+                                    <td style={{ padding: "8px 12px" }}><Text variant="headingSm">${totalCost.toFixed(2)}</Text></td>
+                                  </tr>
+                                </tbody>
+                              </table>
+                            </div>
+                            {hasEdits && (
+                              <InlineStack align="end">
+                                <Button variant="primary" onClick={() => handleSaveQtys(po)}>
+                                  Save quantity changes
+                                </Button>
+                              </InlineStack>
+                            )}
+                          </BlockStack>
                         )}
                       </>
                     )}

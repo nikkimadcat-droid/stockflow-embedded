@@ -1,6 +1,6 @@
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
-import prisma from "../db.server";
+import db from "../db.server";
 import {
   Page,
   Layout,
@@ -28,31 +28,43 @@ export const loader = async ({ request }) => {
   const locData = await locResponse.json();
   const locations = locData.data.locations.edges.map(e => e.node);
 
-  const prodResponse = await admin.graphql(`
-    query {
-      products(first: 250) {
-        edges {
-          node {
-            id
-            title
-            vendor
-            variants(first: 100) {
-              edges {
-                node {
-                  id
-                  sku
+  // paginate ALL products
+  const products = [];
+  let prodCursor = null;
+  let prodHasNext = true;
+
+  while (prodHasNext) {
+    const prodResponse = await admin.graphql(`
+      query($cursor: String) {
+        products(first: 250, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          edges {
+            node {
+              id
+              title
+              vendor
+              variants(first: 100) {
+                edges {
+                  node {
+                    id
+                    sku
+                  }
                 }
               }
             }
           }
         }
       }
-    }
-  `);
-  const prodData = await prodResponse.json();
-  const products = prodData.data.products.edges.map(e => e.node);
+    `, { variables: { cursor: prodCursor } });
 
-  // Fetch all inventory levels with pagination per location
+    const prodData = await prodResponse.json();
+    const page = prodData.data.products;
+    products.push(...page.edges.map(e => e.node));
+    prodHasNext = page.pageInfo.hasNextPage;
+    prodCursor = page.pageInfo.endCursor;
+  }
+
+  // paginate inventory levels per location
   const invMap = {};
 
   for (const location of locations) {
@@ -95,7 +107,7 @@ export const loader = async ({ request }) => {
     }
   }
 
-  const savedMinMax = await prisma.minMax.findMany({ where: { shop } });
+  const savedMinMax = await db.minMax.findMany({ where: { shop } });
   const minMaxMap = {};
   for (const mm of savedMinMax) {
     minMaxMap[`${mm.variantId}__${mm.locationId}`] = mm;
@@ -111,7 +123,7 @@ export const action = async ({ request }) => {
   const updates = JSON.parse(formData.get("updates"));
 
   for (const u of updates) {
-    await prisma.minMax.upsert({
+    await db.minMax.upsert({
       where: {
         shop_variantId_locationId: {
           shop,
@@ -135,7 +147,7 @@ export const action = async ({ request }) => {
     });
 
     if (u.casePackSize) {
-      await prisma.minMax.updateMany({
+      await db.minMax.updateMany({
         where: {
           shop,
           variantId: u.variantId,

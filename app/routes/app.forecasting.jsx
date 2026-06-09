@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import {
@@ -12,6 +12,7 @@ import {
   Text,
   Badge,
   Spinner,
+  Banner,
 } from "@shopify/polaris";
 
 export const loader = async ({ request }) => {
@@ -27,7 +28,6 @@ export const loader = async ({ request }) => {
   const locJson = await locRes.json();
   const locations = locJson.data.locations.edges.map(e => e.node);
 
-  // paginate all products just for vendor and type filter lists
   const vendors = new Set();
   const types = new Set();
   let cursor = null;
@@ -59,6 +59,49 @@ export const loader = async ({ request }) => {
   };
 };
 
+async function fetchOrderSales(admin, sinceStr, untilStr, variantIds) {
+  const salesMap = {};
+  let cursor = null;
+  let hasMore = true;
+
+  while (hasMore) {
+    const res = await admin.graphql(`
+      query($cursor: String, $query: String!) {
+        orders(first: 250, after: $cursor, query: $query) {
+          pageInfo { hasNextPage endCursor }
+          edges {
+            node {
+              lineItems(first: 50) {
+                edges {
+                  node {
+                    variant { id }
+                    quantity
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `, { variables: { cursor, query: `created_at:>="${sinceStr}" created_at:<="${untilStr}"` } });
+
+    const json = await res.json();
+    const data = json.data?.orders;
+    hasMore = data?.pageInfo?.hasNextPage ?? false;
+    cursor = data?.pageInfo?.endCursor ?? null;
+
+    for (const o of data?.edges ?? []) {
+      for (const li of o.node.lineItems.edges) {
+        const vid = li.node.variant?.id;
+        if (vid && variantIds.has(vid)) {
+          salesMap[vid] = (salesMap[vid] ?? 0) + li.node.quantity;
+        }
+      }
+    }
+  }
+  return salesMap;
+}
+
 export const action = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
   const form = await request.formData();
@@ -71,12 +114,17 @@ export const action = async ({ request }) => {
     const days = Number(form.get("days")) || 30;
     const lowStockDays = Number(form.get("lowStockDays")) || 14;
 
-    // date ranges
     const now = new Date();
     const periodStart = new Date(now);
     periodStart.setDate(periodStart.getDate() - days);
     const prevStart = new Date(periodStart);
     prevStart.setDate(prevStart.getDate() - days);
+
+    const fmt = (d) => d.toISOString().split("T")[0];
+    const currentSince = fmt(periodStart);
+    const currentUntil = fmt(now);
+    const prevSince = fmt(prevStart);
+    const prevUntil = fmt(periodStart);
 
     // fetch filtered products
     const products = [];
@@ -127,7 +175,6 @@ export const action = async ({ request }) => {
       (!typeFilter || p.productType === typeFilter)
     );
 
-    // build variant lookup
     const variantMap = {};
     for (const p of filtered) {
       for (const { node: v } of p.variants.edges) {
@@ -146,91 +193,20 @@ export const action = async ({ request }) => {
 
     const variantIds = new Set(Object.keys(variantMap));
 
-    // fetch current period orders
-    const currentSinceStr = periodStart.toISOString();
-    const currentUntilStr = now.toISOString();
-    let ordCursor = null;
-    let ordHasMore = true;
+    // fetch current and previous period orders in parallel
+    const [currentSalesMap, prevSalesMap] = await Promise.all([
+      fetchOrderSales(admin, currentSince, currentUntil, variantIds),
+      fetchOrderSales(admin, prevSince, prevUntil, variantIds),
+    ]);
 
-    while (ordHasMore) {
-      const ordRes = await admin.graphql(`
-        query($cursor: String, $query: String!) {
-          orders(first: 50, after: $cursor, query: $query) {
-            pageInfo { hasNextPage endCursor }
-            edges {
-              node {
-                lineItems(first: 50) {
-                  edges {
-                    node {
-                      variant { id }
-                      quantity
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      `, { variables: { cursor: ordCursor, query: `created_at:>${currentSinceStr} created_at:<${currentUntilStr}` } });
-
-      const ordJson = await ordRes.json();
-      const ordData = ordJson.data?.orders;
-      ordHasMore = ordData?.pageInfo?.hasNextPage ?? false;
-      ordCursor = ordData?.pageInfo?.endCursor ?? null;
-
-      for (const o of ordData?.edges ?? []) {
-        for (const li of o.node.lineItems.edges) {
-          const vid = li.node.variant?.id;
-          if (vid && variantIds.has(vid)) {
-            variantMap[vid].currentSales += li.node.quantity;
-          }
-        }
-      }
+    for (const [vid, qty] of Object.entries(currentSalesMap)) {
+      if (variantMap[vid]) variantMap[vid].currentSales = qty;
+    }
+    for (const [vid, qty] of Object.entries(prevSalesMap)) {
+      if (variantMap[vid]) variantMap[vid].prevSales = qty;
     }
 
-    // fetch previous period orders
-    const prevSinceStr = prevStart.toISOString();
-    const prevUntilStr = periodStart.toISOString();
-    let prevCursor = null;
-    let prevHasMore = true;
-
-    while (prevHasMore) {
-      const prevRes = await admin.graphql(`
-        query($cursor: String, $query: String!) {
-          orders(first: 50, after: $cursor, query: $query) {
-            pageInfo { hasNextPage endCursor }
-            edges {
-              node {
-                lineItems(first: 50) {
-                  edges {
-                    node {
-                      variant { id }
-                      quantity
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      `, { variables: { cursor: prevCursor, query: `created_at:>${prevSinceStr} created_at:<${prevUntilStr}` } });
-
-      const prevJson = await prevRes.json();
-      const prevData = prevJson.data?.orders;
-      prevHasMore = prevData?.pageInfo?.hasNextPage ?? false;
-      prevCursor = prevData?.pageInfo?.endCursor ?? null;
-
-      for (const o of prevData?.edges ?? []) {
-        for (const li of o.node.lineItems.edges) {
-          const vid = li.node.variant?.id;
-          if (vid && variantIds.has(vid)) {
-            variantMap[vid].prevSales += li.node.quantity;
-          }
-        }
-      }
-    }
-
-    // fetch inventory levels for this location
+    // fetch inventory levels
     let invCursor = null;
     let invHasMore = true;
     while (invHasMore) {
@@ -311,6 +287,8 @@ export default function Forecasting() {
   const [rows, setRows] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [loadedDays, setLoadedDays] = useState(30);
+  const [sortField, setSortField] = useState("productTitle");
+  const [sortDir, setSortDir] = useState("asc");
 
   const isSubmitting = fetcher.state !== "idle";
 
@@ -331,6 +309,66 @@ export default function Forecasting() {
     fd.append("days", days);
     fd.append("lowStockDays", lowStockDays);
     fetcher.submit(fd, { method: "post" });
+  }
+
+  function handleSort(field) {
+    if (sortField === field) {
+      setSortDir(d => d === "asc" ? "desc" : "asc");
+    } else {
+      setSortField(field);
+      setSortDir("asc");
+    }
+  }
+
+  function downloadCSV() {
+    const headers = ["Product", "Vendor", "SKU", "This Period", "Prev Period", "Trend", "Change %", "On Hand", "Days Left"];
+    const csvRows = [
+      headers,
+      ...sortedRows.map(r => [
+        r.productTitle,
+        r.vendor,
+        r.sku,
+        r.currentSales,
+        r.prevSales,
+        r.trend,
+        r.changePercent + "%",
+        r.onHand,
+        r.daysOfStock ?? "—",
+      ]),
+    ];
+    const csv = csvRows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `forecast-${days}day-${new Date().toISOString().split("T")[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const sortedRows = useMemo(() => {
+    if (!rows.length) return [];
+    return [...rows].sort((a, b) => {
+      let av = a[sortField];
+      let bv = b[sortField];
+      if (av === null) av = -1;
+      if (bv === null) bv = -1;
+      if (typeof av === "string") return sortDir === "asc" ? av.localeCompare(bv) : bv.localeCompare(av);
+      return sortDir === "asc" ? av - bv : bv - av;
+    });
+  }, [rows, sortField, sortDir]);
+
+  function SortHeader({ field, label, align = "left" }) {
+    const active = sortField === field;
+    const arrow = active ? (sortDir === "asc" ? " ↑" : " ↓") : " ↕";
+    return (
+      <th
+        style={{ padding: "8px 12px", textAlign: align, cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}
+        onClick={() => handleSort(field)}
+      >
+        <Text variant="headingSm">{label}{arrow}</Text>
+      </th>
+    );
   }
 
   function trendBadge(row) {
@@ -371,17 +409,11 @@ export default function Forecasting() {
       <Layout>
         <Layout.Section>
 
-          {/* filters */}
           <Card>
             <BlockStack gap="400">
               <InlineStack gap="400" wrap>
                 <div style={{ minWidth: "180px" }}>
-                  <Select
-                    label="Location"
-                    options={locationOptions}
-                    value={locationId}
-                    onChange={setLocationId}
-                  />
+                  <Select label="Location" options={locationOptions} value={locationId} onChange={setLocationId} />
                 </div>
                 <div style={{ minWidth: "180px" }}>
                   <Select
@@ -400,20 +432,10 @@ export default function Forecasting() {
                   />
                 </div>
                 <div style={{ minWidth: "140px" }}>
-                  <Select
-                    label="Period"
-                    options={daysOptions}
-                    value={days}
-                    onChange={setDays}
-                  />
+                  <Select label="Period" options={daysOptions} value={days} onChange={setDays} />
                 </div>
                 <div style={{ minWidth: "160px" }}>
-                  <Select
-                    label="Flag low stock under"
-                    options={lowStockOptions}
-                    value={lowStockDays}
-                    onChange={setLowStockDays}
-                  />
+                  <Select label="Flag low stock under" options={lowStockOptions} value={lowStockDays} onChange={setLowStockDays} />
                 </div>
                 <div style={{ paddingTop: "24px" }}>
                   <Button variant="primary" onClick={handleLoad} loading={isSubmitting}>
@@ -421,10 +443,14 @@ export default function Forecasting() {
                   </Button>
                 </div>
               </InlineStack>
+              {days === "90" && (
+                <Banner tone="warning">
+                  90-day comparisons look back 180 days total. Previous period data may be incomplete on the Shopify Grow plan — results will still show current period sales and days of stock accurately.
+                </Banner>
+              )}
             </BlockStack>
           </Card>
 
-          {/* loading */}
           {isSubmitting && (
             <div style={{ textAlign: "center", padding: "2rem" }}>
               <Spinner size="large" />
@@ -434,36 +460,37 @@ export default function Forecasting() {
             </div>
           )}
 
-          {/* summary */}
           {loaded && !isSubmitting && (
             <Card>
-              <InlineStack gap="400" blockAlign="center">
-                <Text variant="headingSm">{rows.length} SKUs · {loadedDays}-day comparison</Text>
-                {lowStockCount > 0 && <Badge tone="critical">🔴 {lowStockCount} low stock</Badge>}
-                {slowingCount > 0 && <Badge tone="critical">📉 {slowingCount} slowing</Badge>}
-                {spikingCount > 0 && <Badge tone="warning">📈 {spikingCount} spiking</Badge>}
+              <InlineStack align="space-between" blockAlign="center">
+                <InlineStack gap="400" blockAlign="center">
+                  <Text variant="headingSm">{rows.length} SKUs · {loadedDays}-day comparison</Text>
+                  {lowStockCount > 0 && <Badge tone="critical">🔴 {lowStockCount} low stock</Badge>}
+                  {slowingCount > 0 && <Badge tone="critical">📉 {slowingCount} slowing</Badge>}
+                  {spikingCount > 0 && <Badge tone="warning">📈 {spikingCount} spiking</Badge>}
+                </InlineStack>
+                <Button onClick={downloadCSV}>↓ Export CSV</Button>
               </InlineStack>
             </Card>
           )}
 
-          {/* table */}
-          {loaded && !isSubmitting && rows.length > 0 && (
+          {loaded && !isSubmitting && sortedRows.length > 0 && (
             <Card>
               <div style={{ overflowX: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead>
                     <tr style={{ borderBottom: "2px solid #e1e3e5" }}>
-                      <th style={{ padding: "8px 12px", textAlign: "left" }}><Text variant="headingSm">Product</Text></th>
-                      <th style={{ padding: "8px 12px", textAlign: "left" }}><Text variant="headingSm">SKU</Text></th>
-                      <th style={{ padding: "8px 12px", textAlign: "right" }}><Text variant="headingSm">This period</Text></th>
-                      <th style={{ padding: "8px 12px", textAlign: "right" }}><Text variant="headingSm">Prev period</Text></th>
-                      <th style={{ padding: "8px 12px", textAlign: "center" }}><Text variant="headingSm">Trend</Text></th>
-                      <th style={{ padding: "8px 12px", textAlign: "right" }}><Text variant="headingSm">On Hand</Text></th>
-                      <th style={{ padding: "8px 12px", textAlign: "right" }}><Text variant="headingSm">Days left</Text></th>
+                      <SortHeader field="productTitle" label="Product" />
+                      <SortHeader field="sku" label="SKU" />
+                      <SortHeader field="currentSales" label="This period" align="right" />
+                      <SortHeader field="prevSales" label="Prev period" align="right" />
+                      <SortHeader field="changePercent" label="Trend" align="center" />
+                      <SortHeader field="onHand" label="On Hand" align="right" />
+                      <SortHeader field="daysOfStock" label="Days left" align="right" />
                     </tr>
                   </thead>
                   <tbody>
-                    {rows.map((row) => (
+                    {sortedRows.map((row) => (
                       <tr
                         key={row.variantId}
                         style={{
@@ -481,21 +508,11 @@ export default function Forecasting() {
                           <Text tone="subdued" variant="bodySm">{row.vendor}</Text>
                         </td>
                         <td style={{ padding: "8px 12px" }}><Text>{row.sku}</Text></td>
-                        <td style={{ padding: "8px 12px", textAlign: "right" }}>
-                          <Text>{row.currentSales}</Text>
-                        </td>
-                        <td style={{ padding: "8px 12px", textAlign: "right" }}>
-                          <Text tone="subdued">{row.prevSales}</Text>
-                        </td>
-                        <td style={{ padding: "8px 12px", textAlign: "center" }}>
-                          {trendBadge(row)}
-                        </td>
-                        <td style={{ padding: "8px 12px", textAlign: "right" }}>
-                          <Text>{row.onHand}</Text>
-                        </td>
-                        <td style={{ padding: "8px 12px", textAlign: "right" }}>
-                          {daysOfStockBadge(row)}
-                        </td>
+                        <td style={{ padding: "8px 12px", textAlign: "right" }}><Text>{row.currentSales}</Text></td>
+                        <td style={{ padding: "8px 12px", textAlign: "right" }}><Text tone="subdued">{row.prevSales}</Text></td>
+                        <td style={{ padding: "8px 12px", textAlign: "center" }}>{trendBadge(row)}</td>
+                        <td style={{ padding: "8px 12px", textAlign: "right" }}><Text>{row.onHand}</Text></td>
+                        <td style={{ padding: "8px 12px", textAlign: "right" }}>{daysOfStockBadge(row)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -504,7 +521,7 @@ export default function Forecasting() {
             </Card>
           )}
 
-          {loaded && !isSubmitting && rows.length === 0 && (
+          {loaded && !isSubmitting && sortedRows.length === 0 && (
             <Card>
               <Text tone="subdued">No sales data found for this filter and period.</Text>
             </Card>

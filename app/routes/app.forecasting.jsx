@@ -59,10 +59,13 @@ export const loader = async ({ request }) => {
   };
 };
 
-async function fetchOrderSales(admin, sinceStr, untilStr, variantIds) {
+async function fetchOrderSales(admin, sinceStr, untilStr, variantIds, locationId) {
   const salesMap = {};
   let cursor = null;
   let hasMore = true;
+
+  // extract the numeric ID from the GID for the location filter
+  const locationNumericId = locationId.split("/").pop();
 
   while (hasMore) {
     const res = await admin.graphql(`
@@ -83,7 +86,7 @@ async function fetchOrderSales(admin, sinceStr, untilStr, variantIds) {
           }
         }
       }
-    `, { variables: { cursor, query: `created_at:>="${sinceStr}" created_at:<="${untilStr}"` } });
+    `, { variables: { cursor, query: `created_at:>="${sinceStr}" created_at:<="${untilStr}" location_id:${locationNumericId}` } });
 
     const json = await res.json();
     const data = json.data?.orders;
@@ -193,10 +196,10 @@ export const action = async ({ request }) => {
 
     const variantIds = new Set(Object.keys(variantMap));
 
-    // fetch current and previous period orders in parallel
+    // fetch current and previous period orders in parallel, filtered by location
     const [currentSalesMap, prevSalesMap] = await Promise.all([
-      fetchOrderSales(admin, currentSince, currentUntil, variantIds),
-      fetchOrderSales(admin, prevSince, prevUntil, variantIds),
+      fetchOrderSales(admin, currentSince, currentUntil, variantIds, locationId),
+      fetchOrderSales(admin, prevSince, prevUntil, variantIds, locationId),
     ]);
 
     for (const [vid, qty] of Object.entries(currentSalesMap)) {
@@ -206,7 +209,7 @@ export const action = async ({ request }) => {
       if (variantMap[vid]) variantMap[vid].prevSales = qty;
     }
 
-    // fetch inventory levels
+    // fetch inventory levels for this location
     let invCursor = null;
     let invHasMore = true;
     while (invHasMore) {
@@ -341,7 +344,7 @@ export default function Forecasting() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `forecast-${days}day-${new Date().toISOString().split("T")[0]}.csv`;
+    a.download = `forecast-${days}day-${locations.find(l => l.id === locationId)?.name ?? "store"}-${new Date().toISOString().split("T")[0]}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -413,7 +416,12 @@ export default function Forecasting() {
             <BlockStack gap="400">
               <InlineStack gap="400" wrap>
                 <div style={{ minWidth: "180px" }}>
-                  <Select label="Location" options={locationOptions} value={locationId} onChange={setLocationId} />
+                  <Select
+                    label="Location"
+                    options={locationOptions}
+                    value={locationId}
+                    onChange={val => { setLocationId(val); setLoaded(false); setRows([]); }}
+                  />
                 </div>
                 <div style={{ minWidth: "180px" }}>
                   <Select
@@ -443,9 +451,12 @@ export default function Forecasting() {
                   </Button>
                 </div>
               </InlineStack>
-              {days === "90" && (
+
+              {days !== "30" && (
                 <Banner tone="warning">
-                  90-day comparisons look back 180 days total. Previous period data may be incomplete on the Shopify Grow plan — results will still show current period sales and days of stock accurately.
+                  Period-over-period comparison is only reliable on the 30-day window on the Shopify Grow plan.
+                  {days === "90" ? " 90-day runs look back 180 days total and previous period data will likely be missing." : " 60-day previous period data may be incomplete."}
+                  {" "}Current period sales and days-of-stock are accurate for any window.
                 </Banner>
               )}
             </BlockStack>
@@ -455,7 +466,7 @@ export default function Forecasting() {
             <div style={{ textAlign: "center", padding: "2rem" }}>
               <Spinner size="large" />
               <div style={{ marginTop: "1rem" }}>
-                <Text>Pulling sales data — this may take a moment…</Text>
+                <Text>Pulling sales data for {locations.find(l => l.id === locationId)?.name ?? "this location"} — this may take a moment…</Text>
               </div>
             </div>
           )}
@@ -464,7 +475,9 @@ export default function Forecasting() {
             <Card>
               <InlineStack align="space-between" blockAlign="center">
                 <InlineStack gap="400" blockAlign="center">
-                  <Text variant="headingSm">{rows.length} SKUs · {loadedDays}-day comparison</Text>
+                  <Text variant="headingSm">
+                    {rows.length} SKUs · {loadedDays}-day · {locations.find(l => l.id === locationId)?.name ?? ""}
+                  </Text>
                   {lowStockCount > 0 && <Badge tone="critical">🔴 {lowStockCount} low stock</Badge>}
                   {slowingCount > 0 && <Badge tone="critical">📉 {slowingCount} slowing</Badge>}
                   {spikingCount > 0 && <Badge tone="warning">📈 {spikingCount} spiking</Badge>}
@@ -523,7 +536,7 @@ export default function Forecasting() {
 
           {loaded && !isSubmitting && sortedRows.length === 0 && (
             <Card>
-              <Text tone="subdued">No sales data found for this filter and period.</Text>
+              <Text tone="subdued">No sales data found for this location, filter, and period.</Text>
             </Card>
           )}
 

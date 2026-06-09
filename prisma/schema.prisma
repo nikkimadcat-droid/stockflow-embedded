@@ -101,28 +101,37 @@ model PurchaseOrderItem {
 }
 
 model TransferTemplate {
-  id             String     @id @default(cuid())
+  id             String                   @id @default(cuid())
   shop           String
   name           String
+  type           String                   @default("simple")
   fromLocationId String
   toLocationId   String
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
+  createdAt      DateTime                 @default(now())
+  updatedAt      DateTime                 @updatedAt
+  vendors        TransferTemplateVendor[]
   transfers      Transfer[]
 }
 
+model TransferTemplateVendor {
+  id         String           @id @default(cuid())
+  templateId String
+  template   TransferTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  vendor     String
+}
+
 model Transfer {
-  id             String         @id @default(cuid())
+  id             String            @id @default(cuid())
   shop           String
   transferNumber String
   templateId     String?
   template       TransferTemplate? @relation(fields: [templateId], references: [id])
   fromLocationId String
   toLocationId   String
-  status         String         @default("draft")
+  status         String            @default("draft")
   notes          String?
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
   items          TransferItem[]
 }
 
@@ -133,6 +142,7 @@ model TransferItem {
   variantId     String
   productTitle  String
   variantTitle  String
+  vendor        String   @default("")
   sku           String
   qty           Int
   updatedAt     DateTime @updatedAt

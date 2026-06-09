@@ -14,7 +14,7 @@ import {
   Banner,
   Spinner,
 } from "@shopify/polaris";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
@@ -30,7 +30,6 @@ export const loader = async ({ request }) => {
   const locData = await locResponse.json();
   const locations = locData.data.locations.edges.map(e => e.node);
 
-  // paginate just vendor and product type for filters
   const vendors = new Set();
   const types = new Set();
   let cursor = null;
@@ -73,7 +72,6 @@ export const action = async ({ request }) => {
     const vendorFilter = formData.get("vendorFilter");
     const typeFilter = formData.get("typeFilter");
 
-    // fetch filtered products
     const products = [];
     let cursor = null;
     let hasMore = true;
@@ -123,7 +121,6 @@ export const action = async ({ request }) => {
       }
     }
 
-    // paginate inventory levels for this location
     const invMap = {};
     let invCursor = null;
     let invHasMore = true;
@@ -157,7 +154,6 @@ export const action = async ({ request }) => {
       }
     }
 
-    // get saved min/max for these variants at this location
     const savedMinMax = await db.minMax.findMany({
       where: { shop, locationId, variantId: { in: [...variantIds] } },
     });
@@ -166,7 +162,6 @@ export const action = async ({ request }) => {
       minMaxMap[mm.variantId] = mm;
     }
 
-    // build rows sorted alphabetically
     const rows = filtered
       .flatMap(p =>
         p.variants.edges.map(({ node: v }) => ({
@@ -182,7 +177,7 @@ export const action = async ({ request }) => {
       )
       .sort((a, b) => a.productTitle.localeCompare(b.productTitle));
 
-    return { ok: true, rows, locationId };
+    return { ok: true, intent: "fetchProducts", rows, locationId };
   }
 
   if (intent === "save") {
@@ -213,7 +208,6 @@ export const action = async ({ request }) => {
         },
       });
 
-      // sync case pack across all locations
       if (u.casePackSize) {
         await db.minMax.updateMany({
           where: {
@@ -226,7 +220,7 @@ export const action = async ({ request }) => {
       }
     }
 
-    return { ok: true, saved: true };
+    return { ok: true, intent: "save", saved: true };
   }
 
   return { ok: false };
@@ -243,24 +237,53 @@ export default function MinMax() {
   const [edits, setEdits] = useState({});
   const [loaded, setLoaded] = useState(false);
   const [loadedLocationId, setLoadedLocationId] = useState("");
+  const [showSaved, setShowSaved] = useState(false);
+
+  // keep a ref to edits so we can access current value in the save merge
+  const editsRef = useRef(edits);
+  editsRef.current = edits;
 
   const isSubmitting = fetcher.state !== "idle";
   const isSaving = isSubmitting && fetcher.formData?.get("intent") === "save";
   const isLoading = isSubmitting && fetcher.formData?.get("intent") === "fetchProducts";
 
-  if (fetcher.data?.rows && fetcher.data.rows !== rows) {
-    setRows(fetcher.data.rows);
-    setLoadedLocationId(fetcher.data.locationId);
-    setLoaded(true);
-    setEdits({});
-  }
+  // handle fetcher responses
+  const lastDataRef = useRef(null);
+  if (fetcher.data && fetcher.data !== lastDataRef.current) {
+    lastDataRef.current = fetcher.data;
 
-  const saved = fetcher.data?.saved && !isSubmitting;
+    if (fetcher.data.intent === "fetchProducts" && fetcher.data.rows) {
+      setRows(fetcher.data.rows);
+      setLoadedLocationId(fetcher.data.locationId);
+      setLoaded(true);
+      setEdits({});
+      setShowSaved(false);
+    }
+
+    if (fetcher.data.intent === "save" && fetcher.data.saved) {
+      // merge saved edits into rows so values persist without reloading
+      const currentEdits = editsRef.current;
+      setRows(prev => prev.map(r => {
+        const e = currentEdits[r.variantId];
+        if (!e) return r;
+        return {
+          ...r,
+          minLevel: e.minLevel !== undefined ? parseInt(e.minLevel) || 0 : r.minLevel,
+          maxLevel: e.maxLevel !== undefined ? parseInt(e.maxLevel) || 0 : r.maxLevel,
+          casePackSize: e.casePackSize !== undefined ? parseInt(e.casePackSize) || 1 : r.casePackSize,
+        };
+      }));
+      setEdits({});
+      setShowSaved(true);
+      setTimeout(() => setShowSaved(false), 3000);
+    }
+  }
 
   function handleLoad() {
     setLoaded(false);
     setRows([]);
     setEdits({});
+    setShowSaved(false);
     const fd = new FormData();
     fd.append("intent", "fetchProducts");
     fd.append("locationId", selectedLocation);
@@ -292,17 +315,18 @@ export default function MinMax() {
     fd.append("locationId", loadedLocationId);
     fd.append("updates", JSON.stringify(updates));
     fetcher.submit(fd, { method: "POST" });
-    setEdits({});
   }
 
   function getValue(variantId, field) {
     if (edits[variantId]?.[field] !== undefined) return edits[variantId][field];
     const row = rows.find(r => r.variantId === variantId);
-    return String(row?.[field] ?? (field === "casePackSize" ? 1 : 0));
+    if (field === "casePackSize") return String(row?.casePackSize ?? 1);
+    return String(row?.[field] ?? 0);
   }
 
   function getStatus(variantId, onHand) {
-    const min = parseInt(edits[variantId]?.minLevel ?? rows.find(r => r.variantId === variantId)?.minLevel ?? 0);
+    const row = rows.find(r => r.variantId === variantId);
+    const min = parseInt(edits[variantId]?.minLevel ?? row?.minLevel ?? 0);
     if (min === 0) return "—";
     if (onHand <= min) return "⚠️ Reorder";
     return "OK";
@@ -321,7 +345,7 @@ export default function MinMax() {
           variant="primary"
           onClick={handleSave}
           loading={isSaving}
-          disabled={!hasEdits}
+          disabled={!hasEdits || isSaving}
         >
           Save changes
         </Button>
@@ -330,13 +354,12 @@ export default function MinMax() {
       <Layout>
         <Layout.Section>
 
-          {saved && (
+          {showSaved && (
             <div style={{ marginBottom: "1rem" }}>
               <Banner tone="success">Saved successfully.</Banner>
             </div>
           )}
 
-          {/* filters */}
           <Card>
             <BlockStack gap="400">
               <InlineStack gap="400" wrap>
@@ -345,7 +368,12 @@ export default function MinMax() {
                     label="Location"
                     options={locationOptions}
                     value={selectedLocation}
-                    onChange={val => { setSelectedLocation(val); setLoaded(false); setRows([]); }}
+                    onChange={val => {
+                      setSelectedLocation(val);
+                      setLoaded(false);
+                      setRows([]);
+                      setEdits({});
+                    }}
                   />
                 </div>
                 <div style={{ minWidth: "200px" }}>
@@ -353,7 +381,10 @@ export default function MinMax() {
                     label="Vendor"
                     options={vendorOptions}
                     value={vendorFilter}
-                    onChange={val => { setVendorFilter(val); if (val) setTypeFilter(""); }}
+                    onChange={val => {
+                      setVendorFilter(val);
+                      if (val) setTypeFilter("");
+                    }}
                   />
                 </div>
                 <div style={{ minWidth: "200px" }}>
@@ -361,7 +392,10 @@ export default function MinMax() {
                     label="Product Type"
                     options={typeOptions}
                     value={typeFilter}
-                    onChange={val => { setTypeFilter(val); if (val) setVendorFilter(""); }}
+                    onChange={val => {
+                      setTypeFilter(val);
+                      if (val) setVendorFilter("");
+                    }}
                   />
                 </div>
                 <div style={{ paddingTop: "24px" }}>
@@ -374,13 +408,12 @@ export default function MinMax() {
                   </Button>
                 </div>
               </InlineStack>
-              {loaded && (
+              {loaded && !isLoading && (
                 <Text tone="subdued">{rows.length} SKUs loaded</Text>
               )}
             </BlockStack>
           </Card>
 
-          {/* loading */}
           {isLoading && (
             <div style={{ textAlign: "center", padding: "2rem" }}>
               <Spinner size="large" />
@@ -390,7 +423,6 @@ export default function MinMax() {
             </div>
           )}
 
-          {/* table */}
           {loaded && !isLoading && rows.length > 0 && (
             <Card>
               <div style={{ overflowX: "auto" }}>

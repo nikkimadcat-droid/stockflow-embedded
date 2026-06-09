@@ -94,6 +94,7 @@ model PurchaseOrderItem {
   productTitle    String
   variantTitle    String
   sku             String
+  supplierCode    String        @default("")
   qtyOrdered      Int
   qtyCost         Float
   updatedAt       DateTime      @updatedAt

@@ -35,8 +35,9 @@ function downloadCSV(po) {
     ["PO Number", "Supplier", "Status", "Created"],
     [po.poNumber, po.supplier?.name ?? "", po.status, new Date(po.createdAt).toLocaleDateString()],
     [],
-    ["Product", "Variant", "SKU", "Qty Ordered", "Unit Cost", "Line Total"],
+    ["Supplier Code", "Product", "Variant", "SKU", "Qty Ordered", "Unit Cost", "Line Total"],
     ...po.items.map((i) => [
+      i.supplierCode ?? "",
       i.productTitle,
       i.variantTitle,
       i.sku,
@@ -45,7 +46,7 @@ function downloadCSV(po) {
       (i.qtyOrdered * i.qtyCost).toFixed(2),
     ]),
     [],
-    ["", "", "", "TOTAL", "", po.items.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0).toFixed(2)],
+    ["", "", "", "TOTAL", "", "", po.items.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0).toFixed(2)],
   ];
 
   const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
@@ -118,6 +119,7 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
       productTitle: onHand.productTitle,
       variantTitle: onHand.variantTitle,
       sku: onHand.sku,
+      supplierCode: skuRec?.supplierCode ?? "",
       qtyOrdered,
       qtyCost: skuRec?.cost ?? 0,
     });
@@ -189,6 +191,7 @@ async function buildSalesItems(admin, db, shop, supplierId) {
       productTitle: data.productTitle,
       variantTitle: data.variantTitle,
       sku: data.sku,
+      supplierCode: skuRec?.supplierCode ?? "",
       qtyOrdered: data.qty,
       qtyCost: skuRec?.cost ?? 0,
     });
@@ -250,6 +253,7 @@ export const action = async ({ request }) => {
             productTitle: i.productTitle,
             variantTitle: i.variantTitle,
             sku: i.sku,
+            supplierCode: i.supplierCode ?? "",
             qtyOrdered: Number(i.qtyOrdered),
             qtyCost: Number(i.qtyCost),
             updatedAt: new Date(),
@@ -281,6 +285,7 @@ export const action = async ({ request }) => {
             productTitle: i.productTitle,
             variantTitle: i.variantTitle,
             sku: i.sku,
+            supplierCode: i.supplierCode ?? "",
             qtyOrdered: Number(i.qtyOrdered),
             qtyCost: Number(i.qtyCost),
             updatedAt: new Date(),
@@ -301,11 +306,31 @@ export const action = async ({ request }) => {
   if (intent === "updateItems") {
     const id = form.get("id");
     const updates = JSON.parse(form.get("updates"));
+    const removedIds = JSON.parse(form.get("removedIds") || "[]");
+
+    // delete removed items
+    if (removedIds.length > 0) {
+      await db.purchaseOrderItem.deleteMany({
+        where: { id: { in: removedIds } },
+      });
+    }
+
+    // update remaining items
     for (const u of updates) {
       await db.purchaseOrderItem.update({
         where: { id: u.id },
-        data: { qtyOrdered: Number(u.qtyOrdered), updatedAt: new Date() },
+        data: {
+          qtyOrdered: Number(u.qtyOrdered),
+          supplierCode: u.supplierCode,
+          updatedAt: new Date(),
+        },
       });
+      if (u.supplierCode !== undefined) {
+        await db.supplierSku.updateMany({
+          where: { shop, variantId: u.variantId, supplierId: u.supplierId },
+          data: { supplierCode: u.supplierCode },
+        });
+      }
     }
     return { ok: true, saved: true };
   }
@@ -329,7 +354,8 @@ export default function PurchaseOrders() {
   const [locationId, setLocationId] = useState(locations[0]?.id ?? "");
   const [notes, setNotes] = useState("");
   const [expandedId, setExpandedId] = useState(null);
-  const [qtyEdits, setQtyEdits] = useState({});
+  const [itemEdits, setItemEdits] = useState({});
+  const [removedItems, setRemovedItems] = useState({});
 
   const isSubmitting = fetcher.state !== "idle";
 
@@ -351,7 +377,8 @@ export default function PurchaseOrders() {
     fd.append("intent", "regenerate");
     fd.append("id", id);
     fetcher.submit(fd, { method: "post" });
-    setQtyEdits((prev) => { const n = { ...prev }; delete n[id]; return n; });
+    setItemEdits((prev) => { const n = { ...prev }; delete n[id]; return n; });
+    setRemovedItems((prev) => { const n = { ...prev }; delete n[id]; return n; });
   }
 
   function handleStatusChange(id, status) {
@@ -362,26 +389,62 @@ export default function PurchaseOrders() {
     fetcher.submit(fd, { method: "post" });
   }
 
-  function handleQtyChange(poId, itemId, val) {
-    setQtyEdits((prev) => ({
+  function handleItemEdit(poId, itemId, field, val) {
+    setItemEdits((prev) => ({
       ...prev,
-      [poId]: { ...prev[poId], [itemId]: val },
+      [poId]: {
+        ...prev[poId],
+        [itemId]: { ...prev[poId]?.[itemId], [field]: val },
+      },
     }));
   }
 
-  function handleSaveQtys(po) {
-    const edits = qtyEdits[po.id];
-    if (!edits) return;
+  function handleRemoveItem(poId, itemId) {
+    setRemovedItems((prev) => ({
+      ...prev,
+      [poId]: new Set([...(prev[poId] ?? []), itemId]),
+    }));
+    // also clear any edits for this item
+    setItemEdits((prev) => {
+      const poEdits = { ...prev[poId] };
+      delete poEdits[itemId];
+      return { ...prev, [poId]: poEdits };
+    });
+  }
+
+  function handleRestoreItem(poId, itemId) {
+    setRemovedItems((prev) => {
+      const s = new Set(prev[poId] ?? []);
+      s.delete(itemId);
+      return { ...prev, [poId]: s };
+    });
+  }
+
+  function handleSaveItems(po) {
+    const edits = itemEdits[po.id] ?? {};
+    const removed = removedItems[po.id] ?? new Set();
+    const hasEdits = Object.keys(edits).length > 0;
+    const hasRemovals = removed.size > 0;
+    if (!hasEdits && !hasRemovals) return;
+
     const updates = po.items
-      .filter((i) => edits[i.id] !== undefined)
-      .map((i) => ({ id: i.id, qtyOrdered: edits[i.id] }));
-    if (updates.length === 0) return;
+      .filter((i) => !removed.has(i.id) && edits[i.id])
+      .map((i) => ({
+        id: i.id,
+        variantId: i.variantId,
+        supplierId: po.supplierId,
+        qtyOrdered: edits[i.id]?.qtyOrdered !== undefined ? edits[i.id].qtyOrdered : i.qtyOrdered,
+        supplierCode: edits[i.id]?.supplierCode !== undefined ? edits[i.id].supplierCode : (i.supplierCode ?? ""),
+      }));
+
     const fd = new FormData();
     fd.append("intent", "updateItems");
     fd.append("id", po.id);
     fd.append("updates", JSON.stringify(updates));
+    fd.append("removedIds", JSON.stringify([...removed]));
     fetcher.submit(fd, { method: "post" });
-    setQtyEdits((prev) => { const n = { ...prev }; delete n[po.id]; return n; });
+    setItemEdits((prev) => { const n = { ...prev }; delete n[po.id]; return n; });
+    setRemovedItems((prev) => { const n = { ...prev }; delete n[po.id]; return n; });
   }
 
   function handleDelete(id) {
@@ -476,15 +539,21 @@ export default function PurchaseOrders() {
 
           {!isSubmitting && purchaseOrders.map((po) => {
             const isExpanded = expandedId === po.id;
-            const poEdits = qtyEdits[po.id] ?? {};
-            const hasEdits = Object.keys(poEdits).length > 0;
+            const poEdits = itemEdits[po.id] ?? {};
+            const poRemoved = removedItems[po.id] ?? new Set();
+            const hasChanges = Object.keys(poEdits).length > 0 || poRemoved.size > 0;
 
-            const displayItems = po.items.map((i) => ({
-              ...i,
-              qtyOrdered: poEdits[i.id] !== undefined ? Number(poEdits[i.id]) : i.qtyOrdered,
-            }));
-            const totalCost = displayItems.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0);
-            const totalUnits = displayItems.reduce((s, i) => s + i.qtyOrdered, 0);
+            const displayItems = po.items
+              .map((i) => ({
+                ...i,
+                qtyOrdered: poEdits[i.id]?.qtyOrdered !== undefined ? Number(poEdits[i.id].qtyOrdered) : i.qtyOrdered,
+                supplierCode: poEdits[i.id]?.supplierCode !== undefined ? poEdits[i.id].supplierCode : (i.supplierCode ?? ""),
+                removed: poRemoved.has(i.id),
+              }));
+
+            const activeItems = displayItems.filter((i) => !i.removed);
+            const totalCost = activeItems.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0);
+            const totalUnits = activeItems.reduce((s, i) => s + i.qtyOrdered, 0);
 
             return (
               <div key={po.id} style={{ marginBottom: "1rem" }}>
@@ -498,7 +567,7 @@ export default function PurchaseOrders() {
                           <Badge tone="default">{po.mode}</Badge>
                         </InlineStack>
                         <Text tone="subdued">
-                          {po.supplier?.name} · {po.items.length} SKUs · {totalUnits} units · ${totalCost.toFixed(2)}
+                          {po.supplier?.name} · {activeItems.length} SKUs · {totalUnits} units · ${totalCost.toFixed(2)}
                         </Text>
                         <Text tone="subdued" variant="bodySm">
                           Created {new Date(po.createdAt).toLocaleDateString()}
@@ -518,7 +587,7 @@ export default function PurchaseOrders() {
                             ↺ Regenerate
                           </Button>
                         )}
-                        <Button variant="plain" onClick={() => downloadCSV({ ...po, items: displayItems })}>
+                        <Button variant="plain" onClick={() => downloadCSV({ ...po, items: activeItems })}>
                           ↓ CSV
                         </Button>
                         <Button variant="plain" onClick={() => setExpandedId(isExpanded ? null : po.id)}>
@@ -543,19 +612,46 @@ export default function PurchaseOrders() {
                               <table style={{ width: "100%", borderCollapse: "collapse" }}>
                                 <thead>
                                   <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                                    {["Product", "Variant", "SKU", "Qty", "Unit Cost", "Line Total"].map((h) => (
-                                      <th key={h} style={{ padding: "8px 12px", textAlign: "left" }}>
+                                    {["Supplier Code", "Product", "Variant", "SKU", "Qty", "Unit Cost", "Line Total", ""].map((h, i) => (
+                                      <th key={i} style={{ padding: "8px 12px", textAlign: "left" }}>
                                         <Text variant="headingSm">{h}</Text>
                                       </th>
                                     ))}
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {po.items.map((item) => {
-                                    const qty = poEdits[item.id] !== undefined ? poEdits[item.id] : String(item.qtyOrdered);
+                                  {displayItems.map((item) => {
+                                    const qty = poEdits[item.id]?.qtyOrdered !== undefined ? poEdits[item.id].qtyOrdered : String(item.qtyOrdered);
+                                    const supplierCode = poEdits[item.id]?.supplierCode !== undefined ? poEdits[item.id].supplierCode : (item.supplierCode ?? "");
                                     const lineTotal = (Number(qty) * item.qtyCost).toFixed(2);
+
+                                    if (item.removed) {
+                                      return (
+                                        <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3", opacity: 0.4 }}>
+                                          <td colSpan={7} style={{ padding: "8px 12px" }}>
+                                            <Text tone="subdued"><s>{item.productTitle} — {item.variantTitle}</s></Text>
+                                          </td>
+                                          <td style={{ padding: "8px 12px" }}>
+                                            <Button variant="plain" onClick={() => handleRestoreItem(po.id, item.id)}>
+                                              Restore
+                                            </Button>
+                                          </td>
+                                        </tr>
+                                      );
+                                    }
+
                                     return (
                                       <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
+                                        <td style={{ padding: "8px 12px", width: "130px" }}>
+                                          <TextField
+                                            label=""
+                                            labelHidden
+                                            value={supplierCode}
+                                            onChange={(val) => handleItemEdit(po.id, item.id, "supplierCode", val)}
+                                            autoComplete="off"
+                                            placeholder="—"
+                                          />
+                                        </td>
                                         <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>
                                         <td style={{ padding: "8px 12px" }}><Text>{item.variantTitle}</Text></td>
                                         <td style={{ padding: "8px 12px" }}><Text>{item.sku}</Text></td>
@@ -565,28 +661,44 @@ export default function PurchaseOrders() {
                                             labelHidden
                                             type="number"
                                             value={qty}
-                                            onChange={(val) => handleQtyChange(po.id, item.id, val)}
+                                            onChange={(val) => handleItemEdit(po.id, item.id, "qtyOrdered", val)}
                                             autoComplete="off"
                                           />
                                         </td>
                                         <td style={{ padding: "8px 12px" }}><Text>${item.qtyCost.toFixed(2)}</Text></td>
                                         <td style={{ padding: "8px 12px" }}><Text>${lineTotal}</Text></td>
+                                        <td style={{ padding: "8px 12px" }}>
+                                          <Button
+                                            variant="plain"
+                                            tone="critical"
+                                            onClick={() => handleRemoveItem(po.id, item.id)}
+                                          >
+                                            Remove
+                                          </Button>
+                                        </td>
                                       </tr>
                                     );
                                   })}
-                                  <tr style={{ borderTop: "2px solid #e1e3e5", fontWeight: "bold" }}>
-                                    <td colSpan={3} style={{ padding: "8px 12px" }}><Text variant="headingSm">Total</Text></td>
-                                    <td style={{ padding: "8px 12px" }}><Text variant="headingSm">{totalUnits}</Text></td>
+                                  <tr style={{ borderTop: "2px solid #e1e3e5" }}>
+                                    <td colSpan={4} style={{ padding: "8px 12px" }}>
+                                      <Text variant="headingSm">Total</Text>
+                                    </td>
+                                    <td style={{ padding: "8px 12px" }}>
+                                      <Text variant="headingSm">{totalUnits}</Text>
+                                    </td>
                                     <td />
-                                    <td style={{ padding: "8px 12px" }}><Text variant="headingSm">${totalCost.toFixed(2)}</Text></td>
+                                    <td style={{ padding: "8px 12px" }}>
+                                      <Text variant="headingSm">${totalCost.toFixed(2)}</Text>
+                                    </td>
+                                    <td />
                                   </tr>
                                 </tbody>
                               </table>
                             </div>
-                            {hasEdits && (
+                            {hasChanges && (
                               <InlineStack align="end">
-                                <Button variant="primary" onClick={() => handleSaveQtys(po)}>
-                                  Save quantity changes
+                                <Button variant="primary" onClick={() => handleSaveItems(po)}>
+                                  Save changes
                                 </Button>
                               </InlineStack>
                             )}

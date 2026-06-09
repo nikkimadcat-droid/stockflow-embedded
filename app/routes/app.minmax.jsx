@@ -7,10 +7,12 @@ import {
   Card,
   Text,
   BlockStack,
+  InlineStack,
   Button,
   Select,
   TextField,
   Banner,
+  Spinner,
 } from "@shopify/polaris";
 import { useState, useCallback } from "react";
 
@@ -28,249 +30,369 @@ export const loader = async ({ request }) => {
   const locData = await locResponse.json();
   const locations = locData.data.locations.edges.map(e => e.node);
 
-  // paginate ALL products
-  const products = [];
-  let prodCursor = null;
-  let prodHasNext = true;
-
-  while (prodHasNext) {
-    const prodResponse = await admin.graphql(`
+  // paginate just vendor and product type for filters
+  const vendors = new Set();
+  const types = new Set();
+  let cursor = null;
+  let hasMore = true;
+  while (hasMore) {
+    const res = await admin.graphql(`
       query($cursor: String) {
         products(first: 250, after: $cursor) {
           pageInfo { hasNextPage endCursor }
-          edges {
-            node {
-              id
-              title
-              vendor
-              variants(first: 100) {
-                edges {
-                  node {
-                    id
-                    sku
+          edges { node { vendor productType } }
+        }
+      }
+    `, { variables: { cursor } });
+    const json = await res.json();
+    const page = json.data.products;
+    for (const { node: p } of page.edges) {
+      if (p.vendor) vendors.add(p.vendor);
+      if (p.productType) types.add(p.productType);
+    }
+    hasMore = page.pageInfo.hasNextPage;
+    cursor = page.pageInfo.endCursor;
+  }
+
+  return {
+    locations,
+    vendors: [...vendors].sort(),
+    types: [...types].sort(),
+    shop,
+  };
+};
+
+export const action = async ({ request }) => {
+  const { admin, session } = await authenticate.admin(request);
+  const shop = session.shop;
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+
+  if (intent === "fetchProducts") {
+    const locationId = formData.get("locationId");
+    const vendorFilter = formData.get("vendorFilter");
+    const typeFilter = formData.get("typeFilter");
+
+    // fetch filtered products
+    const products = [];
+    let cursor = null;
+    let hasMore = true;
+    while (hasMore) {
+      const query = vendorFilter
+        ? `vendor:'${vendorFilter}'`
+        : typeFilter
+        ? `product_type:'${typeFilter}'`
+        : "";
+
+      const prodRes = await admin.graphql(`
+        query($cursor: String, $query: String!) {
+          products(first: 250, after: $cursor, query: $query) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                id
+                title
+                vendor
+                variants(first: 100) {
+                  edges {
+                    node { id sku }
                   }
                 }
               }
             }
           }
         }
+      `, { variables: { cursor, query } });
+
+      const prodJson = await prodRes.json();
+      const page = prodJson.data.products;
+      products.push(...page.edges.map(e => e.node));
+      hasMore = page.pageInfo.hasNextPage;
+      cursor = page.pageInfo.endCursor;
+    }
+
+    const filtered = products.filter(p =>
+      (!vendorFilter || p.vendor === vendorFilter) &&
+      (!typeFilter || p.productType === typeFilter)
+    );
+
+    const variantIds = new Set();
+    for (const p of filtered) {
+      for (const { node: v } of p.variants.edges) {
+        variantIds.add(v.id);
       }
-    `, { variables: { cursor: prodCursor } });
+    }
 
-    const prodData = await prodResponse.json();
-    const page = prodData.data.products;
-    products.push(...page.edges.map(e => e.node));
-    prodHasNext = page.pageInfo.hasNextPage;
-    prodCursor = page.pageInfo.endCursor;
-  }
-
-  // paginate inventory levels per location
-  const invMap = {};
-
-  for (const location of locations) {
-    let hasNextPage = true;
-    let cursor = null;
-
-    while (hasNextPage) {
-      const invResponse = await admin.graphql(`
+    // paginate inventory levels for this location
+    const invMap = {};
+    let invCursor = null;
+    let invHasMore = true;
+    while (invHasMore) {
+      const invRes = await admin.graphql(`
         query($locationId: ID!, $cursor: String) {
           location(id: $locationId) {
             inventoryLevels(first: 250, after: $cursor) {
               pageInfo { hasNextPage endCursor }
               edges {
                 node {
+                  quantities(names: ["available"]) { quantity }
                   item { variant { id } }
-                  quantities(names: ["available"]) {
-                    name
-                    quantity
-                  }
                 }
               }
             }
           }
         }
-      `, { variables: { locationId: location.id, cursor } });
+      `, { variables: { locationId, cursor: invCursor } });
 
-      const invData = await invResponse.json();
-      const levels = invData.data.location.inventoryLevels;
+      const invJson = await invRes.json();
+      const levels = invJson.data?.location?.inventoryLevels;
+      invHasMore = levels?.pageInfo?.hasNextPage ?? false;
+      invCursor = levels?.pageInfo?.endCursor ?? null;
 
-      for (const edge of levels.edges) {
-        const variantId = edge.node.item?.variant?.id;
-        if (!variantId) continue;
-        if (!invMap[variantId]) invMap[variantId] = {};
-        const qty = edge.node.quantities?.find(q => q.name === "available")?.quantity ?? 0;
-        invMap[variantId][location.id] = qty;
+      for (const e of levels?.edges ?? []) {
+        const vid = e.node.item?.variant?.id;
+        if (vid && variantIds.has(vid)) {
+          invMap[vid] = e.node.quantities?.[0]?.quantity ?? 0;
+        }
       }
-
-      hasNextPage = levels.pageInfo.hasNextPage;
-      cursor = levels.pageInfo.endCursor;
     }
-  }
 
-  const savedMinMax = await db.minMax.findMany({ where: { shop } });
-  const minMaxMap = {};
-  for (const mm of savedMinMax) {
-    minMaxMap[`${mm.variantId}__${mm.locationId}`] = mm;
-  }
-
-  return { locations, products, minMaxMap, invMap, shop };
-};
-
-export const action = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
-  const shop = session.shop;
-  const formData = await request.formData();
-  const updates = JSON.parse(formData.get("updates"));
-
-  for (const u of updates) {
-    await db.minMax.upsert({
-      where: {
-        shop_variantId_locationId: {
-          shop,
-          variantId: u.variantId,
-          locationId: u.locationId,
-        },
-      },
-      update: {
-        minLevel: parseInt(u.minLevel) || 0,
-        maxLevel: parseInt(u.maxLevel) || 0,
-        casePackSize: parseInt(u.casePackSize) || 1,
-      },
-      create: {
-        shop,
-        variantId: u.variantId,
-        locationId: u.locationId,
-        minLevel: parseInt(u.minLevel) || 0,
-        maxLevel: parseInt(u.maxLevel) || 0,
-        casePackSize: parseInt(u.casePackSize) || 1,
-      },
+    // get saved min/max for these variants at this location
+    const savedMinMax = await db.minMax.findMany({
+      where: { shop, locationId, variantId: { in: [...variantIds] } },
     });
+    const minMaxMap = {};
+    for (const mm of savedMinMax) {
+      minMaxMap[mm.variantId] = mm;
+    }
 
-    if (u.casePackSize) {
-      await db.minMax.updateMany({
+    // build rows sorted alphabetically
+    const rows = filtered
+      .flatMap(p =>
+        p.variants.edges.map(({ node: v }) => ({
+          variantId: v.id,
+          productTitle: p.title,
+          vendor: p.vendor,
+          sku: v.sku || "—",
+          onHand: invMap[v.id] ?? 0,
+          minLevel: minMaxMap[v.id]?.minLevel ?? 0,
+          maxLevel: minMaxMap[v.id]?.maxLevel ?? 0,
+          casePackSize: minMaxMap[v.id]?.casePackSize ?? 1,
+        }))
+      )
+      .sort((a, b) => a.productTitle.localeCompare(b.productTitle));
+
+    return { ok: true, rows, locationId };
+  }
+
+  if (intent === "save") {
+    const updates = JSON.parse(formData.get("updates"));
+    const locationId = formData.get("locationId");
+
+    for (const u of updates) {
+      await db.minMax.upsert({
         where: {
+          shop_variantId_locationId: {
+            shop,
+            variantId: u.variantId,
+            locationId,
+          },
+        },
+        update: {
+          minLevel: parseInt(u.minLevel) || 0,
+          maxLevel: parseInt(u.maxLevel) || 0,
+          casePackSize: parseInt(u.casePackSize) || 1,
+        },
+        create: {
           shop,
           variantId: u.variantId,
-          NOT: { locationId: u.locationId },
-        },
-        data: {
+          locationId,
+          minLevel: parseInt(u.minLevel) || 0,
+          maxLevel: parseInt(u.maxLevel) || 0,
           casePackSize: parseInt(u.casePackSize) || 1,
         },
       });
+
+      // sync case pack across all locations
+      if (u.casePackSize) {
+        await db.minMax.updateMany({
+          where: {
+            shop,
+            variantId: u.variantId,
+            NOT: { locationId },
+          },
+          data: { casePackSize: parseInt(u.casePackSize) || 1 },
+        });
+      }
     }
+
+    return { ok: true, saved: true };
   }
 
-  return { ok: true };
+  return { ok: false };
 };
 
 export default function MinMax() {
-  const { locations, products, minMaxMap, invMap } = useLoaderData();
+  const { locations, vendors, types } = useLoaderData();
   const fetcher = useFetcher();
+
   const [selectedLocation, setSelectedLocation] = useState(locations[0]?.id || "");
-  const [selectedVendor, setSelectedVendor] = useState("");
+  const [vendorFilter, setVendorFilter] = useState("");
+  const [typeFilter, setTypeFilter] = useState("");
+  const [rows, setRows] = useState([]);
   const [edits, setEdits] = useState({});
+  const [loaded, setLoaded] = useState(false);
+  const [loadedLocationId, setLoadedLocationId] = useState("");
 
-  const locationOptions = locations.map(l => ({ label: l.name, value: l.id }));
+  const isSubmitting = fetcher.state !== "idle";
+  const isSaving = isSubmitting && fetcher.formData?.get("intent") === "save";
+  const isLoading = isSubmitting && fetcher.formData?.get("intent") === "fetchProducts";
 
-  const vendors = [...new Set(products.map(p => p.vendor).filter(Boolean))].sort();
-  const vendorOptions = [
-    { label: "All vendors", value: "" },
-    ...vendors.map(v => ({ label: v, value: v })),
-  ];
+  if (fetcher.data?.rows && fetcher.data.rows !== rows) {
+    setRows(fetcher.data.rows);
+    setLoadedLocationId(fetcher.data.locationId);
+    setLoaded(true);
+    setEdits({});
+  }
 
-  const getKey = (variantId, locationId) => `${variantId}__${locationId}`;
+  const saved = fetcher.data?.saved && !isSubmitting;
 
-  const getValue = (variantId, field) => {
-    const key = getKey(variantId, selectedLocation);
-    if (edits[key]?.[field] !== undefined) return edits[key][field];
-    if (field === "casePackSize") {
-      const anyLocation = Object.values(minMaxMap).find(
-        mm => mm.variantId === variantId && mm.casePackSize > 1
-      );
-      if (anyLocation) return String(anyLocation.casePackSize);
-      return "1";
-    }
-    const saved = minMaxMap[key];
-    if (saved) return String(saved[field]);
-    return "0";
-  };
+  function handleLoad() {
+    setLoaded(false);
+    setRows([]);
+    setEdits({});
+    const fd = new FormData();
+    fd.append("intent", "fetchProducts");
+    fd.append("locationId", selectedLocation);
+    fd.append("vendorFilter", vendorFilter);
+    fd.append("typeFilter", typeFilter);
+    fetcher.submit(fd, { method: "POST" });
+  }
 
   const handleChange = useCallback((variantId, field, value) => {
-    const key = getKey(variantId, selectedLocation);
     setEdits(prev => ({
       ...prev,
-      [key]: { ...prev[key], [field]: value },
+      [variantId]: { ...prev[variantId], [field]: value },
     }));
-  }, [selectedLocation]);
+  }, []);
 
-  const handleSave = () => {
-    const updates = [];
-    for (const [key, fields] of Object.entries(edits)) {
-      const [variantId, locationId] = key.split("__");
-      const saved = minMaxMap[key];
-      updates.push({
-        variantId,
-        locationId,
-        minLevel: fields.minLevel ?? saved?.minLevel ?? 0,
-        maxLevel: fields.maxLevel ?? saved?.maxLevel ?? 0,
-        casePackSize: fields.casePackSize ?? saved?.casePackSize ?? 1,
-      });
-    }
+  function handleSave() {
+    const updates = rows
+      .filter(r => edits[r.variantId])
+      .map(r => ({
+        variantId: r.variantId,
+        minLevel: edits[r.variantId]?.minLevel ?? r.minLevel,
+        maxLevel: edits[r.variantId]?.maxLevel ?? r.maxLevel,
+        casePackSize: edits[r.variantId]?.casePackSize ?? r.casePackSize,
+      }));
+
     if (updates.length === 0) return;
-    const form = new FormData();
-    form.append("updates", JSON.stringify(updates));
-    fetcher.submit(form, { method: "POST" });
+    const fd = new FormData();
+    fd.append("intent", "save");
+    fd.append("locationId", loadedLocationId);
+    fd.append("updates", JSON.stringify(updates));
+    fetcher.submit(fd, { method: "POST" });
     setEdits({});
-  };
+  }
 
-  const getOnHand = (variantId) => {
-    return invMap[variantId]?.[selectedLocation] ?? 0;
-  };
+  function getValue(variantId, field) {
+    if (edits[variantId]?.[field] !== undefined) return edits[variantId][field];
+    const row = rows.find(r => r.variantId === variantId);
+    return String(row?.[field] ?? (field === "casePackSize" ? 1 : 0));
+  }
 
-  const getStatus = (variantId, onHand) => {
-    const key = getKey(variantId, selectedLocation);
-    const min = parseInt(edits[key]?.minLevel ?? minMaxMap[key]?.minLevel ?? 0);
+  function getStatus(variantId, onHand) {
+    const min = parseInt(edits[variantId]?.minLevel ?? rows.find(r => r.variantId === variantId)?.minLevel ?? 0);
     if (min === 0) return "—";
     if (onHand <= min) return "⚠️ Reorder";
     return "OK";
-  };
+  }
 
-  const saved = fetcher.state === "idle" && fetcher.data?.ok;
-
-  const filteredProducts = selectedVendor
-    ? products.filter(p => p.vendor === selectedVendor)
-    : products;
+  const locationOptions = locations.map(l => ({ label: l.name, value: l.id }));
+  const vendorOptions = [{ label: "All vendors", value: "" }, ...vendors.map(v => ({ label: v, value: v }))];
+  const typeOptions = [{ label: "All product types", value: "" }, ...types.map(t => ({ label: t, value: t }))];
+  const hasEdits = Object.keys(edits).length > 0;
 
   return (
     <Page
       title="Min / Max Levels"
       primaryAction={
-        <Button variant="primary" onClick={handleSave} loading={fetcher.state !== "idle"}>
+        <Button
+          variant="primary"
+          onClick={handleSave}
+          loading={isSaving}
+          disabled={!hasEdits}
+        >
           Save changes
         </Button>
       }
     >
       <Layout>
         <Layout.Section>
+
           {saved && (
-            <Banner tone="success" onDismiss={() => {}}>
-              Saved successfully.
-            </Banner>
+            <div style={{ marginBottom: "1rem" }}>
+              <Banner tone="success">Saved successfully.</Banner>
+            </div>
           )}
+
+          {/* filters */}
           <Card>
             <BlockStack gap="400">
-              <Select
-                label="Location"
-                options={locationOptions}
-                value={selectedLocation}
-                onChange={setSelectedLocation}
-              />
-              <Select
-                label="Vendor"
-                options={vendorOptions}
-                value={selectedVendor}
-                onChange={setSelectedVendor}
-              />
+              <InlineStack gap="400" wrap>
+                <div style={{ minWidth: "200px" }}>
+                  <Select
+                    label="Location"
+                    options={locationOptions}
+                    value={selectedLocation}
+                    onChange={val => { setSelectedLocation(val); setLoaded(false); setRows([]); }}
+                  />
+                </div>
+                <div style={{ minWidth: "200px" }}>
+                  <Select
+                    label="Vendor"
+                    options={vendorOptions}
+                    value={vendorFilter}
+                    onChange={val => { setVendorFilter(val); if (val) setTypeFilter(""); }}
+                  />
+                </div>
+                <div style={{ minWidth: "200px" }}>
+                  <Select
+                    label="Product Type"
+                    options={typeOptions}
+                    value={typeFilter}
+                    onChange={val => { setTypeFilter(val); if (val) setVendorFilter(""); }}
+                  />
+                </div>
+                <div style={{ paddingTop: "24px" }}>
+                  <Button
+                    variant="primary"
+                    onClick={handleLoad}
+                    loading={isLoading}
+                  >
+                    Load products
+                  </Button>
+                </div>
+              </InlineStack>
+              {loaded && (
+                <Text tone="subdued">{rows.length} SKUs loaded</Text>
+              )}
+            </BlockStack>
+          </Card>
+
+          {/* loading */}
+          {isLoading && (
+            <div style={{ textAlign: "center", padding: "2rem" }}>
+              <Spinner size="large" />
+              <div style={{ marginTop: "1rem" }}>
+                <Text>Loading products and inventory…</Text>
+              </div>
+            </div>
+          )}
+
+          {/* table */}
+          {loaded && !isLoading && rows.length > 0 && (
+            <Card>
               <div style={{ overflowX: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead>
@@ -283,66 +405,70 @@ export default function MinMax() {
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredProducts.flatMap(p =>
-                      p.variants.edges.map(({ node: v }) => {
-                        const onHand = getOnHand(v.id);
-                        const status = getStatus(v.id, onHand);
-                        return (
-                          <tr key={v.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
-                            <td style={{ padding: "8px 12px" }}>
-                              <Text>{p.title}</Text>
-                              <Text tone="subdued" variant="bodySm">{p.vendor}</Text>
-                            </td>
-                            <td style={{ padding: "8px 12px" }}>
-                              <Text>{v.sku || "—"}</Text>
-                            </td>
-                            <td style={{ padding: "8px 12px" }}>
-                              <Text>{onHand}</Text>
-                            </td>
-                            <td style={{ padding: "8px 12px", width: "120px" }}>
-                              <TextField
-                                label=""
-                                labelHidden
-                                type="number"
-                                value={getValue(v.id, "minLevel")}
-                                onChange={val => handleChange(v.id, "minLevel", val)}
-                                autoComplete="off"
-                              />
-                            </td>
-                            <td style={{ padding: "8px 12px", width: "120px" }}>
-                              <TextField
-                                label=""
-                                labelHidden
-                                type="number"
-                                value={getValue(v.id, "maxLevel")}
-                                onChange={val => handleChange(v.id, "maxLevel", val)}
-                                autoComplete="off"
-                              />
-                            </td>
-                            <td style={{ padding: "8px 12px", width: "120px" }}>
-                              <TextField
-                                label=""
-                                labelHidden
-                                type="number"
-                                value={getValue(v.id, "casePackSize")}
-                                onChange={val => handleChange(v.id, "casePackSize", val)}
-                                autoComplete="off"
-                              />
-                            </td>
-                            <td style={{ padding: "8px 12px" }}>
-                              <Text tone={status === "⚠️ Reorder" ? "critical" : "subdued"}>
-                                {status}
-                              </Text>
-                            </td>
-                          </tr>
-                        );
-                      })
-                    )}
+                    {rows.map(row => {
+                      const status = getStatus(row.variantId, row.onHand);
+                      return (
+                        <tr key={row.variantId} style={{ borderBottom: "1px solid #f1f2f3" }}>
+                          <td style={{ padding: "8px 12px" }}>
+                            <Text>{row.productTitle}</Text>
+                            <Text tone="subdued" variant="bodySm">{row.vendor}</Text>
+                          </td>
+                          <td style={{ padding: "8px 12px" }}>
+                            <Text>{row.sku}</Text>
+                          </td>
+                          <td style={{ padding: "8px 12px" }}>
+                            <Text>{row.onHand}</Text>
+                          </td>
+                          <td style={{ padding: "8px 12px", width: "100px" }}>
+                            <TextField
+                              label=""
+                              labelHidden
+                              type="number"
+                              value={getValue(row.variantId, "minLevel")}
+                              onChange={val => handleChange(row.variantId, "minLevel", val)}
+                              autoComplete="off"
+                            />
+                          </td>
+                          <td style={{ padding: "8px 12px", width: "100px" }}>
+                            <TextField
+                              label=""
+                              labelHidden
+                              type="number"
+                              value={getValue(row.variantId, "maxLevel")}
+                              onChange={val => handleChange(row.variantId, "maxLevel", val)}
+                              autoComplete="off"
+                            />
+                          </td>
+                          <td style={{ padding: "8px 12px", width: "100px" }}>
+                            <TextField
+                              label=""
+                              labelHidden
+                              type="number"
+                              value={getValue(row.variantId, "casePackSize")}
+                              onChange={val => handleChange(row.variantId, "casePackSize", val)}
+                              autoComplete="off"
+                            />
+                          </td>
+                          <td style={{ padding: "8px 12px" }}>
+                            <Text tone={status === "⚠️ Reorder" ? "critical" : "subdued"}>
+                              {status}
+                            </Text>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
-            </BlockStack>
-          </Card>
+            </Card>
+          )}
+
+          {loaded && !isLoading && rows.length === 0 && (
+            <Card>
+              <Text tone="subdued">No products found for the selected filters.</Text>
+            </Card>
+          )}
+
         </Layout.Section>
       </Layout>
     </Page>

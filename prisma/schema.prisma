@@ -76,6 +76,8 @@ model PurchaseOrder {
   supplierId String
   supplier   Supplier            @relation(fields: [supplierId], references: [id])
   status     String              @default("draft")
+  mode       String              @default("minmax")
+  locationId String              @default("")
   notes      String?
   orderedAt  DateTime?
   receivedAt DateTime?

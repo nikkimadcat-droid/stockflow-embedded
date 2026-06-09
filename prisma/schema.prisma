@@ -41,11 +41,12 @@ model MinMax {
 }
 
 model Supplier {
-  id        String        @id @default(cuid())
+  id        String              @id @default(cuid())
   shop      String
   name      String
-  createdAt DateTime      @default(now())
+  createdAt DateTime            @default(now())
   skus      SupplierSku[]
+  orders    PurchaseOrder[]
 }
 
 model Vendor {
@@ -66,4 +67,32 @@ model SupplierSku {
   updatedAt    DateTime @updatedAt
 
   @@unique([supplierId, variantId])
+}
+
+model PurchaseOrder {
+  id         String              @id @default(cuid())
+  shop       String
+  poNumber   String
+  supplierId String
+  supplier   Supplier            @relation(fields: [supplierId], references: [id])
+  status     String              @default("draft")
+  notes      String?
+  orderedAt  DateTime?
+  receivedAt DateTime?
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
+  items      PurchaseOrderItem[]
+}
+
+model PurchaseOrderItem {
+  id              String        @id @default(cuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  variantId       String
+  productTitle    String
+  variantTitle    String
+  sku             String
+  qtyOrdered      Int
+  qtyCost         Float
+  updatedAt       DateTime      @updatedAt
 }

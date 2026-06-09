@@ -1,4 +1,4 @@
-import { useState } from "react";
+﻿import { useState } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -385,7 +385,7 @@ export default function PurchaseOrders() {
           {isSubmitting && (
             <div style={{ textAlign: "center", padding: "2rem" }}>
               <Spinner size="large" />
-              <Text>Generating purchase order…</Text>
+              <Text>Generating purchase order...</Text>
             </div>
           )}
 

@@ -64,6 +64,7 @@ export const loader = async ({ request }) => {
 
     const vendorData = await vendorResponse.json();
     const page = vendorData.data.products;
+    console.log("Sample variant:", JSON.stringify(page.edges[0]?.node?.variants?.edges[0]?.node, null, 2));
 
     for (const { node: p } of page.edges) {
       if (!p.vendor) continue;

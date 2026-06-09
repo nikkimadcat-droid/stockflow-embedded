@@ -29,20 +29,36 @@ export const loader = async ({ request }) => {
   const locJson = await locRes.json();
   const locations = locJson.data.locations.edges.map(e => e.node);
 
-  // just pull vendors and product types for filters — lightweight
-  const vendorRes = await admin.graphql(`
-    query {
-      products(first: 250) {
-        edges { node { vendor productType } }
-      }
-    }
-  `);
-  const vendorJson = await vendorRes.json();
-  const vendorProducts = vendorJson.data.products.edges.map(e => e.node);
-  const vendors = [...new Set(vendorProducts.map(p => p.vendor).filter(Boolean))].sort();
-  const types = [...new Set(vendorProducts.map(p => p.productType).filter(Boolean))].sort();
+  // paginate all products just for vendor and type lists
+  const vendors = new Set();
+  const types = new Set();
+  let cursor = null;
+  let hasMore = true;
 
-  return { locations, vendors, types };
+  while (hasMore) {
+    const res = await admin.graphql(`
+      query($cursor: String) {
+        products(first: 250, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          edges { node { vendor productType } }
+        }
+      }
+    `, { variables: { cursor } });
+    const json = await res.json();
+    const page = json.data.products;
+    for (const { node: p } of page.edges) {
+      if (p.vendor) vendors.add(p.vendor);
+      if (p.productType) types.add(p.productType);
+    }
+    hasMore = page.pageInfo.hasNextPage;
+    cursor = page.pageInfo.endCursor;
+  }
+
+  return {
+    locations,
+    vendors: [...vendors].sort(),
+    types: [...types].sort(),
+  };
 };
 
 export const action = async ({ request }) => {
@@ -55,10 +71,10 @@ export const action = async ({ request }) => {
     const vendorFilter = form.get("vendorFilter");
     const typeFilter = form.get("typeFilter");
 
-    // paginate products with vendor/type filter
     const products = [];
     let cursor = null;
     let hasMore = true;
+
     while (hasMore) {
       const query = vendorFilter
         ? `vendor:'${vendorFilter}'`
@@ -98,13 +114,11 @@ export const action = async ({ request }) => {
       cursor = page.pageInfo.endCursor;
     }
 
-    // apply type filter client-side if both filters set
     const filtered = products.filter(p =>
       (!vendorFilter || p.vendor === vendorFilter) &&
       (!typeFilter || p.productType === typeFilter)
     );
 
-    // get all variant IDs
     const variantIds = new Set();
     for (const p of filtered) {
       for (const { node: v } of p.variants.edges) {
@@ -112,7 +126,6 @@ export const action = async ({ request }) => {
       }
     }
 
-    // paginate inventory levels for this location
     const invMap = {};
     let invCursor = null;
     let invHasMore = true;
@@ -153,7 +166,6 @@ export const action = async ({ request }) => {
       }
     }
 
-    // build rows sorted alphabetically
     const rows = filtered
       .flatMap(p =>
         p.variants.edges.map(({ node: v }) => ({
@@ -219,7 +231,6 @@ export default function Stocktake() {
 
   const isSubmitting = fetcher.state !== "idle";
 
-  // capture rows when fetcher returns them
   if (fetcher.data?.rows && fetcher.data.rows !== rows) {
     setRows(fetcher.data.rows);
     setLoaded(true);
@@ -325,7 +336,6 @@ export default function Stocktake() {
               </div>
             )}
 
-            {/* filters */}
             <div className="no-print">
               <Card>
                 <BlockStack gap="400">
@@ -371,7 +381,6 @@ export default function Stocktake() {
               </Card>
             </div>
 
-            {/* print header */}
             <div className="print-only" style={{ marginBottom: "16px" }}>
               <h2 style={{ margin: 0 }}>Stocktake Count Sheet</h2>
               <p style={{ margin: "4px 0" }}>
@@ -382,7 +391,6 @@ export default function Stocktake() {
               </p>
             </div>
 
-            {/* loading spinner */}
             {isSubmitting && fetcher.formData?.get("intent") === "fetchInventory" && (
               <div className="no-print" style={{ textAlign: "center", padding: "2rem" }}>
                 <Spinner size="large" />
@@ -392,7 +400,6 @@ export default function Stocktake() {
               </div>
             )}
 
-            {/* table */}
             {loaded && rows.length > 0 && (
               <div style={{ marginTop: "1rem" }}>
                 <Card>

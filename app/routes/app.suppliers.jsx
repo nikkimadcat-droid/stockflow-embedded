@@ -49,7 +49,10 @@ export const loader = async ({ request }) => {
                     id
                     sku
                     displayName
-                    inventoryItem { id }
+                    inventoryItem {
+                      id
+                      unitCost { amount }
+                    }
                   }
                 }
               }
@@ -66,11 +69,19 @@ export const loader = async ({ request }) => {
       if (!p.vendor) continue;
       if (!vendorMap[p.vendor]) vendorMap[p.vendor] = [];
       for (const { node: v } of p.variants.edges) {
-        vendorMap[p.vendor].push({ id: v.id, sku: v.sku, name: v.displayName });
+        const cost = parseFloat(v.inventoryItem?.unitCost?.amount ?? 0);
+        vendorMap[p.vendor].push({
+          id: v.id,
+          sku: v.sku,
+          name: v.displayName,
+          cost,
+          inventoryItemId: v.inventoryItem?.id,
+        });
         variantMap[v.id] = {
           sku: v.sku,
           title: p.title,
           displayName: v.displayName,
+          cost,
           inventoryItemId: v.inventoryItem?.id,
         };
       }
@@ -104,19 +115,18 @@ export const action = async ({ request }) => {
 
   if (intent === "add_by_vendor") {
     const supplierId = formData.get("supplierId");
-    const cost = parseFloat(formData.get("cost")) || 0;
     const variants = JSON.parse(formData.get("variants"));
 
     for (const v of variants) {
       await prisma.supplierSku.upsert({
         where: { supplierId_variantId: { supplierId, variantId: v.id } },
-        update: { cost, supplierCode: v.sku || "" },
+        update: { cost: v.cost, supplierCode: v.sku || "" },
         create: {
           shop,
           supplierId,
           variantId: v.id,
           supplierCode: v.sku || "",
-          cost,
+          cost: v.cost,
         },
       });
     }
@@ -129,13 +139,11 @@ export const action = async ({ request }) => {
     const cost = parseFloat(formData.get("cost")) || 0;
     const inventoryItemId = formData.get("inventoryItemId");
 
-    // Update in StockFlow DB
     await prisma.supplierSku.update({
       where: { id },
       data: { supplierCode, cost },
     });
 
-    // Push cost to Shopify
     if (inventoryItemId) {
       await admin.graphql(`
         mutation($id: ID!, $input: InventoryItemInput!) {
@@ -172,7 +180,6 @@ export default function Suppliers() {
   const [newName, setNewName] = useState("");
   const [expandedId, setExpandedId] = useState(null);
   const [selectedVendor, setSelectedVendor] = useState("");
-  const [vendorCost, setVendorCost] = useState("");
   const [skuEdits, setSkuEdits] = useState({});
 
   const vendors = Object.keys(vendorMap).sort();
@@ -205,11 +212,9 @@ export default function Suppliers() {
     const form = new FormData();
     form.append("intent", "add_by_vendor");
     form.append("supplierId", supplierId);
-    form.append("cost", vendorCost);
     form.append("variants", JSON.stringify(variants));
     fetcher.submit(form, { method: "POST" });
     setSelectedVendor("");
-    setVendorCost("");
   };
 
   const handleSkuEdit = (id, field, value) => {
@@ -293,14 +298,6 @@ export default function Suppliers() {
                           options={vendorOptions}
                           value={selectedVendor}
                           onChange={setSelectedVendor}
-                        />
-                        <TextField
-                          label="Default cost per unit"
-                          type="number"
-                          value={vendorCost}
-                          onChange={setVendorCost}
-                          prefix="$"
-                          autoComplete="off"
                         />
                         <Button
                           variant="primary"

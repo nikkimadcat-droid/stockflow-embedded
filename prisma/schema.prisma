@@ -99,3 +99,41 @@ model PurchaseOrderItem {
   qtyCost         Float
   updatedAt       DateTime      @updatedAt
 }
+
+model TransferTemplate {
+  id             String     @id @default(cuid())
+  shop           String
+  name           String
+  fromLocationId String
+  toLocationId   String
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+  transfers      Transfer[]
+}
+
+model Transfer {
+  id             String         @id @default(cuid())
+  shop           String
+  transferNumber String
+  templateId     String?
+  template       TransferTemplate? @relation(fields: [templateId], references: [id])
+  fromLocationId String
+  toLocationId   String
+  status         String         @default("draft")
+  notes          String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  items          TransferItem[]
+}
+
+model TransferItem {
+  id            String   @id @default(cuid())
+  transferId    String
+  transfer      Transfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  variantId     String
+  productTitle  String
+  variantTitle  String
+  sku           String
+  qty           Int
+  updatedAt     DateTime @updatedAt
+}

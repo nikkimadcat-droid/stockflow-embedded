@@ -27,15 +27,152 @@ function poNumberGen() {
 }
 
 function statusBadge(status) {
-  const map = {
-    draft: "info",
-    ordered: "warning",
-    received: "success",
-    cancelled: "critical",
-  };
+  const map = { draft: "info", ordered: "warning", received: "success", cancelled: "critical" };
   return <Badge tone={map[status] ?? "info"}>{status.charAt(0).toUpperCase() + status.slice(1)}</Badge>;
 }
 
+// ── shared helper: build items from minmax ─────────────────────────────────
+async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
+  const supplierSkus = await db.supplierSku.findMany({ where: { shop, supplierId } });
+  const variantIds = supplierSkus.map((s) => s.variantId);
+  if (variantIds.length === 0) return [];
+
+  const minmaxRows = await db.minMax.findMany({
+    where: { shop, locationId, variantId: { in: variantIds } },
+  });
+  if (minmaxRows.length === 0) return [];
+
+  // paginate inventory levels
+  const onHandMap = {};
+  let cursor = null;
+  let hasMore = true;
+  while (hasMore) {
+    const invRes = await admin.graphql(`
+      query($locationId: ID!, $cursor: String) {
+        location(id: $locationId) {
+          inventoryLevels(first: 250, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                quantities(names: ["available"]) { quantity }
+                item { variant { id title product { title } } sku }
+              }
+            }
+          }
+        }
+      }
+    `, { variables: { locationId, cursor } });
+    const invJson = await invRes.json();
+    const levels = invJson.data?.location?.inventoryLevels;
+    hasMore = levels?.pageInfo?.hasNextPage ?? false;
+    cursor = levels?.pageInfo?.endCursor ?? null;
+    for (const e of levels?.edges ?? []) {
+      const n = e.node;
+      const vid = n.item?.variant?.id;
+      if (vid) onHandMap[vid] = {
+        qty: n.quantities?.[0]?.quantity ?? 0,
+        productTitle: n.item?.variant?.product?.title ?? "",
+        variantTitle: n.item?.variant?.title ?? "",
+        sku: n.item?.sku ?? "",
+      };
+    }
+  }
+
+  const items = [];
+  for (const mm of minmaxRows) {
+    const onHand = onHandMap[mm.variantId];
+    if (!onHand) continue;
+    const needed = mm.maxLevel - onHand.qty;
+    if (needed <= 0) continue;
+    const qtyOrdered = mm.casePackSize > 1
+      ? Math.ceil(needed / mm.casePackSize) * mm.casePackSize
+      : needed;
+    const skuRec = supplierSkus.find((s) => s.variantId === mm.variantId);
+    items.push({
+      variantId: mm.variantId,
+      productTitle: onHand.productTitle,
+      variantTitle: onHand.variantTitle,
+      sku: onHand.sku,
+      qtyOrdered,
+      qtyCost: skuRec?.cost ?? 0,
+    });
+  }
+  return items;
+}
+
+// ── shared helper: build items from 30-day sales ───────────────────────────
+async function buildSalesItems(admin, db, shop, supplierId) {
+  const supplierSkus = await db.supplierSku.findMany({ where: { shop, supplierId } });
+  const variantIds = new Set(supplierSkus.map((s) => s.variantId));
+  if (variantIds.size === 0) return [];
+
+  const since = new Date();
+  since.setDate(since.getDate() - 30);
+  const sinceStr = since.toISOString();
+
+  let cursor = null;
+  const salesMap = {};
+  let hasMore = true;
+
+  while (hasMore) {
+    const ordRes = await admin.graphql(`
+      query($cursor: String, $since: String!) {
+        orders(first: 50, after: $cursor, query: $since) {
+          pageInfo { hasNextPage endCursor }
+          edges {
+            node {
+              lineItems(first: 50) {
+                edges {
+                  node {
+                    variant { id title product { title } sku }
+                    quantity
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `, { variables: { cursor, since: `created_at:>${sinceStr}` } });
+
+    const ordJson = await ordRes.json();
+    const ordData = ordJson.data?.orders;
+    hasMore = ordData?.pageInfo?.hasNextPage ?? false;
+    cursor = ordData?.pageInfo?.endCursor ?? null;
+
+    for (const o of ordData?.edges ?? []) {
+      for (const li of o.node.lineItems.edges) {
+        const n = li.node;
+        const vid = n.variant?.id;
+        if (!vid || !variantIds.has(vid)) continue;
+        salesMap[vid] = salesMap[vid] ?? {
+          qty: 0,
+          productTitle: n.variant?.product?.title ?? "",
+          variantTitle: n.variant?.title ?? "",
+          sku: n.variant?.sku ?? "",
+        };
+        salesMap[vid].qty += n.quantity;
+      }
+    }
+  }
+
+  const items = [];
+  for (const [variantId, data] of Object.entries(salesMap)) {
+    if (data.qty === 0) continue;
+    const skuRec = supplierSkus.find((s) => s.variantId === variantId);
+    items.push({
+      variantId,
+      productTitle: data.productTitle,
+      variantTitle: data.variantTitle,
+      sku: data.sku,
+      qtyOrdered: data.qty,
+      qtyCost: skuRec?.cost ?? 0,
+    });
+  }
+  return items;
+}
+
+// ── loader ─────────────────────────────────────────────────────────────────
 export const loader = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
@@ -52,11 +189,7 @@ export const loader = async ({ request }) => {
   });
 
   const locRes = await admin.graphql(`
-    query {
-      locations(first: 10) {
-        edges { node { id name } }
-      }
-    }
+    query { locations(first: 10) { edges { node { id name } } } }
   `);
   const locJson = await locRes.json();
   const locations = locJson.data.locations.edges.map((e) => e.node);
@@ -64,165 +197,32 @@ export const loader = async ({ request }) => {
   return { purchaseOrders, suppliers, locations, shop };
 };
 
+// ── action ─────────────────────────────────────────────────────────────────
 export const action = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
   const form = await request.formData();
   const intent = form.get("intent");
 
+  // ── CREATE ────────────────────────────────────────────────────
   if (intent === "create") {
     const supplierId = form.get("supplierId");
     const notes = form.get("notes") || "";
     const mode = form.get("mode");
-    const locationId = form.get("locationId");
+    const locationId = form.get("locationId") || "";
     const poNumber = poNumberGen();
 
     let items = [];
-
-    if (mode === "minmax") {
-      const supplierSkus = await db.supplierSku.findMany({
-        where: { shop, supplierId },
-      });
-      const variantIds = supplierSkus.map((s) => s.variantId);
-
-      const minmaxRows = await db.minMax.findMany({
-        where: { shop, locationId, variantId: { in: variantIds } },
-      });
-
-      const invRes = await admin.graphql(`
-        query($locationId: ID!) {
-          location(id: $locationId) {
-            inventoryLevels(first: 250) {
-              edges {
-                node {
-                  quantities(names: ["available"]) { quantity }
-                  item { variant { id title product { title } } sku }
-                }
-              }
-            }
-          }
-        }
-      `, { variables: { locationId } });
-      const invJson = await invRes.json();
-      const levels = invJson.data?.location?.inventoryLevels?.edges ?? [];
-
-      const onHandMap = {};
-      for (const e of levels) {
-        const n = e.node;
-        const vid = n.item?.variant?.id;
-        if (vid) onHandMap[vid] = {
-          qty: n.quantities?.[0]?.quantity ?? 0,
-          productTitle: n.item?.variant?.product?.title ?? "",
-          variantTitle: n.item?.variant?.title ?? "",
-          sku: n.item?.sku ?? "",
-        };
-      }
-
-      for (const mm of minmaxRows) {
-        const onHand = onHandMap[mm.variantId];
-        if (!onHand) continue;
-        const needed = mm.maxLevel - onHand.qty;
-        if (needed <= 0) continue;
-        const qtyOrdered = mm.casePackSize > 1
-          ? Math.ceil(needed / mm.casePackSize) * mm.casePackSize
-          : needed;
-        const skuRec = supplierSkus.find((s) => s.variantId === mm.variantId);
-        items.push({
-          variantId: mm.variantId,
-          productTitle: onHand.productTitle,
-          variantTitle: onHand.variantTitle,
-          sku: onHand.sku,
-          qtyOrdered,
-          qtyCost: skuRec?.cost ?? 0,
-        });
-      }
-    }
-
-    if (mode === "sales") {
-      const since = new Date();
-      since.setDate(since.getDate() - 30);
-      const sinceStr = since.toISOString();
-
-      const supplierSkus = await db.supplierSku.findMany({
-        where: { shop, supplierId },
-      });
-      const variantIds = new Set(supplierSkus.map((s) => s.variantId));
-
-      let cursor = null;
-      const salesMap = {};
-      let hasMore = true;
-
-      while (hasMore) {
-        const ordRes = await admin.graphql(`
-          query($cursor: String, $since: String!) {
-            orders(first: 50, after: $cursor, query: $since) {
-              pageInfo { hasNextPage endCursor }
-              edges {
-                node {
-                  lineItems(first: 50) {
-                    edges {
-                      node {
-                        variant { id title product { title } sku }
-                        quantity
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        `, { variables: { cursor, since: `created_at:>${sinceStr}` } });
-
-        const ordJson = await ordRes.json();
-        const ordData = ordJson.data?.orders;
-        hasMore = ordData?.pageInfo?.hasNextPage ?? false;
-        cursor = ordData?.pageInfo?.endCursor ?? null;
-
-        for (const o of ordData?.edges ?? []) {
-          for (const li of o.node.lineItems.edges) {
-            const n = li.node;
-            const vid = n.variant?.id;
-            if (!vid || !variantIds.has(vid)) continue;
-            salesMap[vid] = salesMap[vid] ?? {
-              qty: 0,
-              productTitle: n.variant?.product?.title ?? "",
-              variantTitle: n.variant?.title ?? "",
-              sku: n.variant?.sku ?? "",
-            };
-            salesMap[vid].qty += n.quantity;
-          }
-        }
-      }
-
-      for (const [variantId, data] of Object.entries(salesMap)) {
-        if (data.qty === 0) continue;
-        const skuRec = supplierSkus.find((s) => s.variantId === variantId);
-        items.push({
-          variantId,
-          productTitle: data.productTitle,
-          variantTitle: data.variantTitle,
-          sku: data.sku,
-          qtyOrdered: data.qty,
-          qtyCost: skuRec?.cost ?? 0,
-        });
-      }
-    }
-
+    if (mode === "minmax") items = await buildMinmaxItems(admin, db, shop, supplierId, locationId);
+    if (mode === "sales") items = await buildSalesItems(admin, db, shop, supplierId);
     if (mode === "manual") {
-      try {
-        items = JSON.parse(form.get("items") || "[]");
-      } catch {
-        items = [];
-      }
+      try { items = JSON.parse(form.get("items") || "[]"); } catch { items = []; }
     }
 
     const po = await db.purchaseOrder.create({
       data: {
-        shop,
-        poNumber,
-        supplierId,
-        status: "draft",
-        notes,
+        shop, poNumber, supplierId, status: "draft",
+        mode, locationId, notes,
         items: {
           create: items.map((i) => ({
             variantId: i.variantId,
@@ -241,16 +241,48 @@ export const action = async ({ request }) => {
     return { ok: true, poId: po.id };
   }
 
+  // ── REGENERATE ────────────────────────────────────────────────
+  if (intent === "regenerate") {
+    const id = form.get("id");
+    const po = await db.purchaseOrder.findUnique({ where: { id } });
+    if (!po) return { ok: false };
+
+    let items = [];
+    if (po.mode === "minmax") items = await buildMinmaxItems(admin, db, shop, po.supplierId, po.locationId);
+    if (po.mode === "sales") items = await buildSalesItems(admin, db, shop, po.supplierId);
+
+    // delete old items and replace
+    await db.purchaseOrderItem.deleteMany({ where: { purchaseOrderId: id } });
+    await db.purchaseOrder.update({
+      where: { id },
+      data: {
+        updatedAt: new Date(),
+        items: {
+          create: items.map((i) => ({
+            variantId: i.variantId,
+            productTitle: i.productTitle,
+            variantTitle: i.variantTitle,
+            sku: i.sku,
+            qtyOrdered: Number(i.qtyOrdered),
+            qtyCost: Number(i.qtyCost),
+            updatedAt: new Date(),
+          })),
+        },
+      },
+    });
+
+    return { ok: true, regenerated: true };
+  }
+
+  // ── UPDATE STATUS ─────────────────────────────────────────────
   if (intent === "updateStatus") {
     const id = form.get("id");
     const status = form.get("status");
-    await db.purchaseOrder.update({
-      where: { id },
-      data: { status, updatedAt: new Date() },
-    });
+    await db.purchaseOrder.update({ where: { id }, data: { status, updatedAt: new Date() } });
     return { ok: true };
   }
 
+  // ── DELETE ────────────────────────────────────────────────────
   if (intent === "delete") {
     const id = form.get("id");
     await db.purchaseOrder.delete({ where: { id } });
@@ -260,6 +292,7 @@ export const action = async ({ request }) => {
   return { ok: false };
 };
 
+// ── component ──────────────────────────────────────────────────────────────
 export default function PurchaseOrders() {
   const { purchaseOrders, suppliers, locations } = useLoaderData();
   const fetcher = useFetcher();
@@ -283,6 +316,14 @@ export default function PurchaseOrders() {
     fetcher.submit(fd, { method: "post" });
     setShowCreate(false);
     setNotes("");
+  }
+
+  function handleRegenerate(id) {
+    if (!confirm("Regenerate this PO? Current line items will be replaced with fresh data.")) return;
+    const fd = new FormData();
+    fd.append("intent", "regenerate");
+    fd.append("id", id);
+    fetcher.submit(fd, { method: "post" });
   }
 
   function handleStatusChange(id, status) {
@@ -319,9 +360,7 @@ export default function PurchaseOrders() {
     <Page
       title="Purchase Orders"
       primaryAction={
-        <Button variant="primary" onClick={() => setShowCreate(true)}>
-          + New PO
-        </Button>
+        <Button variant="primary" onClick={() => setShowCreate(true)}>+ New PO</Button>
       }
     >
       <Layout>
@@ -341,18 +380,8 @@ export default function PurchaseOrders() {
                     No suppliers set up yet. Add suppliers first so you can link SKUs and costs.
                   </Banner>
                 )}
-                <Select
-                  label="Supplier"
-                  options={supplierOptions}
-                  value={supplierId}
-                  onChange={setSupplierId}
-                />
-                <Select
-                  label="How to populate items"
-                  options={modeOptions}
-                  value={mode}
-                  onChange={setMode}
-                />
+                <Select label="Supplier" options={supplierOptions} value={supplierId} onChange={setSupplierId} />
+                <Select label="How to populate items" options={modeOptions} value={mode} onChange={setMode} />
                 {(mode === "minmax" || mode === "sales") && (
                   <Select
                     label="Location"
@@ -361,15 +390,13 @@ export default function PurchaseOrders() {
                     onChange={setLocationId}
                     helpText={
                       mode === "minmax"
-                        ? "Check inventory levels at this location against min/max targets"
+                        ? "Check inventory at this location against min/max targets"
                         : "Sales are store-wide; inventory will be delivered here"
                     }
                   />
                 )}
                 {mode === "manual" && (
-                  <Banner tone="info">
-                    A blank PO will be created. You can add line items after saving.
-                  </Banner>
+                  <Banner tone="info">A blank PO will be created. You can add line items after saving.</Banner>
                 )}
                 <TextField
                   label="Notes (optional)"
@@ -385,7 +412,7 @@ export default function PurchaseOrders() {
           {isSubmitting && (
             <div style={{ textAlign: "center", padding: "2rem" }}>
               <Spinner size="large" />
-              <Text>Generating purchase order...</Text>
+              <Text>Working on it — this may take a moment for large catalogs…</Text>
             </div>
           )}
 
@@ -411,6 +438,7 @@ export default function PurchaseOrders() {
                         <InlineStack gap="200" blockAlign="center">
                           <Text variant="headingMd">{po.poNumber}</Text>
                           {statusBadge(po.status)}
+                          <Badge tone="default">{po.mode}</Badge>
                         </InlineStack>
                         <Text tone="subdued">
                           {po.supplier?.name} · {po.items.length} SKUs · {totalUnits} units · ${totalCost.toFixed(2)}
@@ -428,17 +456,15 @@ export default function PurchaseOrders() {
                           value={po.status}
                           onChange={(val) => handleStatusChange(po.id, val)}
                         />
-                        <Button
-                          variant="plain"
-                          onClick={() => setExpandedId(isExpanded ? null : po.id)}
-                        >
+                        {po.mode !== "manual" && (
+                          <Button variant="plain" onClick={() => handleRegenerate(po.id)}>
+                            ↺ Regenerate
+                          </Button>
+                        )}
+                        <Button variant="plain" onClick={() => setExpandedId(isExpanded ? null : po.id)}>
                           {isExpanded ? "Hide items" : "View items"}
                         </Button>
-                        <Button
-                          variant="plain"
-                          tone="critical"
-                          onClick={() => handleDelete(po.id)}
-                        >
+                        <Button variant="plain" tone="critical" onClick={() => handleDelete(po.id)}>
                           Delete
                         </Button>
                       </InlineStack>
@@ -448,7 +474,9 @@ export default function PurchaseOrders() {
                       <>
                         <Divider />
                         {po.items.length === 0 ? (
-                          <Text tone="subdued">No line items on this PO.</Text>
+                          <Banner tone="info">
+                            No items needed — all SKUs for this supplier are at or above their minimum levels.
+                          </Banner>
                         ) : (
                           <DataTable
                             columnContentTypes={["text", "text", "text", "numeric", "numeric", "numeric"]}

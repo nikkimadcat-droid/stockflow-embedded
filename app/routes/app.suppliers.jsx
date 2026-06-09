@@ -29,36 +29,47 @@ export const loader = async ({ request }) => {
     orderBy: { name: "asc" },
   });
 
-  const vendorResponse = await admin.graphql(`
-    query {
-      products(first: 250) {
-        edges {
-          node {
-            vendor
-            variants(first: 100) {
-              edges {
-                node {
-                  id
-                  sku
-                  displayName
+  // Fetch all products with pagination to get all vendors
+  const vendorMap = {};
+  let hasNextPage = true;
+  let cursor = null;
+
+  while (hasNextPage) {
+    const vendorResponse = await admin.graphql(`
+      query($cursor: String) {
+        products(first: 250, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          edges {
+            node {
+              vendor
+              variants(first: 100) {
+                edges {
+                  node {
+                    id
+                    sku
+                    displayName
+                  }
                 }
               }
             }
           }
         }
       }
-    }
-  `);
-  const vendorData = await vendorResponse.json();
-  const products = vendorData.data.products.edges.map(e => e.node);
+    `, { variables: { cursor } });
 
-  const vendorMap = {};
-  for (const p of products) {
-    if (!p.vendor) continue;
-    if (!vendorMap[p.vendor]) vendorMap[p.vendor] = [];
-    for (const { node: v } of p.variants.edges) {
-      vendorMap[p.vendor].push({ id: v.id, sku: v.sku, name: v.displayName });
+    const vendorData = await vendorResponse.json();
+    const page = vendorData.data.products;
+
+    for (const { node: p } of page.edges) {
+      if (!p.vendor) continue;
+      if (!vendorMap[p.vendor]) vendorMap[p.vendor] = [];
+      for (const { node: v } of p.variants.edges) {
+        vendorMap[p.vendor].push({ id: v.id, sku: v.sku, name: v.displayName });
+      }
     }
+
+    hasNextPage = page.pageInfo.hasNextPage;
+    cursor = page.pageInfo.endCursor;
   }
 
   return { suppliers, vendorMap };

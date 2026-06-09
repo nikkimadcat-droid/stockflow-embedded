@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
-import prisma from "../db.server";
+import db from "../db.server";
 import {
   Page,
   Layout,
@@ -21,8 +21,6 @@ import {
   Spinner,
 } from "@shopify/polaris";
 
-// ── helpers ────────────────────────────────────────────────────────────────
-
 function poNumberGen() {
   const d = new Date();
   return `PO-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}-${Math.floor(Math.random() * 900) + 100}`;
@@ -38,26 +36,21 @@ function statusBadge(status) {
   return <Badge tone={map[status] ?? "info"}>{status.charAt(0).toUpperCase() + status.slice(1)}</Badge>;
 }
 
-// ── loader ─────────────────────────────────────────────────────────────────
-
 export const loader = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
 
-  // existing POs
-  const purchaseOrders = await prisma.purchaseOrder.findMany({
+  const purchaseOrders = await db.purchaseOrder.findMany({
     where: { shop },
     include: { items: true, supplier: true },
     orderBy: { createdAt: "desc" },
   });
 
-  // suppliers for the create modal
-  const suppliers = await prisma.supplier.findMany({
+  const suppliers = await db.supplier.findMany({
     where: { shop },
     orderBy: { name: "asc" },
   });
 
-  // locations
   const locRes = await admin.graphql(`
     query {
       locations(first: 10) {
@@ -71,36 +64,31 @@ export const loader = async ({ request }) => {
   return { purchaseOrders, suppliers, locations, shop };
 };
 
-// ── action ─────────────────────────────────────────────────────────────────
-
 export const action = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
   const form = await request.formData();
   const intent = form.get("intent");
 
-  // ── CREATE PO ────────────────────────────────────────────────
   if (intent === "create") {
     const supplierId = form.get("supplierId");
     const notes = form.get("notes") || "";
-    const mode = form.get("mode"); // "minmax" | "sales" | "manual"
+    const mode = form.get("mode");
     const locationId = form.get("locationId");
     const poNumber = poNumberGen();
 
     let items = [];
 
     if (mode === "minmax") {
-      // pull minmax records for this supplier's variants at chosen location
-      const supplierSkus = await prisma.supplierSku.findMany({
+      const supplierSkus = await db.supplierSku.findMany({
         where: { shop, supplierId },
       });
       const variantIds = supplierSkus.map((s) => s.variantId);
 
-      const minmaxRows = await prisma.minMax.findMany({
+      const minmaxRows = await db.minMax.findMany({
         where: { shop, locationId, variantId: { in: variantIds } },
       });
 
-      // fetch current inventory levels from Shopify
       const invRes = await admin.graphql(`
         query($locationId: ID!) {
           location(id: $locationId) {
@@ -151,17 +139,15 @@ export const action = async ({ request }) => {
     }
 
     if (mode === "sales") {
-      // pull last 30 days of orders to calculate velocity
       const since = new Date();
       since.setDate(since.getDate() - 30);
       const sinceStr = since.toISOString();
 
-      const supplierSkus = await prisma.supplierSku.findMany({
+      const supplierSkus = await db.supplierSku.findMany({
         where: { shop, supplierId },
       });
       const variantIds = new Set(supplierSkus.map((s) => s.variantId));
 
-      // paginate orders
       let cursor = null;
       const salesMap = {};
       let hasMore = true;
@@ -178,7 +164,6 @@ export const action = async ({ request }) => {
                       node {
                         variant { id title product { title } sku }
                         quantity
-                        fulfillmentStatus
                       }
                     }
                   }
@@ -217,13 +202,12 @@ export const action = async ({ request }) => {
           productTitle: data.productTitle,
           variantTitle: data.variantTitle,
           sku: data.sku,
-          qtyOrdered: data.qty, // order what sold — user can edit
+          qtyOrdered: data.qty,
           qtyCost: skuRec?.cost ?? 0,
         });
       }
     }
 
-    // for manual mode, items come in as JSON from the form
     if (mode === "manual") {
       try {
         items = JSON.parse(form.get("items") || "[]");
@@ -232,7 +216,7 @@ export const action = async ({ request }) => {
       }
     }
 
-    const po = await prisma.purchaseOrder.create({
+    const po = await db.purchaseOrder.create({
       data: {
         shop,
         poNumber,
@@ -257,28 +241,24 @@ export const action = async ({ request }) => {
     return { ok: true, poId: po.id };
   }
 
-  // ── UPDATE STATUS ─────────────────────────────────────────────
   if (intent === "updateStatus") {
     const id = form.get("id");
     const status = form.get("status");
-    await prisma.purchaseOrder.update({
+    await db.purchaseOrder.update({
       where: { id },
       data: { status, updatedAt: new Date() },
     });
     return { ok: true };
   }
 
-  // ── DELETE PO ─────────────────────────────────────────────────
   if (intent === "delete") {
     const id = form.get("id");
-    await prisma.purchaseOrder.delete({ where: { id } });
+    await db.purchaseOrder.delete({ where: { id } });
     return { ok: true };
   }
 
   return { ok: false };
 };
-
-// ── component ──────────────────────────────────────────────────────────────
 
 export default function PurchaseOrders() {
   const { purchaseOrders, suppliers, locations } = useLoaderData();
@@ -328,7 +308,6 @@ export default function PurchaseOrders() {
     { label: "Reorder from 30-day sales velocity", value: "sales" },
     { label: "Manual — I'll enter quantities", value: "manual" },
   ];
-
   const statusOptions = [
     { label: "Draft", value: "draft" },
     { label: "Ordered", value: "ordered" },
@@ -348,7 +327,6 @@ export default function PurchaseOrders() {
       <Layout>
         <Layout.Section>
 
-          {/* ── create modal ── */}
           <Modal
             open={showCreate}
             onClose={() => setShowCreate(false)}
@@ -384,7 +362,7 @@ export default function PurchaseOrders() {
                     helpText={
                       mode === "minmax"
                         ? "Check inventory levels at this location against min/max targets"
-                        : "Sales data is store-wide but inventory will be delivered here"
+                        : "Sales are store-wide; inventory will be delivered here"
                     }
                   />
                 )}
@@ -404,7 +382,6 @@ export default function PurchaseOrders() {
             </Modal.Section>
           </Modal>
 
-          {/* ── PO list ── */}
           {isSubmitting && (
             <div style={{ textAlign: "center", padding: "2rem" }}>
               <Spinner size="large" />
@@ -429,8 +406,6 @@ export default function PurchaseOrders() {
               <div key={po.id} style={{ marginBottom: "1rem" }}>
                 <Card>
                   <BlockStack gap="300">
-
-                    {/* header row */}
                     <InlineStack align="space-between" blockAlign="center">
                       <BlockStack gap="100">
                         <InlineStack gap="200" blockAlign="center">
@@ -445,7 +420,6 @@ export default function PurchaseOrders() {
                           {po.notes ? ` · ${po.notes}` : ""}
                         </Text>
                       </BlockStack>
-
                       <InlineStack gap="200">
                         <Select
                           label=""
@@ -470,7 +444,6 @@ export default function PurchaseOrders() {
                       </InlineStack>
                     </InlineStack>
 
-                    {/* expanded line items */}
                     {isExpanded && (
                       <>
                         <Divider />

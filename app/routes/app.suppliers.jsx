@@ -29,8 +29,8 @@ export const loader = async ({ request }) => {
     orderBy: { name: "asc" },
   });
 
-  // Fetch all products with pagination to get all vendors
   const vendorMap = {};
+  const variantMap = {};
   let hasNextPage = true;
   let cursor = null;
 
@@ -41,6 +41,7 @@ export const loader = async ({ request }) => {
           pageInfo { hasNextPage endCursor }
           edges {
             node {
+              title
               vendor
               variants(first: 100) {
                 edges {
@@ -48,6 +49,7 @@ export const loader = async ({ request }) => {
                     id
                     sku
                     displayName
+                    inventoryItem { id }
                   }
                 }
               }
@@ -65,6 +67,12 @@ export const loader = async ({ request }) => {
       if (!vendorMap[p.vendor]) vendorMap[p.vendor] = [];
       for (const { node: v } of p.variants.edges) {
         vendorMap[p.vendor].push({ id: v.id, sku: v.sku, name: v.displayName });
+        variantMap[v.id] = {
+          sku: v.sku,
+          title: p.title,
+          displayName: v.displayName,
+          inventoryItemId: v.inventoryItem?.id,
+        };
       }
     }
 
@@ -72,11 +80,11 @@ export const loader = async ({ request }) => {
     cursor = page.pageInfo.endCursor;
   }
 
-  return { suppliers, vendorMap };
+  return { suppliers, vendorMap, variantMap };
 };
 
 export const action = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
   const formData = await request.formData();
   const intent = formData.get("intent");
@@ -115,6 +123,38 @@ export const action = async ({ request }) => {
     return { ok: true };
   }
 
+  if (intent === "update_sku") {
+    const id = formData.get("id");
+    const supplierCode = formData.get("supplierCode");
+    const cost = parseFloat(formData.get("cost")) || 0;
+    const inventoryItemId = formData.get("inventoryItemId");
+
+    // Update in StockFlow DB
+    await prisma.supplierSku.update({
+      where: { id },
+      data: { supplierCode, cost },
+    });
+
+    // Push cost to Shopify
+    if (inventoryItemId) {
+      await admin.graphql(`
+        mutation($id: ID!, $input: InventoryItemInput!) {
+          inventoryItemUpdate(id: $id, input: $input) {
+            inventoryItem { id unitCost { amount } }
+            userErrors { field message }
+          }
+        }
+      `, {
+        variables: {
+          id: inventoryItemId,
+          input: { cost: { amount: cost.toString(), currencyCode: "USD" } },
+        },
+      });
+    }
+
+    return { ok: true };
+  }
+
   if (intent === "remove_sku") {
     const supplierId = formData.get("supplierId");
     const variantId = formData.get("variantId");
@@ -126,13 +166,14 @@ export const action = async ({ request }) => {
 };
 
 export default function Suppliers() {
-  const { suppliers, vendorMap } = useLoaderData();
+  const { suppliers, vendorMap, variantMap } = useLoaderData();
   const fetcher = useFetcher();
   const [modalOpen, setModalOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [expandedId, setExpandedId] = useState(null);
   const [selectedVendor, setSelectedVendor] = useState("");
   const [vendorCost, setVendorCost] = useState("");
+  const [skuEdits, setSkuEdits] = useState({});
 
   const vendors = Object.keys(vendorMap).sort();
   const vendorOptions = [
@@ -169,6 +210,26 @@ export default function Suppliers() {
     fetcher.submit(form, { method: "POST" });
     setSelectedVendor("");
     setVendorCost("");
+  };
+
+  const handleSkuEdit = (id, field, value) => {
+    setSkuEdits(prev => ({
+      ...prev,
+      [id]: { ...prev[id], [field]: value },
+    }));
+  };
+
+  const handleSkuSave = (sku) => {
+    const edits = skuEdits[sku.id] ?? {};
+    const variant = variantMap[sku.variantId] ?? {};
+    const form = new FormData();
+    form.append("intent", "update_sku");
+    form.append("id", sku.id);
+    form.append("supplierCode", edits.supplierCode ?? sku.supplierCode ?? "");
+    form.append("cost", edits.cost ?? sku.cost ?? 0);
+    form.append("inventoryItemId", variant.inventoryItemId ?? "");
+    fetcher.submit(form, { method: "POST" });
+    setSkuEdits(prev => { const n = { ...prev }; delete n[sku.id]; return n; });
   };
 
   const handleRemoveSku = (supplierId, variantId) => {
@@ -257,7 +318,7 @@ export default function Suppliers() {
                             <table style={{ width: "100%", borderCollapse: "collapse" }}>
                               <thead>
                                 <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                                  {["Supplier Code", "Cost", ""].map(h => (
+                                  {["SKU", "Product", "Supplier Code", "Cost", ""].map(h => (
                                     <th key={h} style={{ padding: "8px 12px", textAlign: "left" }}>
                                       <Text variant="headingSm">{h}</Text>
                                     </th>
@@ -265,25 +326,62 @@ export default function Suppliers() {
                                 </tr>
                               </thead>
                               <tbody>
-                                {s.skus.map(sku => (
-                                  <tr key={sku.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
-                                    <td style={{ padding: "8px 12px" }}>
-                                      <Text>{sku.supplierCode || "—"}</Text>
-                                    </td>
-                                    <td style={{ padding: "8px 12px" }}>
-                                      <Text>${sku.cost.toFixed(2)}</Text>
-                                    </td>
-                                    <td style={{ padding: "8px 12px", textAlign: "right" }}>
-                                      <Button
-                                        size="slim"
-                                        tone="critical"
-                                        onClick={() => handleRemoveSku(s.id, sku.variantId)}
-                                      >
-                                        Remove
-                                      </Button>
-                                    </td>
-                                  </tr>
-                                ))}
+                                {s.skus.map(sku => {
+                                  const variant = variantMap[sku.variantId] ?? {};
+                                  const edits = skuEdits[sku.id] ?? {};
+                                  const isDirty = Object.keys(edits).length > 0;
+                                  return (
+                                    <tr key={sku.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
+                                      <td style={{ padding: "8px 12px" }}>
+                                        <Text>{variant.sku || "—"}</Text>
+                                      </td>
+                                      <td style={{ padding: "8px 12px" }}>
+                                        <Text>{variant.title || "—"}</Text>
+                                      </td>
+                                      <td style={{ padding: "8px 12px", width: "150px" }}>
+                                        <TextField
+                                          label=""
+                                          labelHidden
+                                          value={edits.supplierCode ?? sku.supplierCode ?? ""}
+                                          onChange={val => handleSkuEdit(sku.id, "supplierCode", val)}
+                                          autoComplete="off"
+                                        />
+                                      </td>
+                                      <td style={{ padding: "8px 12px", width: "120px" }}>
+                                        <TextField
+                                          label=""
+                                          labelHidden
+                                          type="number"
+                                          prefix="$"
+                                          value={String(edits.cost ?? sku.cost ?? 0)}
+                                          onChange={val => handleSkuEdit(sku.id, "cost", val)}
+                                          autoComplete="off"
+                                        />
+                                      </td>
+                                      <td style={{ padding: "8px 12px", textAlign: "right" }}>
+                                        <InlineStack gap="200">
+                                          {isDirty && (
+                                            <Button
+                                              size="slim"
+                                              variant="primary"
+                                              onClick={() => handleSkuSave(sku)}
+                                              loading={fetcher.state !== "idle"}
+                                            >
+                                              Save
+                                            </Button>
+                                          )}
+                                          <Button
+                                            size="slim"
+                                            tone="critical"
+                                            onClick={() => handleRemoveSku(s.id, sku.variantId)}
+                                          >
+                                            Remove
+                                          </Button>
+                                        </InlineStack>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
                               </tbody>
                             </table>
                           </BlockStack>

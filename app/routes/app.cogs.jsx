@@ -143,6 +143,7 @@ export const action = async ({ request }) => {
       const margin = cost != null && data.revenue > 0
         ? ((1 - (cost * data.qty) / data.revenue) * 100)
         : null;
+      const avgPrice = data.qty > 0 ? data.revenue / data.qty : null;
 
       if (cogs != null) {
         totalCOGS += cogs;
@@ -160,6 +161,7 @@ export const action = async ({ request }) => {
         cogs,
         revenue: data.revenue,
         margin,
+        avgPrice,
       });
     }
 
@@ -300,7 +302,7 @@ export default function COGS() {
                   <table style={{ width: "100%", borderCollapse: "collapse" }}>
                     <thead>
                       <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                        {["Product", "SKU", "Cost", "Units Sold", "COGS", "Revenue", "Gross Margin"].map((h, i) => (
+                        {["Product", "SKU", "Cost", "Avg Retail", "Units Sold", "COGS", "Revenue", "Gross Margin"].map((h, i) => (
                           <th key={i} style={{ padding: "8px 12px", textAlign: i >= 2 ? "center" : "left" }}>
                             <Text variant="headingSm">{h}</Text>
                           </th>
@@ -316,6 +318,9 @@ export default function COGS() {
                             <Text tone={item.cost == null ? "critical" : undefined}>
                               {item.cost != null ? `$${item.cost.toFixed(2)}` : "no cost"}
                             </Text>
+                          </td>
+                          <td style={{ padding: "8px 12px", textAlign: "center" }}>
+                            <Text>{item.avgPrice != null ? `$${item.avgPrice.toFixed(2)}` : "—"}</Text>
                           </td>
                           <td style={{ padding: "8px 12px", textAlign: "center" }}>
                             <Text>{item.qty}</Text>

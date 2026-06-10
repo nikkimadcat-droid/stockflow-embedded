@@ -28,9 +28,7 @@ export const action = async ({ request }) => {
   const intent = form.get("intent");
 
   if (intent === "loadVendors") {
-    // Step 1: get vendor → variantId mapping by paginating products (no inventory here)
     const vendorMap = {};
-    const variantVendorMap = {};
     let cursor = null;
     let hasMore = true;
 
@@ -59,56 +57,8 @@ export const action = async ({ request }) => {
       for (const e of products?.edges ?? []) {
         const vendor = e.node.vendor;
         if (!vendor) continue;
-        if (!vendorMap[vendor]) vendorMap[vendor] = { name: vendor, skus: 0, totalStock: 0 };
-        for (const v of e.node.variants.edges) {
-          vendorMap[vendor].skus++;
-          variantVendorMap[v.node.id] = vendor;
-        }
-      }
-    }
-
-    // Step 2: get locations
-    const locRes = await admin.graphql(`
-      query { locations(first: 10) { edges { node { id } } } }
-    `);
-    const locJson = await locRes.json();
-    const locationIds = locJson.data.locations.edges.map((e) => e.node.id);
-
-    // Step 3: for each location, paginate inventory levels (cheap query — no nesting)
-    for (const locationId of locationIds) {
-      let invCursor = null;
-      let invHasMore = true;
-
-      while (invHasMore) {
-        const invRes = await admin.graphql(`
-          query($locationId: ID!, $cursor: String) {
-            location(id: $locationId) {
-              inventoryLevels(first: 250, after: $cursor) {
-                pageInfo { hasNextPage endCursor }
-                edges {
-                  node {
-                    quantities(names: ["available"]) { quantity }
-                    item { variant { id } }
-                  }
-                }
-              }
-            }
-          }
-        `, { variables: { locationId, cursor: invCursor } });
-
-        const invJson = await invRes.json();
-        const levels = invJson.data?.location?.inventoryLevels;
-        invHasMore = levels?.pageInfo?.hasNextPage ?? false;
-        invCursor = levels?.pageInfo?.endCursor ?? null;
-
-        for (const e of levels?.edges ?? []) {
-          const vid = e.node?.item?.variant?.id;
-          const qty = e.node?.quantities?.[0]?.quantity ?? 0;
-          const vendor = variantVendorMap[vid];
-          if (vendor && vendorMap[vendor]) {
-            vendorMap[vendor].totalStock += qty;
-          }
-        }
+        if (!vendorMap[vendor]) vendorMap[vendor] = { name: vendor, skus: 0 };
+        vendorMap[vendor].skus += e.node.variants.edges.length;
       }
     }
 
@@ -285,12 +235,7 @@ export default function Vendors() {
                       <InlineStack align="space-between" blockAlign="center">
                         <BlockStack gap="100">
                           <Text variant="headingMd">{v.name}</Text>
-                          <InlineStack gap="200">
-                            <Badge tone="info">{v.skus} SKUs</Badge>
-                            <Badge tone={v.totalStock > 0 ? "success" : "critical"}>
-                              {v.totalStock} units on hand
-                            </Badge>
-                          </InlineStack>
+                          <Badge tone="info">{v.skus} SKUs</Badge>
                         </BlockStack>
                         <Button variant="plain" onClick={() => handleToggleVendor(v.name)}>
                           {isExpanded ? "Hide products" : "View products"}

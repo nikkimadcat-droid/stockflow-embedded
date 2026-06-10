@@ -39,7 +39,6 @@ export const action = async ({ request }) => {
     since.setDate(since.getDate() - days);
     const sinceStr = since.toISOString();
 
-    // Paginate all orders in the date range, optionally filtered by location
     const locationNumericId = locationId ? locationId.split("/").pop() : null;
     const queryStr = locationNumericId
       ? `created_at:>${sinceStr} location_id:${locationNumericId}`
@@ -47,7 +46,7 @@ export const action = async ({ request }) => {
 
     let cursor = null;
     let hasMore = true;
-    const salesMap = {}; // variantId -> { qty, revenue }
+    const salesMap = {};
 
     while (hasMore) {
       const res = await admin.graphql(`
@@ -103,6 +102,33 @@ export const action = async ({ request }) => {
       where: { shop, variantId: { in: variantIds } },
     });
     const costMap = Object.fromEntries(supplierSkus.map((s) => [s.variantId, parseFloat(s.cost ?? 0)]));
+
+    // Fall back to Shopify unitCost for variants missing from DB
+    const missingIds = variantIds.filter((id) => costMap[id] == null);
+    if (missingIds.length > 0) {
+      for (let i = 0; i < missingIds.length; i += 50) {
+        const batch = missingIds.slice(i, i + 50);
+        const idsQuery = batch.map((id) => `id:${id.split("/").pop()}`).join(" OR ");
+        const res = await admin.graphql(`
+          query($query: String!) {
+            productVariants(first: 50, query: $query) {
+              edges {
+                node {
+                  id
+                  inventoryItem { unitCost { amount } }
+                }
+              }
+            }
+          }
+        `, { variables: { query: idsQuery } });
+        const json = await res.json();
+        for (const e of json.data?.productVariants?.edges ?? []) {
+          const vid = e.node.id;
+          const cost = e.node.inventoryItem?.unitCost?.amount;
+          if (cost != null) costMap[vid] = parseFloat(cost);
+        }
+      }
+    }
 
     // Build rows
     let totalCOGS = 0;
@@ -169,10 +195,6 @@ export default function COGS() {
   const isLoading = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
 
-  if (fetcher.state === "idle" && fetcherData?.intent === "loadCOGS" && result === null) {
-    setResult(fetcherData);
-  }
-  // Allow re-loading with new filters
   if (fetcher.state === "idle" && fetcherData?.intent === "loadCOGS" && fetcherData !== result) {
     setResult(fetcherData);
   }
@@ -278,7 +300,7 @@ export default function COGS() {
                   <table style={{ width: "100%", borderCollapse: "collapse" }}>
                     <thead>
                       <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                        {["Product", "SKU", "Supplier Cost", "Units Sold", "COGS", "Revenue", "Gross Margin"].map((h, i) => (
+                        {["Product", "SKU", "Cost", "Units Sold", "COGS", "Revenue", "Gross Margin"].map((h, i) => (
                           <th key={i} style={{ padding: "8px 12px", textAlign: i >= 2 ? "center" : "left" }}>
                             <Text variant="headingSm">{h}</Text>
                           </th>
@@ -330,7 +352,7 @@ export default function COGS() {
           <Layout.Section>
             <Card>
               <EmptyState heading="Select filters and load COGS" image="">
-                <p>Choose a location and time period, then click Load COGS to calculate gross margin from your supplier costs.</p>
+                <p>Choose a location and time period, then click Load COGS to calculate gross margin from your supplier and Shopify costs.</p>
               </EmptyState>
             </Card>
           </Layout.Section>

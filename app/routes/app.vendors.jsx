@@ -1,87 +1,310 @@
-import { useLoaderData } from "react-router";
+import { useState } from "react";
+import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
+import db from "../db.server";
 import {
   Page,
   Layout,
   Card,
-  DataTable,
-  Text,
   BlockStack,
+  InlineStack,
+  Button,
+  Text,
+  Badge,
+  Divider,
+  Spinner,
+  EmptyState,
 } from "@shopify/polaris";
 
 export const loader = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  const { session } = await authenticate.admin(request);
+  return { shop: session.shop };
+};
 
-  // Fetch all products with vendor info
-  const response = await admin.graphql(`
-    query {
-      products(first: 250) {
-        edges {
-          node {
-            id
-            title
-            vendor
-            variants(first: 100) {
-              edges {
-                node {
-                  id
-                  sku
-                  inventoryQuantity
+export const action = async ({ request }) => {
+  const { admin, session } = await authenticate.admin(request);
+  const shop = session.shop;
+  const form = await request.formData();
+  const intent = form.get("intent");
+
+  // Load vendor summary — paginate full catalog
+  if (intent === "loadVendors") {
+    const vendorMap = {};
+    let cursor = null;
+    let hasMore = true;
+
+    while (hasMore) {
+      const res = await admin.graphql(`
+        query($cursor: String) {
+          products(first: 250, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                vendor
+                variants(first: 100) {
+                  edges {
+                    node {
+                      inventoryQuantity
+                    }
+                  }
                 }
               }
             }
           }
         }
+      `, { variables: { cursor } });
+
+      const json = await res.json();
+      const products = json.data?.products;
+      hasMore = products?.pageInfo?.hasNextPage ?? false;
+      cursor = products?.pageInfo?.endCursor ?? null;
+
+      for (const e of products?.edges ?? []) {
+        const vendor = e.node.vendor;
+        if (!vendor) continue;
+        if (!vendorMap[vendor]) vendorMap[vendor] = { name: vendor, skus: 0, totalStock: 0 };
+        for (const v of e.node.variants.edges) {
+          vendorMap[vendor].skus++;
+          vendorMap[vendor].totalStock += v.node.inventoryQuantity ?? 0;
+        }
       }
     }
-  `);
 
-  const data = await response.json();
-  const products = data.data.products.edges.map(e => e.node);
+    const vendors = Object.values(vendorMap).sort((a, b) => a.name.localeCompare(b.name));
+    return { ok: true, intent: "loadVendors", vendors };
+  }
 
-  // Group by vendor
-  const vendorMap = {};
-  products.forEach(p => {
-    if (!p.vendor) return;
-    if (!vendorMap[p.vendor]) {
-      vendorMap[p.vendor] = { name: p.vendor, skus: 0, totalStock: 0 };
+  // Load products for a specific vendor
+  if (intent === "loadVendorProducts") {
+    const vendor = form.get("vendor");
+    const products = [];
+    let cursor = null;
+    let hasMore = true;
+
+    while (hasMore) {
+      const res = await admin.graphql(`
+        query($cursor: String, $query: String!) {
+          products(first: 250, after: $cursor, query: $query) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                id
+                title
+                variants(first: 100) {
+                  edges {
+                    node {
+                      id
+                      title
+                      sku
+                      inventoryQuantity
+                      inventoryItem { unitCost { amount } }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `, { variables: { cursor, query: `vendor:"${vendor}"` } });
+
+      const json = await res.json();
+      const page = json.data?.products;
+      hasMore = page?.pageInfo?.hasNextPage ?? false;
+      cursor = page?.pageInfo?.endCursor ?? null;
+
+      for (const e of page?.edges ?? []) {
+        products.push(e.node);
+      }
     }
-    p.variants.edges.forEach(v => {
-      vendorMap[p.vendor].skus++;
-      vendorMap[p.vendor].totalStock += v.node.inventoryQuantity || 0;
+
+    // Pull cost prices from supplier SKU table as fallback/override
+    const variantIds = products.flatMap((p) => p.variants.edges.map((v) => v.node.id));
+    const supplierSkus = await db.supplierSku.findMany({
+      where: { shop, variantId: { in: variantIds } },
     });
-  });
+    const costMap = Object.fromEntries(supplierSkus.map((s) => [s.variantId, s.cost]));
 
-  const vendors = Object.values(vendorMap).sort((a, b) =>
-    a.name.localeCompare(b.name)
-  );
+    // Flatten to variants
+    const rows = [];
+    for (const p of products) {
+      for (const ve of p.variants.edges) {
+        const v = ve.node;
+        const shopifyCost = v.inventoryItem?.unitCost?.amount
+          ? parseFloat(v.inventoryItem.unitCost.amount)
+          : null;
+        const supplierCost = costMap[v.id] ?? null;
+        rows.push({
+          productTitle: p.title,
+          variantTitle: v.title,
+          sku: v.sku ?? "",
+          onHand: v.inventoryQuantity ?? 0,
+          shopifyCost,
+          supplierCost,
+        });
+      }
+    }
 
-  return { vendors };
+    rows.sort((a, b) => a.productTitle.localeCompare(b.productTitle));
+    return { ok: true, intent: "loadVendorProducts", vendor, rows };
+  }
+
+  return { ok: false };
 };
 
 export default function Vendors() {
-  const { vendors } = useLoaderData();
+  const { } = useLoaderData();
+  const fetcher = useFetcher();
 
-  const rows = vendors.map(v => [
-    v.name,
-    v.skus,
-    v.totalStock,
-  ]);
+  const [vendors, setVendors] = useState(null);
+  const [expandedVendor, setExpandedVendor] = useState(null);
+  const [vendorProducts, setVendorProducts] = useState({});
+  const [loadingVendor, setLoadingVendor] = useState(null);
+
+  const isLoadingVendors = fetcher.state !== "idle" && !loadingVendor;
+  const fetcherData = fetcher.data;
+
+  // Handle fetcher responses
+  if (fetcher.state === "idle" && fetcherData?.intent === "loadVendors" && vendors === null) {
+    setVendors(fetcherData.vendors);
+  }
+  if (fetcher.state === "idle" && fetcherData?.intent === "loadVendorProducts" && loadingVendor) {
+    setVendorProducts((prev) => ({ ...prev, [fetcherData.vendor]: fetcherData.rows }));
+    setLoadingVendor(null);
+  }
+
+  function handleLoadVendors() {
+    const fd = new FormData();
+    fd.append("intent", "loadVendors");
+    fetcher.submit(fd, { method: "post" });
+  }
+
+  function handleToggleVendor(vendorName) {
+    if (expandedVendor === vendorName) {
+      setExpandedVendor(null);
+      return;
+    }
+    setExpandedVendor(vendorName);
+    if (!vendorProducts[vendorName]) {
+      setLoadingVendor(vendorName);
+      const fd = new FormData();
+      fd.append("intent", "loadVendorProducts");
+      fd.append("vendor", vendorName);
+      fetcher.submit(fd, { method: "post" });
+    }
+  }
 
   return (
     <Page title="Vendors">
       <Layout>
         <Layout.Section>
-          <Card>
-            <BlockStack gap="400">
-              <Text variant="headingMd">{vendors.length} vendors</Text>
-              <DataTable
-                columnContentTypes={["text", "numeric", "numeric"]}
-                headings={["Vendor", "SKUs", "Total Stock"]}
-                rows={rows}
-              />
+
+          {vendors === null && (
+            <Card>
+              <BlockStack gap="400">
+                {isLoadingVendors ? (
+                  <div style={{ textAlign: "center", padding: "2rem" }}>
+                    <Spinner size="large" />
+                    <Text>Loading full catalog — this may take a moment…</Text>
+                  </div>
+                ) : (
+                  <EmptyState
+                    heading="Load vendor summary"
+                    action={{ content: "Load vendors", onAction: handleLoadVendors }}
+                    image=""
+                  >
+                    <p>Fetches all products across your full catalog and groups them by vendor.</p>
+                  </EmptyState>
+                )}
+              </BlockStack>
+            </Card>
+          )}
+
+          {vendors !== null && (
+            <BlockStack gap="300">
+              <InlineStack align="space-between" blockAlign="center">
+                <Text variant="headingMd">{vendors.length} vendors</Text>
+                <Button variant="plain" onClick={() => { setVendors(null); handleLoadVendors(); }}>
+                  ↺ Refresh
+                </Button>
+              </InlineStack>
+
+              {vendors.map((v) => {
+                const isExpanded = expandedVendor === v.name;
+                const isLoadingThis = loadingVendor === v.name;
+                const products = vendorProducts[v.name];
+
+                return (
+                  <Card key={v.name}>
+                    <BlockStack gap="300">
+                      <InlineStack align="space-between" blockAlign="center">
+                        <BlockStack gap="100">
+                          <Text variant="headingMd">{v.name}</Text>
+                          <InlineStack gap="200">
+                            <Badge tone="info">{v.skus} SKUs</Badge>
+                            <Badge tone={v.totalStock > 0 ? "success" : "critical"}>
+                              {v.totalStock} units on hand
+                            </Badge>
+                          </InlineStack>
+                        </BlockStack>
+                        <Button variant="plain" onClick={() => handleToggleVendor(v.name)}>
+                          {isExpanded ? "Hide products" : "View products"}
+                        </Button>
+                      </InlineStack>
+
+                      {isExpanded && (
+                        <>
+                          <Divider />
+                          {isLoadingThis ? (
+                            <div style={{ textAlign: "center", padding: "1rem" }}>
+                              <Spinner size="small" />
+                              <Text tone="subdued">Loading products…</Text>
+                            </div>
+                          ) : products?.length === 0 ? (
+                            <Text tone="subdued">No products found for this vendor.</Text>
+                          ) : (
+                            <div style={{ overflowX: "auto" }}>
+                              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                                <thead>
+                                  <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
+                                    {["Product", "Variant", "SKU", "On Hand", "Shopify Cost", "Supplier Cost"].map((h, i) => (
+                                      <th key={i} style={{ padding: "8px 12px", textAlign: i >= 3 ? "center" : "left" }}>
+                                        <Text variant="headingSm">{h}</Text>
+                                      </th>
+                                    ))}
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {products?.map((row, i) => (
+                                    <tr key={i} style={{ borderBottom: "1px solid #f1f2f3" }}>
+                                      <td style={{ padding: "8px 12px" }}><Text>{row.productTitle}</Text></td>
+                                      <td style={{ padding: "8px 12px" }}><Text>{row.variantTitle}</Text></td>
+                                      <td style={{ padding: "8px 12px" }}><Text>{row.sku}</Text></td>
+                                      <td style={{ padding: "8px 12px", textAlign: "center" }}>
+                                        <Text tone={row.onHand <= 0 ? "critical" : row.onHand < 3 ? "caution" : undefined}>
+                                          {row.onHand}
+                                        </Text>
+                                      </td>
+                                      <td style={{ padding: "8px 12px", textAlign: "center" }}>
+                                        <Text>{row.shopifyCost != null ? `$${row.shopifyCost.toFixed(2)}` : "—"}</Text>
+                                      </td>
+                                      <td style={{ padding: "8px 12px", textAlign: "center" }}>
+                                        <Text>{row.supplierCost != null ? `$${Number(row.supplierCost).toFixed(2)}` : "—"}</Text>
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </BlockStack>
+                  </Card>
+                );
+              })}
             </BlockStack>
-          </Card>
+          )}
+
         </Layout.Section>
       </Layout>
     </Page>

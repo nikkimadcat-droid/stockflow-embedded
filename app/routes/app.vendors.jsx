@@ -89,13 +89,6 @@ export const action = async ({ request }) => {
                       sku
                       inventoryItem {
                         unitCost { amount }
-                        inventoryLevels(first: 10) {
-                          edges {
-                            node {
-                              quantities(names: ["available"]) { quantity }
-                            }
-                          }
-                        }
                       }
                     }
                   }
@@ -123,20 +116,14 @@ export const action = async ({ request }) => {
     for (const p of products) {
       for (const ve of p.variants.edges) {
         const v = ve.node;
-        const shopifyCost = v.inventoryItem?.unitCost?.amount
-          ? parseFloat(v.inventoryItem.unitCost.amount)
-          : null;
-        const supplierCost = costMap[v.id] ?? null;
-        const onHand = (v.inventoryItem?.inventoryLevels?.edges ?? []).reduce(
-          (sum, l) => sum + (l.node.quantities?.[0]?.quantity ?? 0), 0
-        );
         rows.push({
           productTitle: p.title,
           variantTitle: v.title,
           sku: v.sku ?? "",
-          onHand,
-          shopifyCost,
-          supplierCost,
+          shopifyCost: v.inventoryItem?.unitCost?.amount
+            ? parseFloat(v.inventoryItem.unitCost.amount)
+            : null,
+          supplierCost: costMap[v.id] ?? null,
         });
       }
     }
@@ -257,7 +244,7 @@ export default function Vendors() {
                               <table style={{ width: "100%", borderCollapse: "collapse" }}>
                                 <thead>
                                   <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                                    {["Product", "Variant", "SKU", "On Hand (all locations)", "Shopify Cost", "Supplier Cost"].map((h, i) => (
+                                    {["Product", "Variant", "SKU", "Shopify Cost", "Supplier Cost"].map((h, i) => (
                                       <th key={i} style={{ padding: "8px 12px", textAlign: i >= 3 ? "center" : "left" }}>
                                         <Text variant="headingSm">{h}</Text>
                                       </th>
@@ -270,11 +257,6 @@ export default function Vendors() {
                                       <td style={{ padding: "8px 12px" }}><Text>{row.productTitle}</Text></td>
                                       <td style={{ padding: "8px 12px" }}><Text>{row.variantTitle}</Text></td>
                                       <td style={{ padding: "8px 12px" }}><Text>{row.sku}</Text></td>
-                                      <td style={{ padding: "8px 12px", textAlign: "center" }}>
-                                        <Text tone={row.onHand <= 0 ? "critical" : row.onHand < 3 ? "caution" : undefined}>
-                                          {row.onHand}
-                                        </Text>
-                                      </td>
                                       <td style={{ padding: "8px 12px", textAlign: "center" }}>
                                         <Text>{row.shopifyCost != null ? `$${row.shopifyCost.toFixed(2)}` : "—"}</Text>
                                       </td>

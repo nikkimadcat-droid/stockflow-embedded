@@ -30,23 +30,24 @@ function statusBadge(status) {
   return <Badge tone={map[status] ?? "info"}>{status.charAt(0).toUpperCase() + status.slice(1)}</Badge>;
 }
 
-function downloadCSV(po) {
+function downloadCSV(po, onHandMap) {
   const rows = [
     ["PO Number", "Supplier", "Status", "Created"],
     [po.poNumber, po.supplier?.name ?? "", po.status, new Date(po.createdAt).toLocaleDateString()],
     [],
-    ["Supplier Code", "Product", "Variant", "SKU", "Qty Ordered", "Unit Cost", "Line Total"],
+    ["Supplier Code", "Product", "Variant", "SKU", "On Hand", "Qty Ordered", "Unit Cost", "Line Total"],
     ...po.items.map((i) => [
       i.supplierCode ?? "",
       i.productTitle,
       i.variantTitle,
       i.sku,
+      onHandMap?.[i.variantId] !== undefined ? onHandMap[i.variantId] : "",
       i.qtyOrdered,
       i.qtyCost.toFixed(2),
       (i.qtyOrdered * i.qtyCost).toFixed(2),
     ]),
     [],
-    ["", "", "", "TOTAL", "", "", po.items.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0).toFixed(2)],
+    ["", "", "", "", "TOTAL", "", "", po.items.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0).toFixed(2)],
   ];
 
   const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
@@ -296,6 +297,53 @@ export const action = async ({ request }) => {
     return { ok: true, regenerated: true };
   }
 
+  if (intent === "fetchInventory") {
+    const locationId = form.get("locationId");
+    const variantIds = JSON.parse(form.get("variantIds") || "[]");
+    const poId = form.get("poId");
+
+    if (!locationId || variantIds.length === 0) return { ok: true, intent: "fetchInventory", poId, onHand: {} };
+
+    const variantIdSet = new Set(variantIds);
+    const onHand = {};
+    let cursor = null;
+    let hasMore = true;
+
+    while (hasMore) {
+      const invRes = await admin.graphql(`
+        query($locationId: ID!, $cursor: String) {
+          location(id: $locationId) {
+            inventoryLevels(first: 250, after: $cursor) {
+              pageInfo { hasNextPage endCursor }
+              edges {
+                node {
+                  quantities(names: ["available"]) { quantity }
+                  item { variant { id } }
+                }
+              }
+            }
+          }
+        }
+      `, { variables: { locationId, cursor } });
+
+      const invJson = await invRes.json();
+      const levels = invJson.data?.location?.inventoryLevels;
+      hasMore = levels?.pageInfo?.hasNextPage ?? false;
+      cursor = levels?.pageInfo?.endCursor ?? null;
+
+      for (const e of levels?.edges ?? []) {
+        const vid = e.node?.item?.variant?.id;
+        if (vid && variantIdSet.has(vid)) {
+          onHand[vid] = e.node.quantities?.[0]?.quantity ?? 0;
+        }
+      }
+
+      if (Object.keys(onHand).length === variantIds.length) break;
+    }
+
+    return { ok: true, intent: "fetchInventory", poId, onHand };
+  }
+
   if (intent === "updateStatus") {
     const id = form.get("id");
     const status = form.get("status");
@@ -308,14 +356,10 @@ export const action = async ({ request }) => {
     const updates = JSON.parse(form.get("updates"));
     const removedIds = JSON.parse(form.get("removedIds") || "[]");
 
-    // delete removed items
     if (removedIds.length > 0) {
-      await db.purchaseOrderItem.deleteMany({
-        where: { id: { in: removedIds } },
-      });
+      await db.purchaseOrderItem.deleteMany({ where: { id: { in: removedIds } } });
     }
 
-    // update remaining items
     for (const u of updates) {
       await db.purchaseOrderItem.update({
         where: { id: u.id },
@@ -356,8 +400,20 @@ export default function PurchaseOrders() {
   const [expandedId, setExpandedId] = useState(null);
   const [itemEdits, setItemEdits] = useState({});
   const [removedItems, setRemovedItems] = useState({});
+  const [onHandData, setOnHandData] = useState({});
 
   const isSubmitting = fetcher.state !== "idle";
+  const fetcherData = fetcher.data;
+
+  // Pick up fetchInventory result and store it by poId
+  if (
+    fetcher.state === "idle" &&
+    fetcherData?.intent === "fetchInventory" &&
+    fetcherData?.poId &&
+    onHandData[fetcherData.poId] === "loading"
+  ) {
+    setOnHandData((prev) => ({ ...prev, [fetcherData.poId]: fetcherData.onHand }));
+  }
 
   function handleCreate() {
     const fd = new FormData();
@@ -371,6 +427,18 @@ export default function PurchaseOrders() {
     setNotes("");
   }
 
+  function handleLoadInventory(po) {
+    const variantIds = po.items.map((i) => i.variantId);
+    if (!po.locationId || variantIds.length === 0) return;
+    setOnHandData((prev) => ({ ...prev, [po.id]: "loading" }));
+    const fd = new FormData();
+    fd.append("intent", "fetchInventory");
+    fd.append("locationId", po.locationId);
+    fd.append("variantIds", JSON.stringify(variantIds));
+    fd.append("poId", po.id);
+    fetcher.submit(fd, { method: "post" });
+  }
+
   function handleRegenerate(id) {
     if (!confirm("Regenerate this PO? Current line items will be replaced with fresh inventory data.")) return;
     const fd = new FormData();
@@ -379,6 +447,7 @@ export default function PurchaseOrders() {
     fetcher.submit(fd, { method: "post" });
     setItemEdits((prev) => { const n = { ...prev }; delete n[id]; return n; });
     setRemovedItems((prev) => { const n = { ...prev }; delete n[id]; return n; });
+    setOnHandData((prev) => { const n = { ...prev }; delete n[id]; return n; });
   }
 
   function handleStatusChange(id, status) {
@@ -392,10 +461,7 @@ export default function PurchaseOrders() {
   function handleItemEdit(poId, itemId, field, val) {
     setItemEdits((prev) => ({
       ...prev,
-      [poId]: {
-        ...prev[poId],
-        [itemId]: { ...prev[poId]?.[itemId], [field]: val },
-      },
+      [poId]: { ...prev[poId], [itemId]: { ...prev[poId]?.[itemId], [field]: val } },
     }));
   }
 
@@ -404,7 +470,6 @@ export default function PurchaseOrders() {
       ...prev,
       [poId]: new Set([...(prev[poId] ?? []), itemId]),
     }));
-    // also clear any edits for this item
     setItemEdits((prev) => {
       const poEdits = { ...prev[poId] };
       delete poEdits[itemId];
@@ -423,9 +488,7 @@ export default function PurchaseOrders() {
   function handleSaveItems(po) {
     const edits = itemEdits[po.id] ?? {};
     const removed = removedItems[po.id] ?? new Set();
-    const hasEdits = Object.keys(edits).length > 0;
-    const hasRemovals = removed.size > 0;
-    if (!hasEdits && !hasRemovals) return;
+    if (Object.keys(edits).length === 0 && removed.size === 0) return;
 
     const updates = po.items
       .filter((i) => !removed.has(i.id) && edits[i.id])
@@ -457,6 +520,8 @@ export default function PurchaseOrders() {
 
   const supplierOptions = suppliers.map((s) => ({ label: s.name, value: s.id }));
   const locationOptions = locations.map((l) => ({ label: l.name, value: l.id }));
+  const locationNameMap = Object.fromEntries(locations.map((l) => [l.id, l.name]));
+
   const modeOptions = [
     { label: "Reorder from Min/Max (bring to max levels)", value: "minmax" },
     { label: "Reorder from 30-day sales velocity", value: "sales" },
@@ -472,9 +537,7 @@ export default function PurchaseOrders() {
   return (
     <Page
       title="Purchase Orders"
-      primaryAction={
-        <Button variant="primary" onClick={() => setShowCreate(true)}>+ New PO</Button>
-      }
+      primaryAction={<Button variant="primary" onClick={() => setShowCreate(true)}>+ New PO</Button>}
     >
       <Layout>
         <Layout.Section>
@@ -489,9 +552,7 @@ export default function PurchaseOrders() {
             <Modal.Section>
               <BlockStack gap="400">
                 {suppliers.length === 0 && (
-                  <Banner tone="warning">
-                    No suppliers set up yet. Add suppliers first so you can link SKUs and costs.
-                  </Banner>
+                  <Banner tone="warning">No suppliers set up yet. Add suppliers first.</Banner>
                 )}
                 <Select label="Supplier" options={supplierOptions} value={supplierId} onChange={setSupplierId} />
                 <Select label="How to populate items" options={modeOptions} value={mode} onChange={setMode} />
@@ -542,14 +603,17 @@ export default function PurchaseOrders() {
             const poEdits = itemEdits[po.id] ?? {};
             const poRemoved = removedItems[po.id] ?? new Set();
             const hasChanges = Object.keys(poEdits).length > 0 || poRemoved.size > 0;
+            const poOnHand = onHandData[po.id];
+            const isLoadingInventory = poOnHand === "loading";
+            const hasOnHand = poOnHand && poOnHand !== "loading";
+            const locationLabel = po.locationId ? (locationNameMap[po.locationId] ?? "") : null;
 
-            const displayItems = po.items
-              .map((i) => ({
-                ...i,
-                qtyOrdered: poEdits[i.id]?.qtyOrdered !== undefined ? Number(poEdits[i.id].qtyOrdered) : i.qtyOrdered,
-                supplierCode: poEdits[i.id]?.supplierCode !== undefined ? poEdits[i.id].supplierCode : (i.supplierCode ?? ""),
-                removed: poRemoved.has(i.id),
-              }));
+            const displayItems = po.items.map((i) => ({
+              ...i,
+              qtyOrdered: poEdits[i.id]?.qtyOrdered !== undefined ? Number(poEdits[i.id].qtyOrdered) : i.qtyOrdered,
+              supplierCode: poEdits[i.id]?.supplierCode !== undefined ? poEdits[i.id].supplierCode : (i.supplierCode ?? ""),
+              removed: poRemoved.has(i.id),
+            }));
 
             const activeItems = displayItems.filter((i) => !i.removed);
             const totalCost = activeItems.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0);
@@ -565,6 +629,7 @@ export default function PurchaseOrders() {
                           <Text variant="headingMd">{po.poNumber}</Text>
                           {statusBadge(po.status)}
                           <Badge tone="default">{po.mode}</Badge>
+                          {locationLabel && <Badge tone="default">{locationLabel}</Badge>}
                         </InlineStack>
                         <Text tone="subdued">
                           {po.supplier?.name} · {activeItems.length} SKUs · {totalUnits} units · ${totalCost.toFixed(2)}
@@ -583,19 +648,15 @@ export default function PurchaseOrders() {
                           onChange={(val) => handleStatusChange(po.id, val)}
                         />
                         {po.mode !== "manual" && (
-                          <Button variant="plain" onClick={() => handleRegenerate(po.id)}>
-                            ↺ Regenerate
-                          </Button>
+                          <Button variant="plain" onClick={() => handleRegenerate(po.id)}>↺ Regenerate</Button>
                         )}
-                        <Button variant="plain" onClick={() => downloadCSV({ ...po, items: activeItems })}>
+                        <Button variant="plain" onClick={() => downloadCSV({ ...po, items: activeItems }, hasOnHand ? poOnHand : null)}>
                           ↓ CSV
                         </Button>
                         <Button variant="plain" onClick={() => setExpandedId(isExpanded ? null : po.id)}>
                           {isExpanded ? "Hide items" : "View items"}
                         </Button>
-                        <Button variant="plain" tone="critical" onClick={() => handleDelete(po.id)}>
-                          Delete
-                        </Button>
+                        <Button variant="plain" tone="critical" onClick={() => handleDelete(po.id)}>Delete</Button>
                       </InlineStack>
                     </InlineStack>
 
@@ -608,11 +669,34 @@ export default function PurchaseOrders() {
                           </Banner>
                         ) : (
                           <BlockStack gap="300">
+
+                            <InlineStack align="space-between" blockAlign="center">
+                              <Text tone="subdued" variant="bodySm">
+                                {hasOnHand
+                                  ? `Live on-hand at ${locationLabel ?? "selected location"}`
+                                  : po.locationId
+                                  ? `On-hand not loaded yet — click to fetch live from Shopify`
+                                  : "No location set on this PO"}
+                              </Text>
+                              {po.locationId && (
+                                <Button
+                                  variant="plain"
+                                  onClick={() => handleLoadInventory(po)}
+                                  loading={isLoadingInventory}
+                                  disabled={isLoadingInventory}
+                                >
+                                  {hasOnHand ? "↺ Refresh on-hand" : "Load on-hand qty"}
+                                </Button>
+                              )}
+                            </InlineStack>
+
                             <div style={{ overflowX: "auto" }}>
                               <table style={{ width: "100%", borderCollapse: "collapse" }}>
                                 <thead>
                                   <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                                    {["Supplier Code", "Product", "Variant", "SKU", "Qty", "Unit Cost", "Line Total", ""].map((h, i) => (
+                                    {["Supplier Code", "Product", "Variant", "SKU",
+                                      ...(hasOnHand ? ["On Hand"] : []),
+                                      "Qty", "Unit Cost", "Line Total", ""].map((h, i) => (
                                       <th key={i} style={{ padding: "8px 12px", textAlign: "left" }}>
                                         <Text variant="headingSm">{h}</Text>
                                       </th>
@@ -621,20 +705,23 @@ export default function PurchaseOrders() {
                                 </thead>
                                 <tbody>
                                   {displayItems.map((item) => {
-                                    const qty = poEdits[item.id]?.qtyOrdered !== undefined ? poEdits[item.id].qtyOrdered : String(item.qtyOrdered);
-                                    const supplierCode = poEdits[item.id]?.supplierCode !== undefined ? poEdits[item.id].supplierCode : (item.supplierCode ?? "");
+                                    const qty = poEdits[item.id]?.qtyOrdered !== undefined
+                                      ? poEdits[item.id].qtyOrdered
+                                      : String(item.qtyOrdered);
+                                    const supplierCode = poEdits[item.id]?.supplierCode !== undefined
+                                      ? poEdits[item.id].supplierCode
+                                      : (item.supplierCode ?? "");
                                     const lineTotal = (Number(qty) * item.qtyCost).toFixed(2);
+                                    const onHandQty = hasOnHand ? (poOnHand[item.variantId] ?? 0) : null;
 
                                     if (item.removed) {
                                       return (
                                         <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3", opacity: 0.4 }}>
-                                          <td colSpan={7} style={{ padding: "8px 12px" }}>
+                                          <td colSpan={hasOnHand ? 8 : 7} style={{ padding: "8px 12px" }}>
                                             <Text tone="subdued"><s>{item.productTitle} — {item.variantTitle}</s></Text>
                                           </td>
                                           <td style={{ padding: "8px 12px" }}>
-                                            <Button variant="plain" onClick={() => handleRestoreItem(po.id, item.id)}>
-                                              Restore
-                                            </Button>
+                                            <Button variant="plain" onClick={() => handleRestoreItem(po.id, item.id)}>Restore</Button>
                                           </td>
                                         </tr>
                                       );
@@ -644,8 +731,7 @@ export default function PurchaseOrders() {
                                       <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
                                         <td style={{ padding: "8px 12px", width: "130px" }}>
                                           <TextField
-                                            label=""
-                                            labelHidden
+                                            label="" labelHidden
                                             value={supplierCode}
                                             onChange={(val) => handleItemEdit(po.id, item.id, "supplierCode", val)}
                                             autoComplete="off"
@@ -655,10 +741,18 @@ export default function PurchaseOrders() {
                                         <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>
                                         <td style={{ padding: "8px 12px" }}><Text>{item.variantTitle}</Text></td>
                                         <td style={{ padding: "8px 12px" }}><Text>{item.sku}</Text></td>
+                                        {hasOnHand && (
+                                          <td style={{ padding: "8px 12px", width: "80px", textAlign: "center" }}>
+                                            <Text
+                                              tone={onHandQty <= 0 ? "critical" : onHandQty < 3 ? "caution" : "success"}
+                                            >
+                                              {onHandQty}
+                                            </Text>
+                                          </td>
+                                        )}
                                         <td style={{ padding: "8px 12px", width: "100px" }}>
                                           <TextField
-                                            label=""
-                                            labelHidden
+                                            label="" labelHidden
                                             type="number"
                                             value={qty}
                                             onChange={(val) => handleItemEdit(po.id, item.id, "qtyOrdered", val)}
@@ -668,11 +762,7 @@ export default function PurchaseOrders() {
                                         <td style={{ padding: "8px 12px" }}><Text>${item.qtyCost.toFixed(2)}</Text></td>
                                         <td style={{ padding: "8px 12px" }}><Text>${lineTotal}</Text></td>
                                         <td style={{ padding: "8px 12px" }}>
-                                          <Button
-                                            variant="plain"
-                                            tone="critical"
-                                            onClick={() => handleRemoveItem(po.id, item.id)}
-                                          >
+                                          <Button variant="plain" tone="critical" onClick={() => handleRemoveItem(po.id, item.id)}>
                                             Remove
                                           </Button>
                                         </td>
@@ -680,7 +770,7 @@ export default function PurchaseOrders() {
                                     );
                                   })}
                                   <tr style={{ borderTop: "2px solid #e1e3e5" }}>
-                                    <td colSpan={4} style={{ padding: "8px 12px" }}>
+                                    <td colSpan={hasOnHand ? 5 : 4} style={{ padding: "8px 12px" }}>
                                       <Text variant="headingSm">Total</Text>
                                     </td>
                                     <td style={{ padding: "8px 12px" }}>
@@ -695,11 +785,10 @@ export default function PurchaseOrders() {
                                 </tbody>
                               </table>
                             </div>
+
                             {hasChanges && (
                               <InlineStack align="end">
-                                <Button variant="primary" onClick={() => handleSaveItems(po)}>
-                                  Save changes
-                                </Button>
+                                <Button variant="primary" onClick={() => handleSaveItems(po)}>Save changes</Button>
                               </InlineStack>
                             )}
                           </BlockStack>

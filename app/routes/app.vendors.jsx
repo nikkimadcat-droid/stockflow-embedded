@@ -14,11 +14,17 @@ import {
   Divider,
   Spinner,
   EmptyState,
+  Select,
 } from "@shopify/polaris";
 
 export const loader = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
-  return { shop: session.shop };
+  const { admin, session } = await authenticate.admin(request);
+  const locRes = await admin.graphql(`
+    query { locations(first: 10) { edges { node { id name } } } }
+  `);
+  const locJson = await locRes.json();
+  const locations = locJson.data.locations.edges.map((e) => e.node);
+  return { shop: session.shop, locations };
 };
 
 export const action = async ({ request }) => {
@@ -43,7 +49,7 @@ export const action = async ({ request }) => {
                 variants(first: 100) {
                   edges {
                     node {
-                      inventoryQuantity
+                      id
                     }
                   }
                 }
@@ -62,9 +68,44 @@ export const action = async ({ request }) => {
         const vendor = e.node.vendor;
         if (!vendor) continue;
         if (!vendorMap[vendor]) vendorMap[vendor] = { name: vendor, skus: 0, totalStock: 0 };
-        for (const v of e.node.variants.edges) {
-          vendorMap[vendor].skus++;
-          vendorMap[vendor].totalStock += v.node.inventoryQuantity ?? 0;
+        vendorMap[vendor].skus += e.node.variants.edges.length;
+      }
+    }
+
+    // Get total stock across all locations via inventory items
+    let invCursor = null;
+    let invHasMore = true;
+    while (invHasMore) {
+      const invRes = await admin.graphql(`
+        query($cursor: String) {
+          inventoryItems(first: 250, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                variant { product { vendor } }
+                inventoryLevels(first: 10) {
+                  edges {
+                    node {
+                      quantities(names: ["available"]) { quantity }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `, { variables: { cursor: invCursor } });
+
+      const invJson = await invRes.json();
+      const items = invJson.data?.inventoryItems;
+      invHasMore = items?.pageInfo?.hasNextPage ?? false;
+      invCursor = items?.pageInfo?.endCursor ?? null;
+
+      for (const e of items?.edges ?? []) {
+        const vendor = e.node.variant?.product?.vendor;
+        if (!vendor || !vendorMap[vendor]) continue;
+        for (const level of e.node.inventoryLevels.edges) {
+          vendorMap[vendor].totalStock += level.node.quantities?.[0]?.quantity ?? 0;
         }
       }
     }
@@ -94,8 +135,16 @@ export const action = async ({ request }) => {
                       id
                       title
                       sku
-                      inventoryQuantity
-                      inventoryItem { unitCost { amount } }
+                      inventoryItem {
+                        unitCost { amount }
+                        inventoryLevels(first: 10) {
+                          edges {
+                            node {
+                              quantities(names: ["available"]) { quantity }
+                            }
+                          }
+                        }
+                      }
                     }
                   }
                 }
@@ -109,10 +158,7 @@ export const action = async ({ request }) => {
       const page = json.data?.products;
       hasMore = page?.pageInfo?.hasNextPage ?? false;
       cursor = page?.pageInfo?.endCursor ?? null;
-
-      for (const e of page?.edges ?? []) {
-        products.push(e.node);
-      }
+      for (const e of page?.edges ?? []) products.push(e.node);
     }
 
     const variantIds = products.flatMap((p) => p.variants.edges.map((v) => v.node.id));
@@ -129,11 +175,15 @@ export const action = async ({ request }) => {
           ? parseFloat(v.inventoryItem.unitCost.amount)
           : null;
         const supplierCost = costMap[v.id] ?? null;
+        // Sum across all locations
+        const onHand = (v.inventoryItem?.inventoryLevels?.edges ?? []).reduce(
+          (sum, l) => sum + (l.node.quantities?.[0]?.quantity ?? 0), 0
+        );
         rows.push({
           productTitle: p.title,
           variantTitle: v.title,
           sku: v.sku ?? "",
-          onHand: v.inventoryQuantity ?? 0,
+          onHand,
           shopifyCost,
           supplierCost,
         });
@@ -148,7 +198,7 @@ export const action = async ({ request }) => {
 };
 
 export default function Vendors() {
-  useLoaderData();
+  const { } = useLoaderData();
   const fetcher = useFetcher();
 
   const [vendors, setVendors] = useState(null);
@@ -261,7 +311,7 @@ export default function Vendors() {
                               <table style={{ width: "100%", borderCollapse: "collapse" }}>
                                 <thead>
                                   <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                                    {["Product", "Variant", "SKU", "On Hand", "Shopify Cost", "Supplier Cost"].map((h, i) => (
+                                    {["Product", "Variant", "SKU", "On Hand (all locations)", "Shopify Cost", "Supplier Cost"].map((h, i) => (
                                       <th key={i} style={{ padding: "8px 12px", textAlign: i >= 3 ? "center" : "left" }}>
                                         <Text variant="headingSm">{h}</Text>
                                       </th>

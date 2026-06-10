@@ -109,6 +109,7 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
   for (const mm of minmaxRows) {
     const onHand = onHandMap[mm.variantId];
     if (!onHand) continue;
+    if (onHand.qty >= mm.minLevel) continue;
     const needed = mm.maxLevel - onHand.qty;
     if (needed <= 0) continue;
     const qtyOrdered = mm.casePackSize > 1
@@ -405,7 +406,6 @@ export default function PurchaseOrders() {
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
 
-  // Pick up fetchInventory result and store it by poId
   if (
     fetcher.state === "idle" &&
     fetcherData?.intent === "fetchInventory" &&
@@ -743,9 +743,7 @@ export default function PurchaseOrders() {
                                         <td style={{ padding: "8px 12px" }}><Text>{item.sku}</Text></td>
                                         {hasOnHand && (
                                           <td style={{ padding: "8px 12px", width: "80px", textAlign: "center" }}>
-                                            <Text
-                                              tone={onHandQty <= 0 ? "critical" : onHandQty < 3 ? "caution" : "success"}
-                                            >
+                                            <Text tone={onHandQty <= 0 ? "critical" : onHandQty < 3 ? "caution" : "success"}>
                                               {onHandQty}
                                             </Text>
                                           </td>

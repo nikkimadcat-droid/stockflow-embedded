@@ -27,7 +27,6 @@ export const action = async ({ request }) => {
   const form = await request.formData();
   const intent = form.get("intent");
 
-  // Load vendor summary — paginate full catalog
   if (intent === "loadVendors") {
     const vendorMap = {};
     let cursor = null;
@@ -74,7 +73,6 @@ export const action = async ({ request }) => {
     return { ok: true, intent: "loadVendors", vendors };
   }
 
-  // Load products for a specific vendor
   if (intent === "loadVendorProducts") {
     const vendor = form.get("vendor");
     const products = [];
@@ -117,14 +115,12 @@ export const action = async ({ request }) => {
       }
     }
 
-    // Pull cost prices from supplier SKU table as fallback/override
     const variantIds = products.flatMap((p) => p.variants.edges.map((v) => v.node.id));
     const supplierSkus = await db.supplierSku.findMany({
       where: { shop, variantId: { in: variantIds } },
     });
     const costMap = Object.fromEntries(supplierSkus.map((s) => [s.variantId, s.cost]));
 
-    // Flatten to variants
     const rows = [];
     for (const p of products) {
       for (const ve of p.variants.edges) {
@@ -152,7 +148,7 @@ export const action = async ({ request }) => {
 };
 
 export default function Vendors() {
-  const { } = useLoaderData();
+  useLoaderData();
   const fetcher = useFetcher();
 
   const [vendors, setVendors] = useState(null);
@@ -163,11 +159,10 @@ export default function Vendors() {
   const isLoadingVendors = fetcher.state !== "idle" && !loadingVendor;
   const fetcherData = fetcher.data;
 
-  // Handle fetcher responses
-  if (fetcher.state === "idle" && fetcherData?.intent === "loadVendors" && vendors === null) {
+  if (fetcher.state === "idle" && fetcherData?.intent === "loadVendors" && fetcherData?.vendors && vendors === null) {
     setVendors(fetcherData.vendors);
   }
-  if (fetcher.state === "idle" && fetcherData?.intent === "loadVendorProducts" && loadingVendor) {
+  if (fetcher.state === "idle" && fetcherData?.intent === "loadVendorProducts" && fetcherData?.rows && loadingVendor) {
     setVendorProducts((prev) => ({ ...prev, [fetcherData.vendor]: fetcherData.rows }));
     setLoadingVendor(null);
   }

@@ -14,17 +14,11 @@ import {
   Divider,
   Spinner,
   EmptyState,
-  Select,
 } from "@shopify/polaris";
 
 export const loader = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
-  const locRes = await admin.graphql(`
-    query { locations(first: 10) { edges { node { id name } } } }
-  `);
-  const locJson = await locRes.json();
-  const locations = locJson.data.locations.edges.map((e) => e.node);
-  return { shop: session.shop, locations };
+  const { session } = await authenticate.admin(request);
+  return { shop: session.shop };
 };
 
 export const action = async ({ request }) => {
@@ -34,7 +28,9 @@ export const action = async ({ request }) => {
   const intent = form.get("intent");
 
   if (intent === "loadVendors") {
+    // Step 1: get vendor → variantId mapping by paginating products (no inventory here)
     const vendorMap = {};
+    const variantVendorMap = {};
     let cursor = null;
     let hasMore = true;
 
@@ -47,11 +43,7 @@ export const action = async ({ request }) => {
               node {
                 vendor
                 variants(first: 100) {
-                  edges {
-                    node {
-                      id
-                    }
-                  }
+                  edges { node { id } }
                 }
               }
             }
@@ -68,44 +60,54 @@ export const action = async ({ request }) => {
         const vendor = e.node.vendor;
         if (!vendor) continue;
         if (!vendorMap[vendor]) vendorMap[vendor] = { name: vendor, skus: 0, totalStock: 0 };
-        vendorMap[vendor].skus += e.node.variants.edges.length;
+        for (const v of e.node.variants.edges) {
+          vendorMap[vendor].skus++;
+          variantVendorMap[v.node.id] = vendor;
+        }
       }
     }
 
-    // Get total stock across all locations via inventory items
-    let invCursor = null;
-    let invHasMore = true;
-    while (invHasMore) {
-      const invRes = await admin.graphql(`
-        query($cursor: String) {
-          inventoryItems(first: 250, after: $cursor) {
-            pageInfo { hasNextPage endCursor }
-            edges {
-              node {
-                variant { product { vendor } }
-                inventoryLevels(first: 10) {
-                  edges {
-                    node {
-                      quantities(names: ["available"]) { quantity }
-                    }
+    // Step 2: get locations
+    const locRes = await admin.graphql(`
+      query { locations(first: 10) { edges { node { id } } } }
+    `);
+    const locJson = await locRes.json();
+    const locationIds = locJson.data.locations.edges.map((e) => e.node.id);
+
+    // Step 3: for each location, paginate inventory levels (cheap query — no nesting)
+    for (const locationId of locationIds) {
+      let invCursor = null;
+      let invHasMore = true;
+
+      while (invHasMore) {
+        const invRes = await admin.graphql(`
+          query($locationId: ID!, $cursor: String) {
+            location(id: $locationId) {
+              inventoryLevels(first: 250, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
+                edges {
+                  node {
+                    quantities(names: ["available"]) { quantity }
+                    item { variant { id } }
                   }
                 }
               }
             }
           }
-        }
-      `, { variables: { cursor: invCursor } });
+        `, { variables: { locationId, cursor: invCursor } });
 
-      const invJson = await invRes.json();
-      const items = invJson.data?.inventoryItems;
-      invHasMore = items?.pageInfo?.hasNextPage ?? false;
-      invCursor = items?.pageInfo?.endCursor ?? null;
+        const invJson = await invRes.json();
+        const levels = invJson.data?.location?.inventoryLevels;
+        invHasMore = levels?.pageInfo?.hasNextPage ?? false;
+        invCursor = levels?.pageInfo?.endCursor ?? null;
 
-      for (const e of items?.edges ?? []) {
-        const vendor = e.node.variant?.product?.vendor;
-        if (!vendor || !vendorMap[vendor]) continue;
-        for (const level of e.node.inventoryLevels.edges) {
-          vendorMap[vendor].totalStock += level.node.quantities?.[0]?.quantity ?? 0;
+        for (const e of levels?.edges ?? []) {
+          const vid = e.node?.item?.variant?.id;
+          const qty = e.node?.quantities?.[0]?.quantity ?? 0;
+          const vendor = variantVendorMap[vid];
+          if (vendor && vendorMap[vendor]) {
+            vendorMap[vendor].totalStock += qty;
+          }
         }
       }
     }
@@ -175,7 +177,6 @@ export const action = async ({ request }) => {
           ? parseFloat(v.inventoryItem.unitCost.amount)
           : null;
         const supplierCost = costMap[v.id] ?? null;
-        // Sum across all locations
         const onHand = (v.inventoryItem?.inventoryLevels?.edges ?? []).reduce(
           (sum, l) => sum + (l.node.quantities?.[0]?.quantity ?? 0), 0
         );
@@ -198,7 +199,7 @@ export const action = async ({ request }) => {
 };
 
 export default function Vendors() {
-  const { } = useLoaderData();
+  useLoaderData();
   const fetcher = useFetcher();
 
   const [vendors, setVendors] = useState(null);

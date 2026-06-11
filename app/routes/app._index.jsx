@@ -1,4 +1,4 @@
-﻿[paste the full file content here]
+﻿
 import { useState } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";

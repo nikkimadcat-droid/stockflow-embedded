@@ -1,5 +1,4 @@
-﻿
-import { useState } from "react";
+﻿import { useState, useEffect } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -250,16 +249,22 @@ export default function Index() {
   const [productType, setProductType] = useState("");
   const [days, setDays] = useState("30");
   const [search, setSearch] = useState("");
+  const [savedTypes, setSavedTypes] = useState([]);
+
+  useEffect(() => {
+    if (fetcher.data?.productTypes?.length > 0) {
+      setSavedTypes(fetcher.data.productTypes);
+    }
+  }, [fetcher.data]);
 
   const isLoading = fetcher.state !== "idle";
   const result = fetcher.data;
   const rows = result?.rows ?? [];
-  const productTypes = result?.productTypes ?? [];
 
   const locationOptions = locations.map(l => ({ label: l.name, value: l.id }));
   const typeOptions = [
     { label: "All product types", value: "" },
-    ...productTypes.map(t => ({ label: t, value: t })),
+    ...savedTypes.map(t => ({ label: t, value: t })),
   ];
   const dayOptions = [
     { label: "Last 7 days", value: "7" },
@@ -387,9 +392,12 @@ export default function Index() {
                     value={locationId} onChange={setLocationId} />
                 </Box>
                 <Box minWidth="220px">
-                  <Select label="Product type" options={typeOptions}
-                    value={productType} onChange={setProductType}
-                    disabled={productTypes.length === 0} />
+                  <Select
+                    label="Product type"
+                    options={typeOptions}
+                    value={productType}
+                    onChange={setProductType}
+                  />
                 </Box>
                 <Box minWidth="160px">
                   <Select label="Period" options={dayOptions}

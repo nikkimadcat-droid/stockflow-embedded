@@ -41,10 +41,10 @@ model MinMax {
 }
 
 model Supplier {
-  id        String              @id @default(cuid())
+  id        String          @id @default(cuid())
   shop      String
   name      String
-  createdAt DateTime            @default(now())
+  createdAt DateTime        @default(now())
   skus      SupplierSku[]
   orders    PurchaseOrder[]
 }
@@ -121,29 +121,40 @@ model TransferTemplateVendor {
 }
 
 model Transfer {
-  id             String            @id @default(cuid())
+  id             String         @id @default(cuid())
   shop           String
   transferNumber String
   templateId     String?
   template       TransferTemplate? @relation(fields: [templateId], references: [id])
   fromLocationId String
   toLocationId   String
-  status         String            @default("draft")
+  status         String         @default("draft")
   notes          String?
-  createdAt      DateTime          @default(now())
-  updatedAt      DateTime          @updatedAt
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
   items          TransferItem[]
 }
 
 model TransferItem {
-  id            String   @id @default(cuid())
-  transferId    String
-  transfer      Transfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
-  variantId     String
-  productTitle  String
-  variantTitle  String
-  vendor        String   @default("")
-  sku           String
-  qty           Int
-  updatedAt     DateTime @updatedAt
+  id           String   @id @default(cuid())
+  transferId   String
+  transfer     Transfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  variantId    String
+  productTitle String
+  variantTitle String
+  vendor       String   @default("")
+  sku          String
+  qty          Int
+  updatedAt    DateTime @updatedAt
+}
+
+model SnapshotCache {
+  id           Int      @id @default(autoincrement())
+  cacheKey     String   @unique
+  rows         Json
+  lowCount     Int      @default(0)
+  avgST        Int?
+  totalUnits   Int      @default(0)
+  productTypes Json     @default("[]")
+  createdAt    DateTime @default(now())
 }

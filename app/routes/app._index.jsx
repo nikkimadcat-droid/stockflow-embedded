@@ -1,14 +1,14 @@
-import { useState, useEffect } from "react";
+﻿[paste the full file content here]
+import { useState } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import {
   Page, Layout, Card, Text, BlockStack, InlineGrid,
   InlineStack, Select, Button, Spinner, Badge, Banner,
-  DataTable, TextField, Divider, Box, InlineStack as Stack,
+  DataTable, TextField, Divider, Box,
 } from "@shopify/polaris";
 
-// ── Loader: instant — DB only, no Shopify API ─────────────────────────────────
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
 
@@ -26,70 +26,55 @@ export const loader = async ({ request }) => {
 
   const openPOs = await db.purchaseOrder.count({ where: { status: "draft" } });
 
-  // Low inventory count from DB — no API call needed
-  const minMaxRecords = await db.minMaxSetting.findMany();
-  const lowFromDB = minMaxRecords.filter(r => r.currentStock !== null && r.currentStock < r.minLevel).length;
-
-  // Last snapshot metadata (most recent cache entry)
   let lastSnapshot = null;
   try {
-    lastSnapshot = await db.$queryRaw`
-      SELECT "cacheKey", "lowCount", "avgST", "totalUnits", "createdAt"
-      FROM "SnapshotCache"
-      ORDER BY "createdAt" DESC
-      LIMIT 1
-    `;
-    lastSnapshot = lastSnapshot?.[0] ?? null;
-  } catch (e) {
-    // table may not exist yet
-  }
+    lastSnapshot = await db.snapshotCache.findFirst({
+      orderBy: { createdAt: "desc" },
+      select: { cacheKey: true, lowCount: true, avgST: true, totalUnits: true, createdAt: true },
+    });
+  } catch (e) {}
 
-  return { locations, productCount, openPOs, lowFromDB, lastSnapshot };
+  return { locations, productCount, openPOs, lastSnapshot };
 };
 
-// ── Action: scoped snapshot with cache ───────────────────────────────────────
 export const action = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
   const form = await request.formData();
-  const intent = form.get("intent");
-
-  if (intent !== "loadDashboard") return { error: "unknown intent" };
+  if (form.get("intent") !== "loadDashboard") return { error: "unknown intent" };
 
   const locationGid = form.get("locationId");
   const productType = form.get("productType") || "";
   const days = parseInt(form.get("days") || "30");
   const forceRefresh = form.get("forceRefresh") === "true";
-
   const cacheKey = `${locationGid}__${productType}__${days}`;
 
-  // ── Serve from cache if fresh (under 4 hours) and not forcing refresh ──
   if (!forceRefresh) {
     try {
-      const cached = await db.$queryRaw`
-        SELECT * FROM "SnapshotCache"
-        WHERE "cacheKey" = ${cacheKey}
-        AND "createdAt" > NOW() - INTERVAL '4 hours'
-        LIMIT 1
-      `;
-      if (cached?.[0]) {
+      const cached = await db.snapshotCache.findFirst({
+        where: {
+          cacheKey,
+          createdAt: { gt: new Date(Date.now() - 4 * 60 * 60 * 1000) },
+        },
+      });
+      if (cached) {
         return {
-          ...cached[0],
-          rows: cached[0].rows,
-          productTypes: cached[0].productTypes,
+          rows: cached.rows,
+          productTypes: cached.productTypes,
+          lowCount: cached.lowCount,
+          avgST: cached.avgST,
+          totalUnits: cached.totalUnits,
+          days,
           fromCache: true,
-          cachedAt: cached[0].createdAt,
+          cachedAt: cached.createdAt,
         };
       }
-    } catch (e) {
-      // cache miss, continue
-    }
+    } catch (e) {}
   }
 
   const since = new Date();
   since.setDate(since.getDate() - days);
   const sinceStr = since.toISOString();
 
-  // ── 1. Paginate products ────────────────────────────────────────────────
   let products = [];
   let cursor = null;
   let hasNext = true;
@@ -136,7 +121,6 @@ export const action = async ({ request }) => {
     }
   }
 
-  // ── 2. Inventory levels ─────────────────────────────────────────────────
   const onHandMap = {};
   for (let i = 0; i < inventoryItemIds.length; i += 50) {
     const batch = inventoryItemIds.slice(i, i + 50);
@@ -164,7 +148,6 @@ export const action = async ({ request }) => {
     }
   }
 
-  // ── 3. Orders ───────────────────────────────────────────────────────────
   const soldMap = {};
   const locationNumericId = locationGid.split("/").pop();
   const orderQuery = `created_at:>${sinceStr} location_id:${locationNumericId}`;
@@ -201,14 +184,12 @@ export const action = async ({ request }) => {
     }
   }
 
-  // ── 4. Min/max flags ────────────────────────────────────────────────────
-  const minMaxRecords = await db.minMaxSetting.findMany();
+  const minMaxRecords = await db.minMax.findMany();
   const minMaxMap = {};
   for (const r of minMaxRecords) {
     minMaxMap[`${r.variantId}__${r.locationId}`] = r.minLevel;
   }
 
-  // ── 5. Assemble rows ────────────────────────────────────────────────────
   const rows = [];
   for (const [variantId, info] of Object.entries(variantMap)) {
     const onHand = onHandMap[info.inventoryItemId] ?? 0;
@@ -248,27 +229,12 @@ export const action = async ({ request }) => {
     : null;
   const totalUnits = rows.reduce((s, r) => s + r.unitsSold, 0);
 
-  // ── 6. Write to cache ───────────────────────────────────────────────────
   try {
-    await db.$executeRaw`
-      INSERT INTO "SnapshotCache" ("cacheKey", "rows", "lowCount", "avgST", "totalUnits", "productTypes", "createdAt")
-      VALUES (
-        ${cacheKey},
-        ${JSON.stringify(rows)}::jsonb,
-        ${lowCount},
-        ${avgST},
-        ${totalUnits},
-        ${JSON.stringify(productTypes)}::jsonb,
-        NOW()
-      )
-      ON CONFLICT ("cacheKey") DO UPDATE SET
-        "rows" = EXCLUDED."rows",
-        "lowCount" = EXCLUDED."lowCount",
-        "avgST" = EXCLUDED."avgST",
-        "totalUnits" = EXCLUDED."totalUnits",
-        "productTypes" = EXCLUDED."productTypes",
-        "createdAt" = NOW()
-    `;
+    await db.snapshotCache.upsert({
+      where: { cacheKey },
+      update: { rows, lowCount, avgST, totalUnits, productTypes, createdAt: new Date() },
+      create: { cacheKey, rows, lowCount, avgST, totalUnits, productTypes },
+    });
   } catch (e) {
     console.error("Cache write failed:", e);
   }
@@ -276,9 +242,8 @@ export const action = async ({ request }) => {
   return { rows, lowCount, avgST, totalUnits, productTypes, days, fromCache: false };
 };
 
-// ── Component ─────────────────────────────────────────────────────────────────
 export default function Index() {
-  const { locations, productCount, openPOs, lowFromDB, lastSnapshot } = useLoaderData();
+  const { locations, productCount, openPOs, lastSnapshot } = useLoaderData();
   const fetcher = useFetcher();
 
   const [locationId, setLocationId] = useState(locations[0]?.id ?? "");
@@ -289,7 +254,6 @@ export default function Index() {
   const isLoading = fetcher.state !== "idle";
   const result = fetcher.data;
   const rows = result?.rows ?? [];
-
   const productTypes = result?.productTypes ?? [];
 
   const locationOptions = locations.map(l => ({ label: l.name, value: l.id }));
@@ -351,19 +315,19 @@ export default function Index() {
     invBadge(r),
   ]);
 
-  const lowCount = result?.lowCount ?? lowFromDB;
+  const lowCount = result?.lowCount ?? lastSnapshot?.lowCount ?? "—";
 
   function formatCachedAt(ts) {
     if (!ts) return "";
-    const d = new Date(ts);
-    return d.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    return new Date(ts).toLocaleString("en-US", {
+      month: "short", day: "numeric",
+      hour: "numeric", minute: "2-digit",
+    });
   }
 
   return (
     <Page title="StockFlow Dashboard">
       <Layout>
-
-        {/* ── Summary cards — instant from DB ────────────────────────────── */}
         <Layout.Section>
           <InlineGrid columns={4} gap="400">
             <Card>
@@ -394,14 +358,15 @@ export default function Index() {
                 <Text tone="subdued">
                   {result?.fromCache
                     ? `as of ${formatCachedAt(result.cachedAt)}`
-                    : "from min/max records"}
+                    : lastSnapshot
+                    ? `as of ${formatCachedAt(lastSnapshot.createdAt)}`
+                    : "run a snapshot below"}
                 </Text>
               </BlockStack>
             </Card>
           </InlineGrid>
         </Layout.Section>
 
-        {/* ── Snapshot filters ────────────────────────────────────────────── */}
         <Layout.Section>
           <Card>
             <BlockStack gap="400">
@@ -412,9 +377,7 @@ export default function Index() {
                     <Text tone="subdued" variant="bodySm">
                       Cached {formatCachedAt(result.cachedAt)}
                     </Text>
-                    <Button size="slim" onClick={() => handleRun(true)}>
-                      Refresh
-                    </Button>
+                    <Button size="slim" onClick={() => handleRun(true)}>Refresh</Button>
                   </InlineStack>
                 )}
               </InlineStack>
@@ -447,21 +410,19 @@ export default function Index() {
           </Card>
         </Layout.Section>
 
-        {/* ── Loading ─────────────────────────────────────────────────────── */}
         {isLoading && (
           <Layout.Section>
             <Card>
               <BlockStack gap="400" align="center">
                 <Spinner size="large" />
                 <Text tone="subdued">
-                  Pulling inventory and sales data… first run for this scope takes the longest.
+                  Pulling data… first run for this scope takes the longest.
                 </Text>
               </BlockStack>
             </Card>
           </Layout.Section>
         )}
 
-        {/* ── Results ─────────────────────────────────────────────────────── */}
         {!isLoading && rows.length > 0 && (
           <>
             <Layout.Section>
@@ -544,7 +505,9 @@ export default function Index() {
         {!isLoading && result && rows.length === 0 && (
           <Layout.Section>
             <Card>
-              <Text tone="subdued">No SKUs found. Try a different location or product type.</Text>
+              <Text tone="subdued">
+                No SKUs found. Try a different location or product type.
+              </Text>
             </Card>
           </Layout.Section>
         )}

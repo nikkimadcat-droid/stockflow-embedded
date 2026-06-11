@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -8,7 +8,6 @@ import {
   DataTable, TextField, Divider, Box,
 } from "@shopify/polaris";
 
-// ── Loader: locations, product types, open PO count ──────────────────────────
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
 
@@ -24,36 +23,35 @@ export const loader = async ({ request }) => {
   const prodData = await prodRes.json();
   const productCount = prodData.data.productsCount.count;
 
-  // Pull distinct product types from first 250 products
-  const ptRes = await admin.graphql(`
-    query { products(first: 250) { edges { node { productType } } } }
-  `);
-  const ptData = await ptRes.json();
-  const productTypes = [
-    ...new Set(
-      ptData.data.products.edges.map(e => e.node.productType).filter(Boolean)
-    ),
-  ].sort();
-
-  // Open PO count from DB
   const openPOs = await db.purchaseOrder.count({ where: { status: "draft" } });
 
-  return { locations, productCount, productTypes, openPOs };
+  return { locations, productCount, openPOs };
 };
 
-// ── Action: on-demand sell-through + low inventory data ──────────────────────
 export const action = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
   const form = await request.formData();
   if (form.get("intent") !== "loadDashboard") return { error: "unknown intent" };
 
-  const locationGid = form.get("locationId");
+  const locationGid = form.get("locationId") || "ALL";
   const productType = form.get("productType") || "";
   const days = parseInt(form.get("days") || "30");
 
   const since = new Date();
   since.setDate(since.getDate() - days);
   const sinceStr = since.toISOString();
+
+  // Get all locations if ALL
+  let locationGids = [];
+  if (locationGid === "ALL") {
+    const locRes = await admin.graphql(`
+      query { locations(first: 10) { edges { node { id } } } }
+    `);
+    const locData = await locRes.json();
+    locationGids = locData.data.locations.edges.map(e => e.node.id);
+  } else {
+    locationGids = [locationGid];
+  }
 
   // ── 1. Paginate products ──────────────────────────────────────────────────
   let products = [];
@@ -85,7 +83,6 @@ export const action = async ({ request }) => {
     products = products.concat(page?.edges?.map(e => e.node) ?? []);
   }
 
-  // Build variant map + collect inventory item IDs
   const variantMap = {};
   const inventoryItemIds = [];
   for (const p of products) {
@@ -103,76 +100,85 @@ export const action = async ({ request }) => {
     }
   }
 
-  // ── 2. Inventory levels in batches of 50 ─────────────────────────────────
+  // ── 2. Inventory levels — aggregate across all locations ──────────────────
+  // onHandMap: inventoryItemId -> total qty across selected locations
   const onHandMap = {};
-  for (let i = 0; i < inventoryItemIds.length; i += 50) {
-    const batch = inventoryItemIds.slice(i, i + 50);
-    const idsQuery = batch.map(id => `id:${id.split("/").pop()}`).join(" OR ");
-    const res = await admin.graphql(`
-      query($ids: String!, $locationId: ID!) {
-        inventoryItems(first: 50, query: $ids) {
-          edges {
-            node {
-              id
-              inventoryLevel(locationId: $locationId) {
-                quantities(names: ["available"]) { name quantity }
+
+  for (const locGid of locationGids) {
+    for (let i = 0; i < inventoryItemIds.length; i += 50) {
+      const batch = inventoryItemIds.slice(i, i + 50);
+      const idsQuery = batch.map(id => `id:${id.split("/").pop()}`).join(" OR ");
+      const res = await admin.graphql(`
+        query($ids: String!, $locationId: ID!) {
+          inventoryItems(first: 50, query: $ids) {
+            edges {
+              node {
+                id
+                inventoryLevel(locationId: $locationId) {
+                  quantities(names: ["available"]) { name quantity }
+                }
               }
             }
           }
         }
-      }
-    `, { variables: { ids: idsQuery, locationId: locationGid } });
+      `, { variables: { ids: idsQuery, locationId: locGid } });
 
-    const json = await res.json();
-    for (const e of json.data?.inventoryItems?.edges ?? []) {
-      const qty = e.node.inventoryLevel?.quantities
-        ?.find(q => q.name === "available")?.quantity ?? 0;
-      onHandMap[e.node.id] = qty;
+      const json = await res.json();
+      for (const e of json.data?.inventoryItems?.edges ?? []) {
+        const qty = e.node.inventoryLevel?.quantities
+          ?.find(q => q.name === "available")?.quantity ?? 0;
+        onHandMap[e.node.id] = (onHandMap[e.node.id] ?? 0) + qty;
+      }
     }
   }
 
-  // ── 3. Paginate orders for units sold ─────────────────────────────────────
-  const locationNumericId = locationGid?.split("/").pop();
-  const orderQuery = `created_at:>${sinceStr} location_id:${locationNumericId}`;
+  // ── 3. Orders — aggregate across all locations ────────────────────────────
   const soldMap = {};
-  let oCursor = null;
-  let oHasNext = true;
 
-  while (oHasNext) {
-    const res = await admin.graphql(`
-      query($cursor: String, $query: String!) {
-        orders(first: 50, after: $cursor, query: $query) {
-          pageInfo { hasNextPage endCursor }
-          edges {
-            node {
-              lineItems(first: 100) {
-                edges { node { quantity variant { id } } }
+  for (const locGid of locationGids) {
+    const locationNumericId = locGid.split("/").pop();
+    const orderQuery = `created_at:>${sinceStr} location_id:${locationNumericId}`;
+    let oCursor = null;
+    let oHasNext = true;
+
+    while (oHasNext) {
+      const res = await admin.graphql(`
+        query($cursor: String, $query: String!) {
+          orders(first: 50, after: $cursor, query: $query) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                lineItems(first: 100) {
+                  edges { node { quantity variant { id } } }
+                }
               }
             }
           }
         }
-      }
-    `, { variables: { cursor: oCursor, query: orderQuery } });
+      `, { variables: { cursor: oCursor, query: orderQuery } });
 
-    const json = await res.json();
-    const page = json.data?.orders;
-    oHasNext = page?.pageInfo?.hasNextPage ?? false;
-    oCursor = page?.pageInfo?.endCursor ?? null;
+      const json = await res.json();
+      const page = json.data?.orders;
+      oHasNext = page?.pageInfo?.hasNextPage ?? false;
+      oCursor = page?.pageInfo?.endCursor ?? null;
 
-    for (const o of page?.edges ?? []) {
-      for (const li of o.node.lineItems.edges) {
-        const vid = li.node.variant?.id;
-        if (!vid) continue;
-        soldMap[vid] = (soldMap[vid] ?? 0) + li.node.quantity;
+      for (const o of page?.edges ?? []) {
+        for (const li of o.node.lineItems.edges) {
+          const vid = li.node.variant?.id;
+          if (!vid) continue;
+          soldMap[vid] = (soldMap[vid] ?? 0) + li.node.quantity;
+        }
       }
     }
   }
 
-  // ── 4. Min/max records for low-inventory flags ────────────────────────────
+  // ── 4. Min/max for flags ──────────────────────────────────────────────────
   const minMaxRecords = await db.minMaxSetting.findMany();
   const minMaxMap = {};
   for (const r of minMaxRecords) {
-    minMaxMap[`${r.variantId}__${r.locationId}`] = r.minLevel;
+    // For ALL locations, flag if below min at ANY location
+    const key = `${r.variantId}__${r.locationId}`;
+    minMaxMap[key] = r.minLevel;
   }
 
   // ── 5. Assemble rows ──────────────────────────────────────────────────────
@@ -182,9 +188,20 @@ export const action = async ({ request }) => {
     const unitsSold = soldMap[variantId] ?? 0;
     const total = onHand + unitsSold;
     const sellThrough = total > 0 ? Math.round((unitsSold / total) * 100) : null;
-    const minKey = `${variantId}__${locationGid}`;
-    const minLevel = minMaxMap[minKey] ?? null;
-    const isBelowMin = minLevel !== null && onHand < minLevel;
+
+    // Flag if below min at any of the selected locations
+    let isBelowMin = false;
+    let minLevel = null;
+    for (const locGid of locationGids) {
+      const key = `${variantId}__${locGid}`;
+      if (minMaxMap[key] !== undefined) {
+        const locOnHand = onHandMap[info.inventoryItemId] ?? 0;
+        if (locOnHand < minMaxMap[key]) {
+          isBelowMin = true;
+          minLevel = minMaxMap[key];
+        }
+      }
+    }
     const isOutOfStock = onHand <= 0 && unitsSold > 0;
 
     rows.push({
@@ -198,12 +215,14 @@ export const action = async ({ request }) => {
     });
   }
 
-  // Sort: flagged first, then sell-through desc
   rows.sort((a, b) => {
     if (a.isOutOfStock !== b.isOutOfStock) return a.isOutOfStock ? -1 : 1;
     if (a.isBelowMin !== b.isBelowMin) return a.isBelowMin ? -1 : 1;
     return (b.sellThrough ?? -1) - (a.sellThrough ?? -1);
   });
+
+  // Collect product types from results for filter dropdown
+  const productTypes = [...new Set(rows.map(r => r.productType).filter(Boolean))].sort();
 
   const lowCount = rows.filter(r => r.isBelowMin || r.isOutOfStock).length;
   const avgST = rows.filter(r => r.sellThrough !== null).length > 0
@@ -214,24 +233,58 @@ export const action = async ({ request }) => {
       )
     : null;
 
-  return { rows, lowCount, avgST, days, totalUnits: rows.reduce((s, r) => s + r.unitsSold, 0) };
+  return {
+    rows, lowCount, avgST, days,
+    totalUnits: rows.reduce((s, r) => s + r.unitsSold, 0),
+    productTypes,
+  };
 };
 
-// ── Component ─────────────────────────────────────────────────────────────────
 export default function Index() {
-  const { locations, productCount, productTypes, openPOs } = useLoaderData();
+  const { locations, productCount, openPOs } = useLoaderData();
   const fetcher = useFetcher();
+  const summaryFetcher = useFetcher();
 
-  const [locationId, setLocationId] = useState(locations[0]?.id ?? "");
+  const [locationId, setLocationId] = useState("ALL");
   const [productType, setProductType] = useState("");
   const [days, setDays] = useState("30");
   const [search, setSearch] = useState("");
+  const [hasAutoLoaded, setHasAutoLoaded] = useState(false);
 
-  const isLoading = fetcher.state !== "idle";
-  const result = fetcher.data;
-  const rows = result?.rows ?? [];
+  // Auto-fire full-store snapshot on mount
+  useEffect(() => {
+    if (hasAutoLoaded) return;
+    setHasAutoLoaded(true);
+    const fd = new FormData();
+    fd.append("intent", "loadDashboard");
+    fd.append("locationId", "ALL");
+    fd.append("productType", "");
+    fd.append("days", "30");
+    summaryFetcher.submit(fd, { method: "post" });
+  }, []);
 
-  const locationOptions = locations.map(l => ({ label: l.name, value: l.id }));
+  function handleRun() {
+    const fd = new FormData();
+    fd.append("intent", "loadDashboard");
+    fd.append("locationId", locationId);
+    fd.append("productType", productType);
+    fd.append("days", days);
+    fetcher.submit(fd, { method: "post" });
+  }
+
+  const isLoadingSummary = summaryFetcher.state !== "idle";
+  const isLoadingTable = fetcher.state !== "idle";
+  const summary = summaryFetcher.data;
+  const tableResult = fetcher.data ?? summary; // table falls back to summary until filtered
+  const rows = tableResult?.rows ?? [];
+
+  // Product types from the loaded data
+  const productTypes = summary?.productTypes ?? tableResult?.productTypes ?? [];
+
+  const locationOptions = [
+    { label: "All locations", value: "ALL" },
+    ...locations.map(l => ({ label: l.name, value: l.id })),
+  ];
   const typeOptions = [
     { label: "All product types", value: "" },
     ...productTypes.map(t => ({ label: t, value: t })),
@@ -242,15 +295,6 @@ export default function Index() {
     { label: "Last 60 days", value: "60" },
     { label: "Last 90 days", value: "90" },
   ];
-
-  function handleRun() {
-    const fd = new FormData();
-    fd.append("intent", "loadDashboard");
-    fd.append("locationId", locationId);
-    fd.append("productType", productType);
-    fd.append("days", days);
-    fetcher.submit(fd, { method: "post" });
-  }
 
   const filtered = rows.filter(r => {
     if (!search) return true;
@@ -289,13 +333,13 @@ export default function Index() {
     invBadge(r),
   ]);
 
-  const lowCount = result?.lowCount ?? 0;
+  const lowCount = summary?.lowCount ?? 0;
 
   return (
     <Page title="StockFlow Dashboard">
       <Layout>
 
-        {/* ── Summary cards ──────────────────────────────────────────────── */}
+        {/* ── Summary cards — always all-store ───────────────────────────── */}
         <Layout.Section>
           <InlineGrid columns={4} gap="400">
             <Card>
@@ -323,10 +367,10 @@ export default function Index() {
               <BlockStack gap="200">
                 <Text variant="headingMd">Stock Alerts</Text>
                 <Text variant="heading2xl">
-                  {result ? lowCount : "—"}
+                  {isLoadingSummary ? <Spinner size="small" /> : lowCount}
                 </Text>
                 <Text tone="subdued">
-                  {result ? `low or out of stock` : "run snapshot below"}
+                  {isLoadingSummary ? "loading…" : "low or out of stock"}
                 </Text>
               </BlockStack>
             </Card>
@@ -353,7 +397,7 @@ export default function Index() {
                 </Box>
                 <Box paddingBlockStart="500">
                   <Button variant="primary" onClick={handleRun}
-                    loading={isLoading} disabled={!locationId}>
+                    loading={isLoadingTable} disabled={isLoadingSummary}>
                     Run
                   </Button>
                 </Box>
@@ -362,14 +406,14 @@ export default function Index() {
           </Card>
         </Layout.Section>
 
-        {/* ── Loading state ───────────────────────────────────────────────── */}
-        {isLoading && (
+        {/* ── Full-store loading state ────────────────────────────────────── */}
+        {isLoadingSummary && (
           <Layout.Section>
             <Card>
               <BlockStack gap="400" align="center">
                 <Spinner size="large" />
                 <Text tone="subdued">
-                  Pulling inventory and sales data — takes a moment for large catalogs.
+                  Loading full store snapshot — pulling inventory and sales across all locations…
                 </Text>
               </BlockStack>
             </Card>
@@ -377,9 +421,8 @@ export default function Index() {
         )}
 
         {/* ── Results ─────────────────────────────────────────────────────── */}
-        {!isLoading && rows.length > 0 && (
+        {!isLoadingSummary && rows.length > 0 && (
           <>
-            {/* Snapshot stat strip */}
             <Layout.Section>
               <InlineGrid columns={4} gap="400">
                 <Card>
@@ -391,30 +434,34 @@ export default function Index() {
                 <Card>
                   <BlockStack gap="100">
                     <Text variant="headingLg">
-                      {result.avgST !== null ? `${result.avgST}%` : "—"}
+                      {tableResult?.avgST !== null ? `${tableResult.avgST}%` : "—"}
                     </Text>
-                    <Text tone="subdued">Avg sell-through ({days}d)</Text>
+                    <Text tone="subdued">Avg sell-through ({tableResult?.days ?? days}d)</Text>
                   </BlockStack>
                 </Card>
                 <Card>
                   <BlockStack gap="100">
-                    <Text variant="headingLg">{lowCount}</Text>
+                    <Text variant="headingLg">{tableResult?.lowCount ?? 0}</Text>
                     <Text tone="subdued">Low / out of stock</Text>
                   </BlockStack>
                 </Card>
                 <Card>
                   <BlockStack gap="100">
-                    <Text variant="headingLg">{result.totalUnits.toLocaleString()}</Text>
-                    <Text tone="subdued">Units sold ({days}d)</Text>
+                    <Text variant="headingLg">
+                      {tableResult?.totalUnits?.toLocaleString() ?? 0}
+                    </Text>
+                    <Text tone="subdued">Units sold ({tableResult?.days ?? days}d)</Text>
                   </BlockStack>
                 </Card>
               </InlineGrid>
             </Layout.Section>
 
-            {/* Low inventory banner */}
             {lowCount > 0 && (
               <Layout.Section>
-                <Banner title={`${lowCount} SKU${lowCount !== 1 ? "s" : ""} need attention`} tone="warning">
+                <Banner
+                  title={`${lowCount} SKU${lowCount !== 1 ? "s" : ""} need attention`}
+                  tone="warning"
+                >
                   <Text>
                     {rows
                       .filter(r => r.isBelowMin || r.isOutOfStock)
@@ -427,7 +474,6 @@ export default function Index() {
               </Layout.Section>
             )}
 
-            {/* Table */}
             <Layout.Section>
               <Card>
                 <BlockStack gap="400">
@@ -439,29 +485,24 @@ export default function Index() {
                     autoComplete="off"
                   />
                   <Divider />
-                  <DataTable
-                    columnContentTypes={["text","text","text","numeric","numeric","text","text"]}
-                    headings={["Product / SKU","Vendor","Type","On hand",`Sold (${days}d)`,"Sell-through","Status"]}
-                    rows={tableRows}
-                    footerContent={
-                      filtered.length !== rows.length
-                        ? `Showing ${filtered.length} of ${rows.length} SKUs`
-                        : `${rows.length} SKUs`
-                    }
-                    truncate
-                  />
+                  {isLoadingTable
+                    ? <BlockStack gap="400" align="center"><Spinner /><Text tone="subdued">Updating…</Text></BlockStack>
+                    : <DataTable
+                        columnContentTypes={["text","text","text","numeric","numeric","text","text"]}
+                        headings={["Product / SKU","Vendor","Type","On hand",`Sold (${tableResult?.days ?? days}d)`,"Sell-through","Status"]}
+                        rows={tableRows}
+                        footerContent={
+                          filtered.length !== rows.length
+                            ? `Showing ${filtered.length} of ${rows.length} SKUs`
+                            : `${rows.length} SKUs`
+                        }
+                        truncate
+                      />
+                  }
                 </BlockStack>
               </Card>
             </Layout.Section>
           </>
-        )}
-
-        {!isLoading && result && rows.length === 0 && (
-          <Layout.Section>
-            <Card>
-              <Text tone="subdued">No SKUs found. Try a broader product type or different location.</Text>
-            </Card>
-          </Layout.Section>
         )}
 
       </Layout>

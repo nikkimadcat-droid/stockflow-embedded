@@ -345,6 +345,109 @@ export const action = async ({ request }) => {
     return { ok: true, intent: "fetchInventory", poId, onHand };
   }
 
+  // ── RECEIVE: adjust inventory in Shopify then mark PO received ──────────────
+  if (intent === "receive") {
+    const id = form.get("id");
+    const receiveQtys = JSON.parse(form.get("receiveQtys")); // { itemId: qty, ... }
+
+    const po = await db.purchaseOrder.findUnique({
+      where: { id },
+      include: { items: true },
+    });
+    if (!po || !po.locationId) return { ok: false, error: "PO not found or no location set" };
+
+    // Build variantId → inventoryItemId map via Shopify
+    const variantIds = po.items.map((i) => i.variantId);
+    const inventoryItemMap = {}; // variantId → inventoryItemId
+
+    // Fetch inventory items for all variants in batches of 50
+    for (let i = 0; i < variantIds.length; i += 50) {
+      const batch = variantIds.slice(i, i + 50);
+      const varRes = await admin.graphql(`
+        query($ids: [ID!]!) {
+          nodes(ids: $ids) {
+            ... on ProductVariant {
+              id
+              inventoryItem { id }
+            }
+          }
+        }
+      `, { variables: { ids: batch } });
+      const varJson = await varRes.json();
+      for (const node of varJson.data?.nodes ?? []) {
+        if (node?.id && node?.inventoryItem?.id) {
+          inventoryItemMap[node.id] = node.inventoryItem.id;
+        }
+      }
+    }
+
+    // Build adjustments array — only items with qty > 0
+    const changes = [];
+    for (const item of po.items) {
+      const qty = Number(receiveQtys[item.id] ?? item.qtyOrdered);
+      if (qty <= 0) continue;
+      const inventoryItemId = inventoryItemMap[item.variantId];
+      if (!inventoryItemId) continue;
+      changes.push({
+        inventoryItemId,
+        locationId: po.locationId,
+        delta: qty,
+      });
+    }
+
+    if (changes.length === 0) return { ok: false, error: "No items to receive" };
+
+    // Push to Shopify in batches of 100 (API limit)
+    const errors = [];
+    for (let i = 0; i < changes.length; i += 100) {
+      const batch = changes.slice(i, i + 100);
+      const adjRes = await admin.graphql(`
+        mutation($input: InventoryAdjustQuantitiesInput!) {
+          inventoryAdjustQuantities(input: $input) {
+            inventoryAdjustmentGroup {
+              id
+              reason
+              changes {
+                name
+                delta
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `, {
+        variables: {
+          input: {
+            reason: "received",
+            name: "available",
+            changes: batch,
+          },
+        },
+      });
+      const adjJson = await adjRes.json();
+      const userErrors = adjJson.data?.inventoryAdjustQuantities?.userErrors ?? [];
+      if (userErrors.length > 0) {
+        errors.push(...userErrors.map((e) => e.message));
+      }
+    }
+
+    if (errors.length > 0) {
+      return { ok: false, intent: "receive", error: errors.join("; ") };
+    }
+
+    // Mark PO as received
+    await db.purchaseOrder.update({
+      where: { id },
+      data: { status: "received", updatedAt: new Date() },
+    });
+
+    return { ok: true, intent: "receive", poId: id };
+  }
+  // ────────────────────────────────────────────────────────────────────────────
+
   if (intent === "updateStatus") {
     const id = form.get("id");
     const status = form.get("status");
@@ -402,6 +505,8 @@ export default function PurchaseOrders() {
   const [itemEdits, setItemEdits] = useState({});
   const [removedItems, setRemovedItems] = useState({});
   const [onHandData, setOnHandData] = useState({});
+  const [receiveModal, setReceiveModal] = useState(null); // { po, receiveQtys: { itemId: qty } }
+  const [receiveError, setReceiveError] = useState(null);
 
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
@@ -413,6 +518,15 @@ export default function PurchaseOrders() {
     onHandData[fetcherData.poId] === "loading"
   ) {
     setOnHandData((prev) => ({ ...prev, [fetcherData.poId]: fetcherData.onHand }));
+  }
+
+  if (fetcher.state === "idle" && fetcherData?.intent === "receive") {
+    if (fetcherData.ok && receiveModal) {
+      setReceiveModal(null);
+      setReceiveError(null);
+    } else if (!fetcherData.ok && fetcherData.error) {
+      setReceiveError(fetcherData.error);
+    }
   }
 
   function handleCreate() {
@@ -510,6 +624,34 @@ export default function PurchaseOrders() {
     setRemovedItems((prev) => { const n = { ...prev }; delete n[po.id]; return n; });
   }
 
+  function handleOpenReceive(po) {
+    const activeItems = po.items.filter((i) => !(removedItems[po.id] ?? new Set()).has(i.id));
+    const receiveQtys = Object.fromEntries(
+      activeItems.map((i) => {
+        const editedQty = itemEdits[po.id]?.[i.id]?.qtyOrdered;
+        return [i.id, editedQty !== undefined ? String(editedQty) : String(i.qtyOrdered)];
+      })
+    );
+    setReceiveError(null);
+    setReceiveModal({ po, receiveQtys });
+  }
+
+  function handleReceiveQtyChange(itemId, val) {
+    setReceiveModal((prev) => ({
+      ...prev,
+      receiveQtys: { ...prev.receiveQtys, [itemId]: val },
+    }));
+  }
+
+  function handleConfirmReceive() {
+    const { po, receiveQtys } = receiveModal;
+    const fd = new FormData();
+    fd.append("intent", "receive");
+    fd.append("id", po.id);
+    fd.append("receiveQtys", JSON.stringify(receiveQtys));
+    fetcher.submit(fd, { method: "post" });
+  }
+
   function handleDelete(id) {
     if (!confirm("Delete this purchase order?")) return;
     const fd = new FormData();
@@ -542,6 +684,7 @@ export default function PurchaseOrders() {
       <Layout>
         <Layout.Section>
 
+          {/* ── Create PO modal ── */}
           <Modal
             open={showCreate}
             onClose={() => setShowCreate(false)}
@@ -583,7 +726,69 @@ export default function PurchaseOrders() {
             </Modal.Section>
           </Modal>
 
-          {isSubmitting && (
+          {/* ── Receive modal ── */}
+          {receiveModal && (
+            <Modal
+              open
+              onClose={() => { setReceiveModal(null); setReceiveError(null); }}
+              title={`Receive ${receiveModal.po.poNumber}`}
+              primaryAction={{
+                content: "Receive & Update Shopify Inventory",
+                onAction: handleConfirmReceive,
+                loading: isSubmitting,
+                disabled: isSubmitting,
+              }}
+              secondaryActions={[{ content: "Cancel", onAction: () => { setReceiveModal(null); setReceiveError(null); } }]}
+            >
+              <Modal.Section>
+                <BlockStack gap="400">
+                  <Text>
+                    Receiving at: <strong>{locationNameMap[receiveModal.po.locationId] ?? receiveModal.po.locationId}</strong>
+                  </Text>
+                  <Text tone="subdued">
+                    Adjust quantities below if you received a partial shipment. Each item's on-hand count will be increased by the amount shown.
+                  </Text>
+                  {receiveError && <Banner tone="critical">{receiveError}</Banner>}
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                      <thead>
+                        <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
+                          {["Product", "Variant", "SKU", "Qty to Receive"].map((h, i) => (
+                            <th key={i} style={{ padding: "8px 12px", textAlign: "left" }}>
+                              <Text variant="headingSm">{h}</Text>
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {receiveModal.po.items
+                          .filter((i) => !(removedItems[receiveModal.po.id] ?? new Set()).has(i.id))
+                          .map((item) => (
+                            <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
+                              <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>
+                              <td style={{ padding: "8px 12px" }}><Text>{item.variantTitle}</Text></td>
+                              <td style={{ padding: "8px 12px" }}><Text>{item.sku}</Text></td>
+                              <td style={{ padding: "8px 12px", width: "110px" }}>
+                                <TextField
+                                  label="" labelHidden
+                                  type="number"
+                                  value={receiveModal.receiveQtys[item.id] ?? String(item.qtyOrdered)}
+                                  onChange={(val) => handleReceiveQtyChange(item.id, val)}
+                                  autoComplete="off"
+                                  min="0"
+                                />
+                              </td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </BlockStack>
+              </Modal.Section>
+            </Modal>
+          )}
+
+          {isSubmitting && !receiveModal && (
             <div style={{ textAlign: "center", padding: "2rem" }}>
               <Spinner size="large" />
               <Text>Working on it — this may take a moment for large catalogs…</Text>
@@ -598,7 +803,7 @@ export default function PurchaseOrders() {
             </Card>
           )}
 
-          {!isSubmitting && purchaseOrders.map((po) => {
+          {purchaseOrders.map((po) => {
             const isExpanded = expandedId === po.id;
             const poEdits = itemEdits[po.id] ?? {};
             const poRemoved = removedItems[po.id] ?? new Set();
@@ -607,6 +812,7 @@ export default function PurchaseOrders() {
             const isLoadingInventory = poOnHand === "loading";
             const hasOnHand = poOnHand && poOnHand !== "loading";
             const locationLabel = po.locationId ? (locationNameMap[po.locationId] ?? "") : null;
+            const canReceive = po.status !== "received" && po.status !== "cancelled" && po.items.length > 0 && po.locationId;
 
             const displayItems = po.items.map((i) => ({
               ...i,
@@ -647,6 +853,11 @@ export default function PurchaseOrders() {
                           value={po.status}
                           onChange={(val) => handleStatusChange(po.id, val)}
                         />
+                        {canReceive && (
+                          <Button variant="primary" onClick={() => handleOpenReceive(po)}>
+                            ✓ Receive
+                          </Button>
+                        )}
                         {po.mode !== "manual" && (
                           <Button variant="plain" onClick={() => handleRegenerate(po.id)}>↺ Regenerate</Button>
                         )}
@@ -669,7 +880,6 @@ export default function PurchaseOrders() {
                           </Banner>
                         ) : (
                           <BlockStack gap="300">
-
                             <InlineStack align="space-between" blockAlign="center">
                               <Text tone="subdued" variant="bodySm">
                                 {hasOnHand

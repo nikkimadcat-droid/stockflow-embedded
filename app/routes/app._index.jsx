@@ -43,9 +43,10 @@ export const action = async ({ request }) => {
 
   const locationGid = form.get("locationId");
   const productType = form.get("productType") || "";
+  const vendor = form.get("vendor") || "";
   const days = parseInt(form.get("days") || "30");
   const forceRefresh = form.get("forceRefresh") === "true";
-  const cacheKey = `${locationGid}__${productType}__${days}`;
+  const cacheKey = `${locationGid}__${productType}__${vendor}__${days}`;
 
   if (!forceRefresh) {
     try {
@@ -59,6 +60,7 @@ export const action = async ({ request }) => {
         return {
           rows: cached.rows,
           productTypes: cached.productTypes,
+          vendors: cached.vendors ?? [],
           lowCount: cached.lowCount,
           avgST: cached.avgST,
           totalUnits: cached.totalUnits,
@@ -74,10 +76,15 @@ export const action = async ({ request }) => {
   since.setDate(since.getDate() - days);
   const sinceStr = since.toISOString();
 
+  // Build query clause — AND logic when both set
+  let queryParts = [];
+  if (productType) queryParts.push(`product_type:'${productType}'`);
+  if (vendor) queryParts.push(`vendor:'${vendor}'`);
+  const typeClause = queryParts.length > 0 ? queryParts.join(" AND ") : null;
+
   let products = [];
   let cursor = null;
   let hasNext = true;
-  const typeClause = productType ? `product_type:'${productType}'` : null;
 
   while (hasNext) {
     const res = await admin.graphql(`
@@ -218,6 +225,7 @@ export const action = async ({ request }) => {
   });
 
   const productTypes = [...new Set(rows.map(r => r.productType).filter(Boolean))].sort();
+  const vendors = [...new Set(rows.map(r => r.vendor).filter(Boolean))].sort();
   const lowCount = rows.filter(r => r.isBelowMin || r.isOutOfStock).length;
   const avgST = rows.filter(r => r.sellThrough !== null).length > 0
     ? Math.round(
@@ -238,7 +246,7 @@ export const action = async ({ request }) => {
     console.error("Cache write failed:", e);
   }
 
-  return { rows, lowCount, avgST, totalUnits, productTypes, days, fromCache: false };
+  return { rows, lowCount, avgST, totalUnits, productTypes, vendors, days, fromCache: false };
 };
 
 export default function Index() {
@@ -247,13 +255,18 @@ export default function Index() {
 
   const [locationId, setLocationId] = useState(locations[0]?.id ?? "");
   const [productType, setProductType] = useState("");
+  const [vendor, setVendor] = useState("");
   const [days, setDays] = useState("30");
   const [search, setSearch] = useState("");
   const [savedTypes, setSavedTypes] = useState([]);
+  const [savedVendors, setSavedVendors] = useState([]);
 
   useEffect(() => {
     if (fetcher.data?.productTypes?.length > 0) {
       setSavedTypes(fetcher.data.productTypes);
+    }
+    if (fetcher.data?.vendors?.length > 0) {
+      setSavedVendors(fetcher.data.vendors);
     }
   }, [fetcher.data]);
 
@@ -265,6 +278,10 @@ export default function Index() {
   const typeOptions = [
     { label: "All product types", value: "" },
     ...savedTypes.map(t => ({ label: t, value: t })),
+  ];
+  const vendorOptions = [
+    { label: "All vendors", value: "" },
+    ...savedVendors.map(v => ({ label: v, value: v })),
   ];
   const dayOptions = [
     { label: "Last 7 days", value: "7" },
@@ -278,6 +295,7 @@ export default function Index() {
     fd.append("intent", "loadDashboard");
     fd.append("locationId", locationId);
     fd.append("productType", productType);
+    fd.append("vendor", vendor);
     fd.append("days", days);
     fd.append("forceRefresh", force ? "true" : "false");
     fetcher.submit(fd, { method: "post" });
@@ -387,19 +405,19 @@ export default function Index() {
                 )}
               </InlineStack>
               <InlineStack gap="300" wrap={false} blockAlign="end">
-                <Box minWidth="200px">
+                <Box minWidth="180px">
                   <Select label="Location" options={locationOptions}
                     value={locationId} onChange={setLocationId} />
                 </Box>
-                <Box minWidth="220px">
-                  <Select
-                    label="Product type"
-                    options={typeOptions}
-                    value={productType}
-                    onChange={setProductType}
-                  />
+                <Box minWidth="180px">
+                  <Select label="Product type" options={typeOptions}
+                    value={productType} onChange={setProductType} />
                 </Box>
-                <Box minWidth="160px">
+                <Box minWidth="180px">
+                  <Select label="Vendor" options={vendorOptions}
+                    value={vendor} onChange={setVendor} />
+                </Box>
+                <Box minWidth="150px">
                   <Select label="Period" options={dayOptions}
                     value={days} onChange={setDays} />
                 </Box>
@@ -411,7 +429,7 @@ export default function Index() {
               </InlineStack>
               {!result && (
                 <Text tone="subdued" variant="bodySm">
-                  Select a location and product type, then hit Run. Results cache for 4 hours.
+                  Filter by location, product type, vendor, or any combination. Results cache for 4 hours.
                 </Text>
               )}
             </BlockStack>
@@ -514,7 +532,7 @@ export default function Index() {
           <Layout.Section>
             <Card>
               <Text tone="subdued">
-                No SKUs found. Try a different location or product type.
+                No SKUs found. Try a different location, product type, or vendor.
               </Text>
             </Card>
           </Layout.Section>

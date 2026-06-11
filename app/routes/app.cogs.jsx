@@ -12,6 +12,7 @@ import {
   Button,
   Text,
   Select,
+  TextField,
   Spinner,
   EmptyState,
 } from "@shopify/polaris";
@@ -34,15 +35,16 @@ export const action = async ({ request }) => {
 
   if (intent === "loadCOGS") {
     const locationId = form.get("locationId");
-    const days = parseInt(form.get("days") || "30");
-    const since = new Date();
-    since.setDate(since.getDate() - days);
-    const sinceStr = since.toISOString();
+    const startDate = form.get("startDate"); // YYYY-MM-DD
+    const endDate = form.get("endDate");     // YYYY-MM-DD
+
+    const sinceStr = new Date(startDate + "T00:00:00.000Z").toISOString();
+    const untilStr = new Date(endDate + "T23:59:59.999Z").toISOString();
 
     const locationNumericId = locationId ? locationId.split("/").pop() : null;
     const queryStr = locationNumericId
-      ? `created_at:>${sinceStr} location_id:${locationNumericId}`
-      : `created_at:>${sinceStr}`;
+      ? `created_at:>${sinceStr} created_at:<${untilStr} location_id:${locationNumericId}`
+      : `created_at:>${sinceStr} created_at:<${untilStr}`;
 
     let cursor = null;
     let hasMore = true;
@@ -96,14 +98,12 @@ export const action = async ({ request }) => {
       }
     }
 
-    // Pull supplier costs from DB
     const variantIds = Object.keys(salesMap);
     const supplierSkus = await db.supplierSku.findMany({
       where: { shop, variantId: { in: variantIds } },
     });
     const costMap = Object.fromEntries(supplierSkus.map((s) => [s.variantId, parseFloat(s.cost ?? 0)]));
 
-    // Fall back to Shopify unitCost for variants missing from DB
     const missingIds = variantIds.filter((id) => costMap[id] == null);
     if (missingIds.length > 0) {
       for (let i = 0; i < missingIds.length; i += 50) {
@@ -130,7 +130,6 @@ export const action = async ({ request }) => {
       }
     }
 
-    // Build rows
     let totalCOGS = 0;
     let totalRevenue = 0;
     let skusWithCost = 0;
@@ -145,24 +144,11 @@ export const action = async ({ request }) => {
         : null;
       const avgPrice = data.qty > 0 ? data.revenue / data.qty : null;
 
-      if (cogs != null) {
-        totalCOGS += cogs;
-        skusWithCost++;
-      } else {
-        skusNoCost++;
-      }
+      if (cogs != null) { totalCOGS += cogs; skusWithCost++; }
+      else { skusNoCost++; }
       totalRevenue += data.revenue;
 
-      items.push({
-        productTitle: data.productTitle,
-        sku: data.sku,
-        cost,
-        qty: data.qty,
-        cogs,
-        revenue: data.revenue,
-        margin,
-        avgPrice,
-      });
+      items.push({ productTitle: data.productTitle, sku: data.sku, cost, qty: data.qty, cogs, revenue: data.revenue, margin, avgPrice });
     }
 
     items.sort((a, b) => (b.cogs ?? -1) - (a.cogs ?? -1));
@@ -180,18 +166,64 @@ export const action = async ({ request }) => {
       grossMargin,
       skusWithCost,
       skusNoCost,
+      startDate,
+      endDate,
     };
   }
 
   return { ok: false };
 };
 
+function downloadCSV(result, locationLabel) {
+  const periodLabel = `${result.startDate} to ${result.endDate}`;
+  const rows = [
+    [`MadCat COGS Report — ${periodLabel}${locationLabel ? ` — ${locationLabel}` : ""}`],
+    [],
+    ["", "COGS", "Revenue", "Gross Margin"],
+    ["TOTAL", result.totalCOGS.toFixed(2), result.totalRevenue.toFixed(2), result.grossMargin != null ? `${result.grossMargin}%` : "—"],
+    [],
+    ["Product", "SKU", "Unit Cost", "Units Sold", "COGS", "Revenue", "Avg Retail", "Gross Margin"],
+    ...result.items.map((i) => [
+      i.productTitle,
+      i.sku || "",
+      i.cost != null ? i.cost.toFixed(2) : "",
+      i.qty,
+      i.cogs != null ? i.cogs.toFixed(2) : "",
+      i.revenue.toFixed(2),
+      i.avgPrice != null ? i.avgPrice.toFixed(2) : "",
+      i.margin != null ? `${i.margin.toFixed(1)}%` : "",
+    ]),
+  ];
+
+  const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `COGS-${result.startDate}-${result.endDate}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Default to previous calendar month
+function getDefaultDates() {
+  const now = new Date();
+  const firstOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const lastOfLastMonth = new Date(firstOfThisMonth - 1);
+  const firstOfLastMonth = new Date(lastOfLastMonth.getFullYear(), lastOfLastMonth.getMonth(), 1);
+  const pad = (n) => String(n).padStart(2, "0");
+  const fmt = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return { start: fmt(firstOfLastMonth), end: fmt(lastOfLastMonth) };
+}
+
 export default function COGS() {
   const { locations } = useLoaderData();
   const fetcher = useFetcher();
 
+  const defaults = getDefaultDates();
   const [locationId, setLocationId] = useState("all");
-  const [days, setDays] = useState("30");
+  const [startDate, setStartDate] = useState(defaults.start);
+  const [endDate, setEndDate] = useState(defaults.end);
   const [result, setResult] = useState(null);
 
   const isLoading = fetcher.state !== "idle";
@@ -206,7 +238,8 @@ export default function COGS() {
     const fd = new FormData();
     fd.append("intent", "loadCOGS");
     fd.append("locationId", locationId === "all" ? "" : locationId);
-    fd.append("days", days);
+    fd.append("startDate", startDate);
+    fd.append("endDate", endDate);
     fetcher.submit(fd, { method: "post" });
   }
 
@@ -215,11 +248,9 @@ export default function COGS() {
     ...locations.map((l) => ({ label: l.name, value: l.id })),
   ];
 
-  const daysOptions = [
-    { label: "Last 30 days", value: "30" },
-    { label: "Last 60 days", value: "60" },
-    { label: "Last 90 days", value: "90" },
-  ];
+  const locationLabel = locationId === "all"
+    ? "All locations"
+    : locations.find((l) => l.id === locationId)?.name ?? "";
 
   return (
     <Page title="COGS Tracking">
@@ -227,22 +258,33 @@ export default function COGS() {
         <Layout.Section>
           <Card>
             <BlockStack gap="400">
-              <InlineStack gap="300" blockAlign="end">
+              <InlineStack gap="300" blockAlign="end" wrap={false}>
                 <Select
                   label="Location"
                   options={locationOptions}
                   value={locationId}
                   onChange={setLocationId}
                 />
-                <Select
-                  label="Period"
-                  options={daysOptions}
-                  value={days}
-                  onChange={setDays}
+                <TextField
+                  label="Start date"
+                  type="date"
+                  value={startDate}
+                  onChange={setStartDate}
+                />
+                <TextField
+                  label="End date"
+                  type="date"
+                  value={endDate}
+                  onChange={setEndDate}
                 />
                 <Button variant="primary" onClick={handleLoad} loading={isLoading}>
                   {result ? "↺ Reload" : "Load COGS"}
                 </Button>
+                {result && (
+                  <Button onClick={() => downloadCSV(result, locationLabel)}>
+                    ↓ Export CSV
+                  </Button>
+                )}
               </InlineStack>
             </BlockStack>
           </Card>
@@ -263,14 +305,14 @@ export default function COGS() {
               <InlineGrid columns={4} gap="400">
                 <Card>
                   <BlockStack gap="200">
-                    <Text variant="headingMd">COGS ({days}d)</Text>
+                    <Text variant="headingMd">COGS</Text>
                     <Text variant="heading2xl">${result.totalCOGS.toFixed(0)}</Text>
-                    <Text tone="subdued">supplier cost × units sold</Text>
+                    <Text tone="subdued">{result.startDate} → {result.endDate}</Text>
                   </BlockStack>
                 </Card>
                 <Card>
                   <BlockStack gap="200">
-                    <Text variant="headingMd">Revenue ({days}d)</Text>
+                    <Text variant="headingMd">Revenue</Text>
                     <Text variant="heading2xl">${result.totalRevenue.toFixed(0)}</Text>
                     <Text tone="subdued">from orders</Text>
                   </BlockStack>
@@ -356,8 +398,8 @@ export default function COGS() {
         {!isLoading && !result && (
           <Layout.Section>
             <Card>
-              <EmptyState heading="Select filters and load COGS" image="">
-                <p>Choose a location and time period, then click Load COGS to calculate gross margin from your supplier and Shopify costs.</p>
+              <EmptyState heading="Select a date range and load COGS" image="">
+                <p>Choose a location and date range, then click Load COGS. Defaults to last calendar month.</p>
               </EmptyState>
             </Card>
           </Layout.Section>

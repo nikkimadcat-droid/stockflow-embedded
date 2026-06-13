@@ -120,12 +120,13 @@ export const action = async ({ request }) => {
 
     for (const v of variants) {
       await prisma.supplierSku.upsert({
-        where: { supplierId_variantId: { supplierId, variantId: v.id } },
+        where: { supplierId_variantId_vendorName: { supplierId, variantId: v.id, vendorName: "" } },
         update: { cost: v.cost, supplierCode: v.sku || "" },
         create: {
           shop,
           supplierId,
           variantId: v.id,
+          vendorName: "",
           supplierCode: v.sku || "",
           cost: v.cost,
         },

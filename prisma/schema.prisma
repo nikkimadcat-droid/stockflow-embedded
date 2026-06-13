@@ -63,10 +63,11 @@ model SupplierSku {
   supplier     Supplier @relation(fields: [supplierId], references: [id])
   variantId    String
   supplierCode String
+  vendorName   String   @default("")
   cost         Float
   updatedAt    DateTime @updatedAt
 
-  @@unique([supplierId, variantId])
+  @@unique([supplierId, variantId, vendorName])
 }
 
 model PurchaseOrder {

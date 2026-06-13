@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useLoaderData, useFetcher, useSearchParams, Link } from "react-router";
+import { useLoaderData, useFetcher, useSearchParams, useNavigate, Link } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import {
@@ -369,6 +369,7 @@ export default function Stocktake() {
   const data = useLoaderData();
   const fetcher = useFetcher();
   const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
 
   const isListView = data.view === "list";
 
@@ -425,7 +426,7 @@ export default function Stocktake() {
 
   if (isListView) {
     return (
-      <Page title="Saved Stocktakes" backAction={{ content: "Stocktake", url: "/app/stocktake" }}>
+      <Page title="Saved Stocktakes" backAction={{ content: "Stocktake", onAction: () => navigate("/app/stocktake") }}>
         <Layout>
           <Layout.Section>
             <SavedStocktakesList stocktakes={data.stocktakes} />
@@ -546,7 +547,7 @@ export default function Stocktake() {
         }
         secondaryActions={[
           { content: "🖨 Print count sheet", onAction: () => window.print() },
-          { content: "View saved stocktakes", url: "/app/stocktake?view=list" },
+          { content: "View saved stocktakes", onAction: () => navigate("/app/stocktake?view=list") },
         ]}
       >
         <Layout>

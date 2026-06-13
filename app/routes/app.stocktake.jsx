@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useLoaderData, useFetcher, useSearchParams } from "react-router";
+import { useLoaderData, useFetcher, useSearchParams, Link } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import {
@@ -15,10 +15,22 @@ import {
   Badge,
   Banner,
   Spinner,
+  IndexTable,
+  EmptyState,
 } from "@shopify/polaris";
 
 export const loader = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
+
+  const url = new URL(request.url);
+  if (url.searchParams.get("view") === "list") {
+    const stocktakes = await db.stocktake.findMany({
+      where: { shop: session.shop },
+      orderBy: { createdAt: "desc" },
+      include: { _count: { select: { lines: true } } },
+    });
+    return { view: "list", stocktakes };
+  }
 
   const locRes = await admin.graphql(`
     query {
@@ -55,6 +67,7 @@ export const loader = async ({ request }) => {
   }
 
   return {
+    view: "stocktake",
     locations,
     vendors: [...vendors].sort(),
     types: [...types].sort(),
@@ -306,10 +319,62 @@ export const action = async ({ request }) => {
   return { ok: false };
 };
 
+function SavedStocktakesList({ stocktakes }) {
+  return (
+    <Card>
+      {stocktakes.length === 0 ? (
+        <EmptyState heading="No saved stocktakes yet" image="">
+          <p>Saved and completed stocktakes will appear here.</p>
+        </EmptyState>
+      ) : (
+        <IndexTable
+          itemCount={stocktakes.length}
+          headings={[
+            { title: "Date" },
+            { title: "Location" },
+            { title: "Filters" },
+            { title: "SKUs" },
+            { title: "Status" },
+            { title: "" },
+          ]}
+          selectable={false}
+        >
+          {stocktakes.map((s, i) => (
+            <IndexTable.Row id={s.id} key={s.id} position={i}>
+              <IndexTable.Cell>
+                <Text>{new Date(s.createdAt).toLocaleString()}</Text>
+              </IndexTable.Cell>
+              <IndexTable.Cell>{s.locationName}</IndexTable.Cell>
+              <IndexTable.Cell>
+                {[s.vendorFilter, s.typeFilter].filter(Boolean).join(" / ") || "—"}
+              </IndexTable.Cell>
+              <IndexTable.Cell>{s._count.lines}</IndexTable.Cell>
+              <IndexTable.Cell>
+                <Badge tone={s.status === "completed" ? "success" : "attention"}>
+                  {s.status === "completed" ? "Completed" : "In progress"}
+                </Badge>
+              </IndexTable.Cell>
+              <IndexTable.Cell>
+                <Link to={`/app/stocktake?load=${s.id}`}>Open</Link>
+              </IndexTable.Cell>
+            </IndexTable.Row>
+          ))}
+        </IndexTable>
+      )}
+    </Card>
+  );
+}
+
 export default function Stocktake() {
-  const { locations, vendors, types } = useLoaderData();
+  const data = useLoaderData();
   const fetcher = useFetcher();
   const [searchParams] = useSearchParams();
+
+  const isListView = data.view === "list";
+
+  const locations = isListView ? [] : data.locations;
+  const vendors = isListView ? [] : data.vendors;
+  const types = isListView ? [] : data.types;
 
   const [locationId, setLocationId] = useState(locations[0]?.id ?? "");
   const [vendorFilter, setVendorFilter] = useState("");
@@ -323,6 +388,7 @@ export default function Stocktake() {
   const isSubmitting = fetcher.state !== "idle";
 
   useEffect(() => {
+    if (isListView) return;
     const loadId = searchParams.get("load");
     if (loadId) {
       const fd = new FormData();
@@ -333,7 +399,7 @@ export default function Stocktake() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  if (fetcher.data?.intent === "fetchInventory" && fetcher.data.rows !== rows) {
+  if (!isListView && fetcher.data?.intent === "fetchInventory" && fetcher.data.rows !== rows) {
     setRows(fetcher.data.rows);
     setLoaded(true);
     setCounts({});
@@ -341,7 +407,7 @@ export default function Stocktake() {
     setStocktakeStatus("in_progress");
   }
 
-  if (fetcher.data?.intent === "loadStocktake" && fetcher.data.loadedStocktake?.id !== stocktakeId) {
+  if (!isListView && fetcher.data?.intent === "loadStocktake" && fetcher.data.loadedStocktake?.id !== stocktakeId) {
     const { loadedStocktake, rows: loadedRows, counts: loadedCounts } = fetcher.data;
     setStocktakeId(loadedStocktake.id);
     setStocktakeStatus(loadedStocktake.status);
@@ -353,8 +419,20 @@ export default function Stocktake() {
     setLoaded(true);
   }
 
-  if (fetcher.data?.intent === "saveStocktake" && fetcher.data.saved && fetcher.data.stocktakeId !== stocktakeId) {
+  if (!isListView && fetcher.data?.intent === "saveStocktake" && fetcher.data.saved && fetcher.data.stocktakeId !== stocktakeId) {
     setStocktakeId(fetcher.data.stocktakeId);
+  }
+
+  if (isListView) {
+    return (
+      <Page title="Saved Stocktakes" backAction={{ content: "Stocktake", url: "/app/stocktake" }}>
+        <Layout>
+          <Layout.Section>
+            <SavedStocktakesList stocktakes={data.stocktakes} />
+          </Layout.Section>
+        </Layout>
+      </Page>
+    );
   }
 
   function handleLoadInventory() {
@@ -468,7 +546,7 @@ export default function Stocktake() {
         }
         secondaryActions={[
           { content: "🖨 Print count sheet", onAction: () => window.print() },
-          { content: "View saved stocktakes", url: "/app/stocktakes" },
+          { content: "View saved stocktakes", url: "/app/stocktake?view=list" },
         ]}
       >
         <Layout>

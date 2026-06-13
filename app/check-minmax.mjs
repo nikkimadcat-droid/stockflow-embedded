@@ -1,0 +1,11 @@
+import { PrismaClient } from "@prisma/client";
+import dotenv from "dotenv";
+dotenv.config();
+const prisma = new PrismaClient();
+const count = await prisma.minMax.count();
+console.log("Total MinMax rows:", count);
+const sample = await prisma.minMax.findMany({ take: 5 });
+console.log(sample);
+const shops = await prisma.minMax.groupBy({ by: ["shop", "locationId"], _count: true });
+console.log(shops);
+await prisma.$disconnect();

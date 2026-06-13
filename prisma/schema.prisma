@@ -158,3 +158,32 @@ model SnapshotCache {
   productTypes Json     @default("[]")
   createdAt    DateTime @default(now())
 }
+
+model Stocktake {
+  id           String          @id @default(cuid())
+  shop         String
+  locationId   String
+  locationName String
+  vendorFilter String?
+  typeFilter   String?
+  status       String          @default("in_progress")
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  lines        StocktakeLine[]
+}
+
+model StocktakeLine {
+  id              String    @id @default(cuid())
+  stocktakeId     String
+  stocktake       Stocktake @relation(fields: [stocktakeId], references: [id], onDelete: Cascade)
+  variantId       String
+  inventoryItemId String?
+  productTitle    String
+  variantTitle    String    @default("")
+  vendor          String?
+  productType     String?
+  sku             String?
+  onHand          Int
+  counted         Int?
+  updatedAt       DateTime  @updatedAt
+}

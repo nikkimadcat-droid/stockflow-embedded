@@ -17,7 +17,7 @@ import {
 import { useState } from "react";
 
 export const loader = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
 
   const suppliers = await prisma.supplier.findMany({
@@ -57,7 +57,7 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
   const formData = await request.formData();
   const intent = formData.get("intent");
@@ -174,7 +174,7 @@ export default function VendorSources() {
                             <Text variant="headingSm">{h}</Text>
                           </th>
                         )
-                      )}
+                      )}{" "}
                     </tr>
                   </thead>
                   <tbody>

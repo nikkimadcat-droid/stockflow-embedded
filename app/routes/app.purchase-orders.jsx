@@ -1,4 +1,4 @@
-﻿import { useState } from "react";
+﻿import { useState, useEffect, useRef } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -216,7 +216,6 @@ export const loader = async ({ request }) => {
     orderBy: { name: "asc" },
   });
 
-  // Load primary vendor designations per supplier
   const vendorSuppliers = await db.vendorSupplier.findMany({
     where: { shop, isPrimary: true },
   });
@@ -226,7 +225,6 @@ export const loader = async ({ request }) => {
     primaryVendorMap[vs.supplierId].push(vs.vendorName);
   }
 
-  // Build variantId -> vendorName map from SupplierSku
   const allSupplierSkus = await db.supplierSku.findMany({
     where: { shop },
     select: { variantId: true, vendorName: true },
@@ -581,6 +579,9 @@ export default function PurchaseOrders() {
   const [skuQty, setSkuQty] = useState({});
   const [skuCost, setSkuCost] = useState({});
 
+  // Debounce refs — one timer per PO
+  const debounceTimers = useRef({});
+
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
 
@@ -617,6 +618,28 @@ export default function PurchaseOrders() {
     } else if (!fetcherData.ok && !skuResults[poId]?.error) {
       setSkuResults((prev) => ({ ...prev, [poId]: { error: fetcherData.error } }));
     }
+  }
+
+  function handleSkuChange(poId, supplierId, val) {
+    setSkuSearch((prev) => ({ ...prev, [poId]: val }));
+    setSkuResults((prev) => ({ ...prev, [poId]: null }));
+
+    // Clear existing timer for this PO
+    if (debounceTimers.current[poId]) {
+      clearTimeout(debounceTimers.current[poId]);
+    }
+
+    if (!val.trim()) return;
+
+    // Set new debounce timer — fires 400ms after last keystroke
+    debounceTimers.current[poId] = setTimeout(() => {
+      const fd = new FormData();
+      fd.append("intent", "searchSku");
+      fd.append("sku", val.trim());
+      fd.append("supplierId", supplierId);
+      fd.append("poId", poId);
+      fetcher.submit(fd, { method: "post" });
+    }, 400);
   }
 
   function handleCreate() {
@@ -747,18 +770,6 @@ export default function PurchaseOrders() {
     const fd = new FormData();
     fd.append("intent", "delete");
     fd.append("id", id);
-    fetcher.submit(fd, { method: "post" });
-  }
-
-  function handleSkuSearch(poId, supplierId) {
-    const sku = skuSearch[poId]?.trim();
-    if (!sku) return;
-    setSkuResults((prev) => ({ ...prev, [poId]: null }));
-    const fd = new FormData();
-    fd.append("intent", "searchSku");
-    fd.append("sku", sku);
-    fd.append("supplierId", supplierId);
-    fd.append("poId", poId);
     fetcher.submit(fd, { method: "post" });
   }
 
@@ -1000,7 +1011,6 @@ export default function PurchaseOrders() {
             const locationLabel = po.locationId ? (locationNameMap[po.locationId] ?? "") : null;
             const canReceive = po.status !== "received" && po.status !== "cancelled" && po.items.length > 0 && po.locationId;
 
-            // Primary vendors for this PO's supplier (array from loader)
             const primaryVendors = new Set(primaryVendorMap[po.supplierId] ?? []);
 
             const displayItems = po.items.map((i) => ({
@@ -1014,7 +1024,6 @@ export default function PurchaseOrders() {
             const totalCost = activeItems.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0);
             const totalUnits = activeItems.reduce((s, i) => s + i.qtyOrdered, 0);
 
-            // Split primary vs secondary using variantVendorMap
             const primaryItems = displayItems.filter((i) => {
               const vendor = variantVendorMap[i.variantId] ?? "";
               return primaryVendors.size === 0 || primaryVendors.has(vendor) || !vendor;
@@ -1031,6 +1040,9 @@ export default function PurchaseOrders() {
             ];
 
             const skuResult = skuResults[po.id];
+            const isSearching = isSubmitting &&
+              fetcher.formData?.get("intent") === "searchSku" &&
+              fetcher.formData?.get("poId") === po.id;
 
             return (
               <div key={po.id} style={{ marginBottom: "1rem" }}>
@@ -1119,12 +1131,9 @@ export default function PurchaseOrders() {
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {/* Primary items */}
                                   {primaryItems.map((item) =>
                                     renderItemRow(item, po, poEdits, hasOnHand, poOnHand)
                                   )}
-
-                                  {/* Secondary/backup section */}
                                   {secondaryItems.length > 0 && (
                                     <>
                                       <tr>
@@ -1145,8 +1154,6 @@ export default function PurchaseOrders() {
                                       )}
                                     </>
                                   )}
-
-                                  {/* Totals */}
                                   <tr style={{ borderTop: "2px solid #e1e3e5" }}>
                                     <td colSpan={hasOnHand ? 5 : 4} style={{ padding: "8px 12px" }}>
                                       <Text variant="headingSm">Total</Text>
@@ -1173,32 +1180,15 @@ export default function PurchaseOrders() {
                             {/* ── Manual SKU add ── */}
                             <Divider />
                             <Text variant="headingSm">Add item by SKU</Text>
-                            <InlineStack gap="200" blockAlign="end">
-                              <div style={{ flex: 1 }}>
-                                <TextField
-                                  label="SKU"
-                                  value={skuSearch[po.id] ?? ""}
-                                  onChange={(val) =>
-                                    setSkuSearch((prev) => ({ ...prev, [po.id]: val }))
-                                  }
-                                  autoComplete="off"
-                                  placeholder="Enter exact SKU..."
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter") handleSkuSearch(po.id, po.supplierId);
-                                  }}
-                                />
-                              </div>
-                              <Button
-                                onClick={() => handleSkuSearch(po.id, po.supplierId)}
-                                loading={
-                                  isSubmitting &&
-                                  fetcher.formData?.get("intent") === "searchSku" &&
-                                  fetcher.formData?.get("poId") === po.id
-                                }
-                              >
-                                Search
-                              </Button>
-                            </InlineStack>
+                            <TextField
+                              label="SKU search"
+                              labelHidden
+                              value={skuSearch[po.id] ?? ""}
+                              onChange={(val) => handleSkuChange(po.id, po.supplierId, val)}
+                              autoComplete="off"
+                              placeholder="Type a SKU to search..."
+                              suffix={isSearching ? <Spinner size="small" /> : undefined}
+                            />
 
                             {skuResult?.error && (
                               <Banner tone="critical">{skuResult.error}</Banner>

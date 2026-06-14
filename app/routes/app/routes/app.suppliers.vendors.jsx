@@ -1,4 +1,4 @@
-import { useLoaderData, useFetcher } from "react-router";
+import { useLoaderData, useFetcher, useNavigate } from "react-router";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import {
@@ -183,6 +183,7 @@ export const action = async ({ request }) => {
 export default function Suppliers() {
   const { suppliers, vendorMap, variantMap } = useLoaderData();
   const fetcher = useFetcher();
+  const navigate = useNavigate();
   const [modalOpen, setModalOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [expandedId, setExpandedId] = useState(null);
@@ -274,7 +275,8 @@ export default function Suppliers() {
               Saved successfully.
             </Banner>
           )}
-<div style={{ marginBottom: "16px" }}>
+
+          <div style={{ marginBottom: "16px" }}>
             <InlineStack align="end">
               <Button onClick={() => navigate("/app/suppliers/vendors")}>
                 Vendor sources

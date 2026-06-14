@@ -70,6 +70,12 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
   });
   if (minmaxRows.length === 0) return [];
 
+  // Get primary designations for this supplier
+  const vendorSuppliers = await db.vendorSupplier.findMany({
+    where: { shop, supplierId, isPrimary: true },
+  });
+  const primaryVendors = new Set(vendorSuppliers.map((vs) => vs.vendorName));
+
   const onHandMap = {};
   let cursor = null;
   let hasMore = true;
@@ -82,7 +88,7 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
             edges {
               node {
                 quantities(names: ["available"]) { quantity }
-                item { variant { id title product { title } } sku }
+                item { variant { id title product { title vendor } } sku }
               }
             }
           }
@@ -101,6 +107,7 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
         productTitle: n.item?.variant?.product?.title ?? "",
         variantTitle: n.item?.variant?.title ?? "",
         sku: n.item?.sku ?? "",
+        vendor: n.item?.variant?.product?.vendor ?? "",
       };
     }
   }
@@ -121,9 +128,11 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
       productTitle: onHand.productTitle,
       variantTitle: onHand.variantTitle,
       sku: onHand.sku,
+      vendor: onHand.vendor,
       supplierCode: skuRec?.supplierCode ?? "",
       qtyOrdered,
       qtyCost: skuRec?.cost ?? 0,
+      isPrimary: primaryVendors.has(onHand.vendor),
     });
   }
   return items;
@@ -133,6 +142,12 @@ async function buildSalesItems(admin, db, shop, supplierId) {
   const supplierSkus = await db.supplierSku.findMany({ where: { shop, supplierId } });
   const variantIds = new Set(supplierSkus.map((s) => s.variantId));
   if (variantIds.size === 0) return [];
+
+  // Get primary designations for this supplier
+  const vendorSuppliers = await db.vendorSupplier.findMany({
+    where: { shop, supplierId, isPrimary: true },
+  });
+  const primaryVendors = new Set(vendorSuppliers.map((vs) => vs.vendorName));
 
   const since = new Date();
   since.setDate(since.getDate() - 30);
@@ -152,7 +167,7 @@ async function buildSalesItems(admin, db, shop, supplierId) {
               lineItems(first: 50) {
                 edges {
                   node {
-                    variant { id title product { title } sku }
+                    variant { id title sku product { title vendor } }
                     quantity
                   }
                 }
@@ -178,6 +193,7 @@ async function buildSalesItems(admin, db, shop, supplierId) {
           productTitle: n.variant?.product?.title ?? "",
           variantTitle: n.variant?.title ?? "",
           sku: n.variant?.sku ?? "",
+          vendor: n.variant?.product?.vendor ?? "",
         };
         salesMap[vid].qty += n.quantity;
       }
@@ -193,9 +209,11 @@ async function buildSalesItems(admin, db, shop, supplierId) {
       productTitle: data.productTitle,
       variantTitle: data.variantTitle,
       sku: data.sku,
+      vendor: data.vendor,
       supplierCode: skuRec?.supplierCode ?? "",
       qtyOrdered: data.qty,
       qtyCost: skuRec?.cost ?? 0,
+      isPrimary: primaryVendors.has(data.vendor),
     });
   }
   return items;
@@ -216,13 +234,24 @@ export const loader = async ({ request }) => {
     orderBy: { name: "asc" },
   });
 
+  // Load primary vendor designations per supplier
+  const vendorSuppliers = await db.vendorSupplier.findMany({
+    where: { shop, isPrimary: true },
+  });
+  // Map: supplierId -> Set of primary vendorNames
+  const primaryVendorMap = {};
+  for (const vs of vendorSuppliers) {
+    if (!primaryVendorMap[vs.supplierId]) primaryVendorMap[vs.supplierId] = new Set();
+    primaryVendorMap[vs.supplierId].add(vs.vendorName);
+  }
+
   const locRes = await admin.graphql(`
     query { locations(first: 10) { edges { node { id name } } } }
   `);
   const locJson = await locRes.json();
   const locations = locJson.data.locations.edges.map((e) => e.node);
 
-  return { purchaseOrders, suppliers, locations, shop };
+  return { purchaseOrders, suppliers, locations, shop, primaryVendorMap };
 };
 
 export const action = async ({ request }) => {
@@ -298,6 +327,83 @@ export const action = async ({ request }) => {
     return { ok: true, regenerated: true };
   }
 
+  if (intent === "searchSku") {
+    const sku = form.get("sku");
+    const supplierId = form.get("supplierId");
+    const poId = form.get("poId");
+
+    // Search Shopify for the variant by SKU
+    const res = await admin.graphql(`
+      query($query: String!) {
+        productVariants(first: 5, query: $query) {
+          edges {
+            node {
+              id
+              sku
+              title
+              product { title vendor }
+              inventoryItem { unitCost { amount } }
+            }
+          }
+        }
+      }
+    `, { variables: { query: `sku:${sku}` } });
+
+    const json = await res.json();
+    const variants = json.data?.productVariants?.edges?.map((e) => e.node) ?? [];
+
+    if (variants.length === 0) return { ok: false, intent: "searchSku", poId, error: "No variant found for that SKU" };
+
+    const variant = variants[0];
+
+    // Look up cost from SupplierSku
+    const skuRec = await db.supplierSku.findFirst({
+      where: { shop, supplierId, variantId: variant.id },
+    });
+
+    return {
+      ok: true,
+      intent: "searchSku",
+      poId,
+      variant: {
+        id: variant.id,
+        sku: variant.sku,
+        productTitle: variant.product?.title ?? "",
+        variantTitle: variant.title === "Default Title" ? "" : variant.title,
+        vendor: variant.product?.vendor ?? "",
+        supplierCode: skuRec?.supplierCode ?? "",
+        cost: skuRec?.cost ?? parseFloat(variant.inventoryItem?.unitCost?.amount ?? 0),
+      },
+    };
+  }
+
+  if (intent === "addItem") {
+    const purchaseOrderId = form.get("purchaseOrderId");
+    const variantId = form.get("variantId");
+    const productTitle = form.get("productTitle");
+    const variantTitle = form.get("variantTitle");
+    const sku = form.get("sku");
+    const supplierCode = form.get("supplierCode") || "";
+    const qtyOrdered = Number(form.get("qtyOrdered")) || 1;
+    const qtyCost = Number(form.get("qtyCost")) || 0;
+
+    await db.purchaseOrderItem.create({
+      data: {
+        purchaseOrderId,
+        variantId,
+        productTitle,
+        variantTitle,
+        sku,
+        supplierCode,
+        qtyOrdered,
+        qtyCost,
+        updatedAt: new Date(),
+      },
+    });
+
+    return { ok: true, intent: "addItem", purchaseOrderId };
+  }
+
   if (intent === "fetchInventory") {
     const locationId = form.get("locationId");
     const variantIds = JSON.parse(form.get("variantIds") || "[]");
@@ -345,10 +451,9 @@ export const action = async ({ request }) => {
     return { ok: true, intent: "fetchInventory", poId, onHand };
   }
 
-  // ── RECEIVE: adjust inventory in Shopify then mark PO received ──────────────
   if (intent === "receive") {
     const id = form.get("id");
-    const receiveQtys = JSON.parse(form.get("receiveQtys")); // { itemId: qty, ... }
+    const receiveQtys = JSON.parse(form.get("receiveQtys"));
 
     const po = await db.purchaseOrder.findUnique({
       where: { id },
@@ -356,11 +461,9 @@ export const action = async ({ request }) => {
     });
     if (!po || !po.locationId) return { ok: false, error: "PO not found or no location set" };
 
-    // Build variantId → inventoryItemId map via Shopify
     const variantIds = po.items.map((i) => i.variantId);
-    const inventoryItemMap = {}; // variantId → inventoryItemId
+    const inventoryItemMap = {};
 
-    // Fetch inventory items for all variants in batches of 50
     for (let i = 0; i < variantIds.length; i += 50) {
       const batch = variantIds.slice(i, i + 50);
       const varRes = await admin.graphql(`
@@ -381,64 +484,39 @@ export const action = async ({ request }) => {
       }
     }
 
-    // Build adjustments array — only items with qty > 0
     const changes = [];
     for (const item of po.items) {
       const qty = Number(receiveQtys[item.id] ?? item.qtyOrdered);
       if (qty <= 0) continue;
       const inventoryItemId = inventoryItemMap[item.variantId];
       if (!inventoryItemId) continue;
-      changes.push({
-        inventoryItemId,
-        locationId: po.locationId,
-        delta: qty,
-      });
+      changes.push({ inventoryItemId, locationId: po.locationId, delta: qty });
     }
 
     if (changes.length === 0) return { ok: false, error: "No items to receive" };
 
-    // Push to Shopify in batches of 100 (API limit)
     const errors = [];
     for (let i = 0; i < changes.length; i += 100) {
       const batch = changes.slice(i, i + 100);
       const adjRes = await admin.graphql(`
         mutation($input: InventoryAdjustQuantitiesInput!) {
           inventoryAdjustQuantities(input: $input) {
-            inventoryAdjustmentGroup {
-              id
-              reason
-              changes {
-                name
-                delta
-              }
-            }
-            userErrors {
-              field
-              message
-            }
+            inventoryAdjustmentGroup { id reason changes { name delta } }
+            userErrors { field message }
           }
         }
       `, {
         variables: {
-          input: {
-            reason: "received",
-            name: "available",
-            changes: batch,
-          },
+          input: { reason: "received", name: "available", changes: batch },
         },
       });
       const adjJson = await adjRes.json();
       const userErrors = adjJson.data?.inventoryAdjustQuantities?.userErrors ?? [];
-      if (userErrors.length > 0) {
-        errors.push(...userErrors.map((e) => e.message));
-      }
+      if (userErrors.length > 0) errors.push(...userErrors.map((e) => e.message));
     }
 
-    if (errors.length > 0) {
-      return { ok: false, intent: "receive", error: errors.join("; ") };
-    }
+    if (errors.length > 0) return { ok: false, intent: "receive", error: errors.join("; ") };
 
-    // Mark PO as received
     await db.purchaseOrder.update({
       where: { id },
       data: { status: "received", updatedAt: new Date() },
@@ -446,7 +524,6 @@ export const action = async ({ request }) => {
 
     return { ok: true, intent: "receive", poId: id };
   }
-  // ────────────────────────────────────────────────────────────────────────────
 
   if (intent === "updateStatus") {
     const id = form.get("id");
@@ -493,7 +570,7 @@ export const action = async ({ request }) => {
 };
 
 export default function PurchaseOrders() {
-  const { purchaseOrders, suppliers, locations } = useLoaderData();
+  const { purchaseOrders, suppliers, locations, primaryVendorMap } = useLoaderData();
   const fetcher = useFetcher();
 
   const [showCreate, setShowCreate] = useState(false);
@@ -505,8 +582,14 @@ export default function PurchaseOrders() {
   const [itemEdits, setItemEdits] = useState({});
   const [removedItems, setRemovedItems] = useState({});
   const [onHandData, setOnHandData] = useState({});
-  const [receiveModal, setReceiveModal] = useState(null); // { po, receiveQtys: { itemId: qty } }
+  const [receiveModal, setReceiveModal] = useState(null);
   const [receiveError, setReceiveError] = useState(null);
+
+  // SKU search state per PO
+  const [skuSearch, setSkuSearch] = useState({});
+  const [skuResults, setSkuResults] = useState({});
+  const [skuQty, setSkuQty] = useState({});
+  const [skuCost, setSkuCost] = useState({});
 
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
@@ -526,6 +609,17 @@ export default function PurchaseOrders() {
       setReceiveError(null);
     } else if (!fetcherData.ok && fetcherData.error) {
       setReceiveError(fetcherData.error);
+    }
+  }
+
+  if (fetcher.state === "idle" && fetcherData?.intent === "searchSku" && fetcherData?.poId) {
+    const poId = fetcherData.poId;
+    if (fetcherData.ok && fetcherData.variant) {
+      setSkuResults((prev) => ({ ...prev, [poId]: fetcherData.variant }));
+      setSkuQty((prev) => ({ ...prev, [poId]: "1" }));
+      setSkuCost((prev) => ({ ...prev, [poId]: String(fetcherData.variant.cost) }));
+    } else if (!fetcherData.ok) {
+      setSkuResults((prev) => ({ ...prev, [poId]: { error: fetcherData.error } }));
     }
   }
 
@@ -660,6 +754,39 @@ export default function PurchaseOrders() {
     fetcher.submit(fd, { method: "post" });
   }
 
+  function handleSkuSearch(poId, supplierId) {
+    const sku = skuSearch[poId]?.trim();
+    if (!sku) return;
+    setSkuResults((prev) => ({ ...prev, [poId]: null }));
+    const fd = new FormData();
+    fd.append("intent", "searchSku");
+    fd.append("sku", sku);
+    fd.append("supplierId", supplierId);
+    fd.append("poId", poId);
+    fetcher.submit(fd, { method: "post" });
+  }
+
+  function handleAddItem(po) {
+    const result = skuResults[po.id];
+    if (!result || result.error) return;
+    const fd = new FormData();
+    fd.append("intent", "addItem");
+    fd.append("purchaseOrderId", po.id);
+    fd.append("variantId", result.id);
+    fd.append("productTitle", result.productTitle);
+    fd.append("variantTitle", result.variantTitle);
+    fd.append("sku", result.sku);
+    fd.append("supplierCode", result.supplierCode);
+    fd.append("qtyOrdered", skuQty[po.id] ?? "1");
+    fd.append("qtyCost", skuCost[po.id] ?? "0");
+    fetcher.submit(fd, { method: "post" });
+    // Clear search state
+    setSkuSearch((prev) => ({ ...prev, [po.id]: "" }));
+    setSkuResults((prev) => ({ ...prev, [po.id]: null }));
+    setSkuQty((prev) => ({ ...prev, [po.id]: "" }));
+    setSkuCost((prev) => ({ ...prev, [po.id]: "" }));
+  }
+
   const supplierOptions = suppliers.map((s) => ({ label: s.name, value: s.id }));
   const locationOptions = locations.map((l) => ({ label: l.name, value: l.id }));
   const locationNameMap = Object.fromEntries(locations.map((l) => [l.id, l.name]));
@@ -675,6 +802,70 @@ export default function PurchaseOrders() {
     { label: "Received", value: "received" },
     { label: "Cancelled", value: "cancelled" },
   ];
+
+  function renderItemRow(item, po, poEdits, poRemoved, hasOnHand, poOnHand) {
+    const qty = poEdits[item.id]?.qtyOrdered !== undefined
+      ? poEdits[item.id].qtyOrdered
+      : String(item.qtyOrdered);
+    const supplierCode = poEdits[item.id]?.supplierCode !== undefined
+      ? poEdits[item.id].supplierCode
+      : (item.supplierCode ?? "");
+    const lineTotal = (Number(qty) * item.qtyCost).toFixed(2);
+    const onHandQty = hasOnHand ? (poOnHand[item.variantId] ?? 0) : null;
+
+    if (item.removed) {
+      return (
+        <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3", opacity: 0.4 }}>
+          <td colSpan={hasOnHand ? 8 : 7} style={{ padding: "8px 12px" }}>
+            <Text tone="subdued"><s>{item.productTitle} — {item.variantTitle}</s></Text>
+          </td>
+          <td style={{ padding: "8px 12px" }}>
+            <Button variant="plain" onClick={() => handleRestoreItem(po.id, item.id)}>Restore</Button>
+          </td>
+        </tr>
+      );
+    }
+
+    return (
+      <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
+        <td style={{ padding: "8px 12px", width: "130px" }}>
+          <TextField
+            label="" labelHidden
+            value={supplierCode}
+            onChange={(val) => handleItemEdit(po.id, item.id, "supplierCode", val)}
+            autoComplete="off"
+            placeholder="—"
+          />
+        </td>
+        <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>
+        <td style={{ padding: "8px 12px" }}><Text>{item.variantTitle}</Text></td>
+        <td style={{ padding: "8px 12px" }}><Text>{item.sku}</Text></td>
+        {hasOnHand && (
+          <td style={{ padding: "8px 12px", width: "80px", textAlign: "center" }}>
+            <Text tone={onHandQty <= 0 ? "critical" : onHandQty < 3 ? "caution" : "success"}>
+              {onHandQty}
+            </Text>
+          </td>
+        )}
+        <td style={{ padding: "8px 12px", width: "100px" }}>
+          <TextField
+            label="" labelHidden
+            type="number"
+            value={qty}
+            onChange={(val) => handleItemEdit(po.id, item.id, "qtyOrdered", val)}
+            autoComplete="off"
+          />
+        </td>
+        <td style={{ padding: "8px 12px" }}><Text>${item.qtyCost.toFixed(2)}</Text></td>
+        <td style={{ padding: "8px 12px" }}><Text>${lineTotal}</Text></td>
+        <td style={{ padding: "8px 12px" }}>
+          <Button variant="plain" tone="critical" onClick={() => handleRemoveItem(po.id, item.id)}>
+            Remove
+          </Button>
+        </td>
+      </tr>
+    );
+  }
 
   return (
     <Page
@@ -746,7 +937,7 @@ export default function PurchaseOrders() {
                     Receiving at: <strong>{locationNameMap[receiveModal.po.locationId] ?? receiveModal.po.locationId}</strong>
                   </Text>
                   <Text tone="subdued">
-                    Adjust quantities below if you received a partial shipment. Each item's on-hand count will be increased by the amount shown.
+                    Adjust quantities below if you received a partial shipment.
                   </Text>
                   {receiveError && <Banner tone="critical">{receiveError}</Banner>}
                   <div style={{ overflowX: "auto" }}>
@@ -814,6 +1005,9 @@ export default function PurchaseOrders() {
             const locationLabel = po.locationId ? (locationNameMap[po.locationId] ?? "") : null;
             const canReceive = po.status !== "received" && po.status !== "cancelled" && po.items.length > 0 && po.locationId;
 
+            // Determine primary vendors for this PO's supplier
+            const primaryVendors = primaryVendorMap[po.supplierId] ?? new Set();
+
             const displayItems = po.items.map((i) => ({
               ...i,
               qtyOrdered: poEdits[i.id]?.qtyOrdered !== undefined ? Number(poEdits[i.id].qtyOrdered) : i.qtyOrdered,
@@ -824,6 +1018,21 @@ export default function PurchaseOrders() {
             const activeItems = displayItems.filter((i) => !i.removed);
             const totalCost = activeItems.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0);
             const totalUnits = activeItems.reduce((s, i) => s + i.qtyOrdered, 0);
+
+            // Split into primary and secondary based on vendor designation
+            // Items without vendor info go to primary by default
+            const primaryItems = displayItems.filter((i) =>
+              primaryVendors.size === 0 || primaryVendors.has(i.vendor) || !i.vendor
+            );
+            const secondaryItems = displayItems.filter((i) =>
+              primaryVendors.size > 0 && !primaryVendors.has(i.vendor) && i.vendor
+            );
+
+            const tableHeaders = ["Supplier Code", "Product", "Variant", "SKU",
+              ...(hasOnHand ? ["On Hand"] : []),
+              "Qty", "Unit Cost", "Line Total", ""];
+
+            const skuResult = skuResults[po.id];
 
             return (
               <div key={po.id} style={{ marginBottom: "1rem" }}>
@@ -904,9 +1113,7 @@ export default function PurchaseOrders() {
                               <table style={{ width: "100%", borderCollapse: "collapse" }}>
                                 <thead>
                                   <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                                    {["Supplier Code", "Product", "Variant", "SKU",
-                                      ...(hasOnHand ? ["On Hand"] : []),
-                                      "Qty", "Unit Cost", "Line Total", ""].map((h, i) => (
+                                    {tableHeaders.map((h, i) => (
                                       <th key={i} style={{ padding: "8px 12px", textAlign: "left" }}>
                                         <Text variant="headingSm">{h}</Text>
                                       </th>
@@ -914,69 +1121,34 @@ export default function PurchaseOrders() {
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {displayItems.map((item) => {
-                                    const qty = poEdits[item.id]?.qtyOrdered !== undefined
-                                      ? poEdits[item.id].qtyOrdered
-                                      : String(item.qtyOrdered);
-                                    const supplierCode = poEdits[item.id]?.supplierCode !== undefined
-                                      ? poEdits[item.id].supplierCode
-                                      : (item.supplierCode ?? "");
-                                    const lineTotal = (Number(qty) * item.qtyCost).toFixed(2);
-                                    const onHandQty = hasOnHand ? (poOnHand[item.variantId] ?? 0) : null;
+                                  {/* Primary items */}
+                                  {primaryItems.map((item) =>
+                                    renderItemRow(item, po, poEdits, poRemoved, hasOnHand, poOnHand)
+                                  )}
 
-                                    if (item.removed) {
-                                      return (
-                                        <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3", opacity: 0.4 }}>
-                                          <td colSpan={hasOnHand ? 8 : 7} style={{ padding: "8px 12px" }}>
-                                            <Text tone="subdued"><s>{item.productTitle} — {item.variantTitle}</s></Text>
-                                          </td>
-                                          <td style={{ padding: "8px 12px" }}>
-                                            <Button variant="plain" onClick={() => handleRestoreItem(po.id, item.id)}>Restore</Button>
-                                          </td>
-                                        </tr>
-                                      );
-                                    }
-
-                                    return (
-                                      <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
-                                        <td style={{ padding: "8px 12px", width: "130px" }}>
-                                          <TextField
-                                            label="" labelHidden
-                                            value={supplierCode}
-                                            onChange={(val) => handleItemEdit(po.id, item.id, "supplierCode", val)}
-                                            autoComplete="off"
-                                            placeholder="—"
-                                          />
-                                        </td>
-                                        <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>
-                                        <td style={{ padding: "8px 12px" }}><Text>{item.variantTitle}</Text></td>
-                                        <td style={{ padding: "8px 12px" }}><Text>{item.sku}</Text></td>
-                                        {hasOnHand && (
-                                          <td style={{ padding: "8px 12px", width: "80px", textAlign: "center" }}>
-                                            <Text tone={onHandQty <= 0 ? "critical" : onHandQty < 3 ? "caution" : "success"}>
-                                              {onHandQty}
+                                  {/* Secondary/backup items */}
+                                  {secondaryItems.length > 0 && (
+                                    <>
+                                      <tr>
+                                        <td
+                                          colSpan={tableHeaders.length}
+                                          style={{ padding: "12px 12px 6px", background: "#f6f6f7" }}
+                                        >
+                                          <InlineStack gap="200" blockAlign="center">
+                                            <Text variant="headingSm" tone="subdued">
+                                              Backup / Secondary source
                                             </Text>
-                                          </td>
-                                        )}
-                                        <td style={{ padding: "8px 12px", width: "100px" }}>
-                                          <TextField
-                                            label="" labelHidden
-                                            type="number"
-                                            value={qty}
-                                            onChange={(val) => handleItemEdit(po.id, item.id, "qtyOrdered", val)}
-                                            autoComplete="off"
-                                          />
-                                        </td>
-                                        <td style={{ padding: "8px 12px" }}><Text>${item.qtyCost.toFixed(2)}</Text></td>
-                                        <td style={{ padding: "8px 12px" }}><Text>${lineTotal}</Text></td>
-                                        <td style={{ padding: "8px 12px" }}>
-                                          <Button variant="plain" tone="critical" onClick={() => handleRemoveItem(po.id, item.id)}>
-                                            Remove
-                                          </Button>
+                                            <Badge tone="warning">Not primary</Badge>
+                                          </InlineStack>
                                         </td>
                                       </tr>
-                                    );
-                                  })}
+                                      {secondaryItems.map((item) =>
+                                        renderItemRow(item, po, poEdits, poRemoved, hasOnHand, poOnHand)
+                                      )}
+                                    </>
+                                  )}
+
+                                  {/* Totals row */}
                                   <tr style={{ borderTop: "2px solid #e1e3e5" }}>
                                     <td colSpan={hasOnHand ? 5 : 4} style={{ padding: "8px 12px" }}>
                                       <Text variant="headingSm">Total</Text>
@@ -998,6 +1170,79 @@ export default function PurchaseOrders() {
                               <InlineStack align="end">
                                 <Button variant="primary" onClick={() => handleSaveItems(po)}>Save changes</Button>
                               </InlineStack>
+                            )}
+
+                            {/* ── Manual SKU add ── */}
+                            <Divider />
+                            <Text variant="headingSm">Add item by SKU</Text>
+                            <InlineStack gap="200" blockAlign="end">
+                              <div style={{ flex: 1 }}>
+                                <TextField
+                                  label="SKU"
+                                  value={skuSearch[po.id] ?? ""}
+                                  onChange={(val) => setSkuSearch((prev) => ({ ...prev, [po.id]: val }))}
+                                  autoComplete="off"
+                                  placeholder="Enter exact SKU..."
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") handleSkuSearch(po.id, po.supplierId);
+                                  }}
+                                />
+                              </div>
+                              <Button
+                                onClick={() => handleSkuSearch(po.id, po.supplierId)}
+                                loading={isSubmitting && fetcher.formData?.get("intent") === "searchSku"}
+                              >
+                                Search
+                              </Button>
+                            </InlineStack>
+
+                            {skuResult?.error && (
+                              <Banner tone="critical">{skuResult.error}</Banner>
+                            )}
+
+                            {skuResult && !skuResult.error && (
+                              <Card>
+                                <BlockStack gap="300">
+                                  <InlineStack align="space-between">
+                                    <BlockStack gap="100">
+                                      <Text fontWeight="semibold">{skuResult.productTitle}</Text>
+                                      <Text tone="subdued">{skuResult.variantTitle} · {skuResult.sku}</Text>
+                                      {skuResult.supplierCode && (
+                                        <Text tone="subdued">Supplier code: {skuResult.supplierCode}</Text>
+                                      )}
+                                    </BlockStack>
+                                  </InlineStack>
+                                  <InlineStack gap="300" blockAlign="end">
+                                    <div style={{ width: "100px" }}>
+                                      <TextField
+                                        label="Qty"
+                                        type="number"
+                                        value={skuQty[po.id] ?? "1"}
+                                        onChange={(val) => setSkuQty((prev) => ({ ...prev, [po.id]: val }))}
+                                        autoComplete="off"
+                                        min="1"
+                                      />
+                                    </div>
+                                    <div style={{ width: "120px" }}>
+                                      <TextField
+                                        label="Unit cost"
+                                        type="number"
+                                        prefix="$"
+                                        value={skuCost[po.id] ?? "0"}
+                                        onChange={(val) => setSkuCost((prev) => ({ ...prev, [po.id]: val }))}
+                                        autoComplete="off"
+                                      />
+                                    </div>
+                                    <Button
+                                      variant="primary"
+                                      onClick={() => handleAddItem(po)}
+                                      loading={isSubmitting && fetcher.formData?.get("intent") === "addItem"}
+                                    >
+                                      Add to PO
+                                    </Button>
+                                  </InlineStack>
+                                </BlockStack>
+                              </Card>
                             )}
                           </BlockStack>
                         )}

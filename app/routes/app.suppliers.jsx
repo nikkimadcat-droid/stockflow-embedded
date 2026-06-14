@@ -1,4 +1,4 @@
-import { useLoaderData, useFetcher, useNavigate } from "react-router";
+import { useLoaderData, useFetcher, useNavigate, useSearchParams } from "react-router";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import {
@@ -16,6 +16,7 @@ import {
   Select,
   Banner,
   Divider,
+  RadioButton,
 } from "@shopify/polaris";
 import { useState } from "react";
 
@@ -23,11 +24,43 @@ export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
 
+  const url = new URL(request.url);
+  const view = url.searchParams.get("view");
+
   const suppliers = await prisma.supplier.findMany({
     where: { shop },
     include: { skus: true },
     orderBy: { name: "asc" },
   });
+
+  const supplierLookup = {};
+  for (const s of suppliers) supplierLookup[s.id] = s.name;
+
+  if (view === "vendors") {
+    const supplierSkuGroups = await prisma.supplierSku.findMany({
+      where: { shop },
+      select: { vendorName: true, supplierId: true },
+      distinct: ["vendorName", "supplierId"],
+      orderBy: { vendorName: "asc" },
+    });
+
+    const vendorSupplierMap = {};
+    for (const row of supplierSkuGroups) {
+      if (!row.vendorName) continue;
+      if (!vendorSupplierMap[row.vendorName]) vendorSupplierMap[row.vendorName] = [];
+      if (!vendorSupplierMap[row.vendorName].includes(row.supplierId)) {
+        vendorSupplierMap[row.vendorName].push(row.supplierId);
+      }
+    }
+
+    const vendorSuppliers = await prisma.vendorSupplier.findMany({ where: { shop } });
+    const primaryMap = {};
+    for (const vs of vendorSuppliers) {
+      if (vs.isPrimary) primaryMap[vs.vendorName] = vs.supplierId;
+    }
+
+    return { view: "vendors", suppliers, supplierLookup, vendorSupplierMap, primaryMap };
+  }
 
   const vendorMap = {};
   const variantMap = {};
@@ -91,7 +124,7 @@ export const loader = async ({ request }) => {
     cursor = page.pageInfo.endCursor;
   }
 
-  return { suppliers, vendorMap, variantMap };
+  return { view: "suppliers", suppliers, supplierLookup, vendorMap, variantMap };
 };
 
 export const action = async ({ request }) => {
@@ -116,7 +149,6 @@ export const action = async ({ request }) => {
   if (intent === "add_by_vendor") {
     const supplierId = formData.get("supplierId");
     const variants = JSON.parse(formData.get("variants"));
-
     for (const v of variants) {
       await prisma.supplierSku.upsert({
         where: {
@@ -166,7 +198,6 @@ export const action = async ({ request }) => {
         },
       });
     }
-
     return { ok: true };
   }
 
@@ -177,18 +208,167 @@ export const action = async ({ request }) => {
     return { ok: true };
   }
 
+  if (intent === "set_primary") {
+    const vendorName = formData.get("vendorName");
+    const supplierId = formData.get("supplierId");
+
+    const skuSuppliers = await prisma.supplierSku.findMany({
+      where: { shop, vendorName },
+      select: { supplierId: true },
+      distinct: ["supplierId"],
+    });
+
+    for (const { supplierId: sid } of skuSuppliers) {
+      await prisma.vendorSupplier.upsert({
+        where: {
+          shop_vendorName_supplierId: { shop, vendorName, supplierId: sid },
+        },
+        update: { isPrimary: sid === supplierId },
+        create: { shop, vendorName, supplierId: sid, isPrimary: sid === supplierId },
+      });
+    }
+    return { ok: true };
+  }
+
   return { ok: false };
 };
 
 export default function Suppliers() {
-  const { suppliers, vendorMap, variantMap } = useLoaderData();
+  const data = useLoaderData();
   const fetcher = useFetcher();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+
   const [modalOpen, setModalOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [expandedId, setExpandedId] = useState(null);
   const [selectedVendor, setSelectedVendor] = useState("");
   const [skuEdits, setSkuEdits] = useState({});
+  const [vendorSearch, setVendorSearch] = useState("");
+
+  const saved = fetcher.state === "idle" && fetcher.data?.ok;
+
+  // ── Vendor sources view ──────────────────────────────────────────────
+  if (data.view === "vendors") {
+    const { vendorSupplierMap, primaryMap, supplierLookup } = data;
+
+    const handleSetPrimary = (vendorName, supplierId) => {
+      const form = new FormData();
+      form.append("intent", "set_primary");
+      form.append("vendorName", vendorName);
+      form.append("supplierId", supplierId);
+      fetcher.submit(form, { method: "POST" });
+    };
+
+    const filteredVendors = Object.entries(vendorSupplierMap)
+      .filter(([v]) => v.toLowerCase().includes(vendorSearch.toLowerCase()))
+      .sort(([a], [b]) => a.localeCompare(b));
+
+    const totalVendors = Object.keys(vendorSupplierMap).length;
+    const assignedVendors = Object.keys(primaryMap).length;
+
+    return (
+      <Page
+        title="Vendor Sources"
+        backAction={{
+          content: "Suppliers",
+          onAction: () => navigate("/app/suppliers"),
+        }}
+      >
+        <Layout>
+          <Layout.Section>
+            {saved && (
+              <Banner tone="success" onDismiss={() => {}}>
+                Primary supplier saved.
+              </Banner>
+            )}
+            <Card>
+              <BlockStack gap="400">
+                <InlineStack align="space-between">
+                  <BlockStack gap="100">
+                    <Text variant="headingMd">Primary supplier by vendor</Text>
+                    <Text variant="bodySm" tone="subdued">
+                      Set which distributor is the primary source for each vendor.
+                      All others are treated as secondary.
+                    </Text>
+                  </BlockStack>
+                  <Badge>{assignedVendors}/{totalVendors} assigned</Badge>
+                </InlineStack>
+
+                <TextField
+                  label="Search vendors"
+                  value={vendorSearch}
+                  onChange={setVendorSearch}
+                  placeholder="Type to filter..."
+                  autoComplete="off"
+                  clearButton
+                  onClearButtonClick={() => setVendorSearch("")}
+                />
+
+                {filteredVendors.length === 0 ? (
+                  <Text tone="subdued">No vendors found.</Text>
+                ) : (
+                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead>
+                      <tr style={{ borderBottom: "2px solid #e1e3e5" }}>
+                        {["Vendor", "Primary supplier", "All distributors"].map((h) => (
+                          <th key={h} style={{ padding: "8px 12px", textAlign: "left" }}>
+                            <Text variant="headingSm">{h}</Text>
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredVendors.map(([vendorName, supplierIds]) => {
+                        const currentPrimary = primaryMap[vendorName] ?? "";
+                        return (
+                          <tr key={vendorName} style={{ borderBottom: "1px solid #f1f2f3" }}>
+                            <td style={{ padding: "12px 12px", verticalAlign: "top", whiteSpace: "nowrap", width: "200px" }}>
+                              <Text fontWeight="semibold">{vendorName}</Text>
+                            </td>
+                            <td style={{ padding: "12px 12px", verticalAlign: "top" }}>
+                              <BlockStack gap="100">
+                                {supplierIds.map((sid) => (
+                                  <RadioButton
+                                    key={sid}
+                                    label={supplierLookup[sid] ?? sid}
+                                    checked={currentPrimary === sid}
+                                    id={`${vendorName}-${sid}`}
+                                    name={`primary-${vendorName}`}
+                                    onChange={() => handleSetPrimary(vendorName, sid)}
+                                  />
+                                ))}
+                              </BlockStack>
+                            </td>
+                            <td style={{ padding: "12px 12px", verticalAlign: "top" }}>
+                              <BlockStack gap="100">
+                                {supplierIds.map((sid) => (
+                                  <Text
+                                    key={sid}
+                                    tone={sid === currentPrimary ? "success" : "subdued"}
+                                  >
+                                    {supplierLookup[sid] ?? sid}
+                                    {sid === currentPrimary ? " ★" : ""}
+                                  </Text>
+                                ))}
+                              </BlockStack>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+        </Layout>
+      </Page>
+    );
+  }
+
+  // ── Suppliers view ───────────────────────────────────────────────────
+  const { suppliers, vendorMap, variantMap } = data;
 
   const vendors = Object.keys(vendorMap).sort();
   const vendorOptions = [
@@ -257,8 +437,6 @@ export default function Suppliers() {
     fetcher.submit(form, { method: "POST" });
   };
 
-  const saved = fetcher.state === "idle" && fetcher.data?.ok;
-
   return (
     <Page
       title="Suppliers"
@@ -267,6 +445,12 @@ export default function Suppliers() {
           Add supplier
         </Button>
       }
+      secondaryActions={[
+        {
+          content: "Vendor sources",
+          onAction: () => navigate("/app/suppliers?view=vendors"),
+        },
+      ]}
     >
       <Layout>
         <Layout.Section>
@@ -275,14 +459,6 @@ export default function Suppliers() {
               Saved successfully.
             </Banner>
           )}
-
-          <div style={{ marginBottom: "16px" }}>
-            <InlineStack align="end">
-              <Button onClick={() => navigate("/app/suppliers/vendors")}>
-                Vendor sources
-              </Button>
-            </InlineStack>
-          </div>
 
           {suppliers.length === 0 ? (
             <Card>
@@ -343,28 +519,14 @@ export default function Suppliers() {
                               Linked SKUs ({s.skus.length})
                             </Text>
                             <table
-                              style={{
-                                width: "100%",
-                                borderCollapse: "collapse",
-                              }}
+                              style={{ width: "100%", borderCollapse: "collapse" }}
                             >
                               <thead>
-                                <tr
-                                  style={{ borderBottom: "1px solid #e1e3e5" }}
-                                >
-                                  {[
-                                    "SKU",
-                                    "Product",
-                                    "Supplier Code",
-                                    "Cost",
-                                    "",
-                                  ].map((h) => (
+                                <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
+                                  {["SKU", "Product", "Supplier Code", "Cost", ""].map((h) => (
                                     <th
                                       key={h}
-                                      style={{
-                                        padding: "8px 12px",
-                                        textAlign: "left",
-                                      }}
+                                      style={{ padding: "8px 12px", textAlign: "left" }}
                                     >
                                       <Text variant="headingSm">{h}</Text>
                                     </th>
@@ -373,17 +535,13 @@ export default function Suppliers() {
                               </thead>
                               <tbody>
                                 {s.skus.map((sku) => {
-                                  const variant =
-                                    variantMap[sku.variantId] ?? {};
+                                  const variant = variantMap[sku.variantId] ?? {};
                                   const edits = skuEdits[sku.id] ?? {};
-                                  const isDirty =
-                                    Object.keys(edits).length > 0;
+                                  const isDirty = Object.keys(edits).length > 0;
                                   return (
                                     <tr
                                       key={sku.id}
-                                      style={{
-                                        borderBottom: "1px solid #f1f2f3",
-                                      }}
+                                      style={{ borderBottom: "1px solid #f1f2f3" }}
                                     >
                                       <td style={{ padding: "8px 12px" }}>
                                         <Text>{variant.sku || "—"}</Text>
@@ -391,67 +549,38 @@ export default function Suppliers() {
                                       <td style={{ padding: "8px 12px" }}>
                                         <Text>{variant.title || "—"}</Text>
                                       </td>
-                                      <td
-                                        style={{
-                                          padding: "8px 12px",
-                                          width: "150px",
-                                        }}
-                                      >
+                                      <td style={{ padding: "8px 12px", width: "150px" }}>
                                         <TextField
                                           label=""
                                           labelHidden
-                                          value={
-                                            edits.supplierCode ??
-                                            sku.supplierCode ??
-                                            ""
-                                          }
+                                          value={edits.supplierCode ?? sku.supplierCode ?? ""}
                                           onChange={(val) =>
-                                            handleSkuEdit(
-                                              sku.id,
-                                              "supplierCode",
-                                              val
-                                            )
+                                            handleSkuEdit(sku.id, "supplierCode", val)
                                           }
                                           autoComplete="off"
                                         />
                                       </td>
-                                      <td
-                                        style={{
-                                          padding: "8px 12px",
-                                          width: "120px",
-                                        }}
-                                      >
+                                      <td style={{ padding: "8px 12px", width: "120px" }}>
                                         <TextField
                                           label=""
                                           labelHidden
                                           type="number"
                                           prefix="$"
-                                          value={String(
-                                            edits.cost ?? sku.cost ?? 0
-                                          )}
+                                          value={String(edits.cost ?? sku.cost ?? 0)}
                                           onChange={(val) =>
                                             handleSkuEdit(sku.id, "cost", val)
                                           }
                                           autoComplete="off"
                                         />
                                       </td>
-                                      <td
-                                        style={{
-                                          padding: "8px 12px",
-                                          textAlign: "right",
-                                        }}
-                                      >
+                                      <td style={{ padding: "8px 12px", textAlign: "right" }}>
                                         <InlineStack gap="200">
                                           {isDirty && (
                                             <Button
                                               size="slim"
                                               variant="primary"
-                                              onClick={() =>
-                                                handleSkuSave(sku)
-                                              }
-                                              loading={
-                                                fetcher.state !== "idle"
-                                              }
+                                              onClick={() => handleSkuSave(sku)}
+                                              loading={fetcher.state !== "idle"}
                                             >
                                               Save
                                             </Button>
@@ -460,10 +589,7 @@ export default function Suppliers() {
                                             size="slim"
                                             tone="critical"
                                             onClick={() =>
-                                              handleRemoveSku(
-                                                s.id,
-                                                sku.variantId
-                                              )
+                                              handleRemoveSku(s.id, sku.variantId)
                                             }
                                           >
                                             Remove

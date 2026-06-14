@@ -60,6 +60,13 @@ function downloadCSV(po, onHandMap) {
   URL.revokeObjectURL(url);
 }
 
+// Helper: pick best SupplierSku record for a variantId (prefer non-empty supplierCode)
+function bestSkuRec(supplierSkus, variantId) {
+  const matches = supplierSkus.filter((s) => s.variantId === variantId);
+  if (matches.length === 0) return null;
+  return matches.sort((a, b) => (b.supplierCode ? 1 : 0) - (a.supplierCode ? 1 : 0))[0];
+}
+
 async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
   const supplierSkus = await db.supplierSku.findMany({ where: { shop, supplierId } });
   const variantIds = supplierSkus.map((s) => s.variantId);
@@ -115,7 +122,7 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
     const qtyOrdered = mm.casePackSize > 1
       ? Math.ceil(needed / mm.casePackSize) * mm.casePackSize
       : needed;
-    const skuRec = supplierSkus.find((s) => s.variantId === mm.variantId);
+    const skuRec = bestSkuRec(supplierSkus, mm.variantId);
     items.push({
       variantId: mm.variantId,
       productTitle: onHand.productTitle,
@@ -187,7 +194,7 @@ async function buildSalesItems(admin, db, shop, supplierId) {
   const items = [];
   for (const [variantId, data] of Object.entries(salesMap)) {
     if (data.qty === 0) continue;
-    const skuRec = supplierSkus.find((s) => s.variantId === variantId);
+    const skuRec = bestSkuRec(supplierSkus, variantId);
     items.push({
       variantId,
       productTitle: data.productTitle,
@@ -327,7 +334,15 @@ export const action = async ({ request }) => {
       where: { shop, supplierId },
       select: { variantId: true, supplierCode: true, cost: true },
     });
-    const supplierSkuMap = new Map(supplierSkus.map((s) => [s.variantId, s]));
+
+    // Build map preferring records with non-empty supplierCode
+    const supplierSkuMap = new Map();
+    for (const s of supplierSkus) {
+      const existing = supplierSkuMap.get(s.variantId);
+      if (!existing || (!existing.supplierCode && s.supplierCode)) {
+        supplierSkuMap.set(s.variantId, s);
+      }
+    }
 
     if (supplierSkuMap.size === 0) {
       return { ok: true, intent: "searchProducts", poId, results: [] };

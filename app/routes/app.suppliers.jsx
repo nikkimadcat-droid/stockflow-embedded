@@ -1,4 +1,4 @@
-import { useLoaderData, useFetcher, useNavigate } from "react-router";
+import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import {
@@ -119,7 +119,13 @@ export const action = async ({ request }) => {
 
     for (const v of variants) {
       await prisma.supplierSku.upsert({
-        where: { supplierId_variantId_vendorName: { supplierId, variantId: v.id, vendorName: "" } },
+        where: {
+          supplierId_variantId_vendorName: {
+            supplierId,
+            variantId: v.id,
+            vendorName: "",
+          },
+        },
         update: { cost: v.cost, supplierCode: v.sku || "" },
         create: {
           shop,
@@ -177,7 +183,6 @@ export const action = async ({ request }) => {
 export default function Suppliers() {
   const { suppliers, vendorMap, variantMap } = useLoaderData();
   const fetcher = useFetcher();
-  const navigate = useNavigate();
   const [modalOpen, setModalOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [expandedId, setExpandedId] = useState(null);
@@ -261,12 +266,6 @@ export default function Suppliers() {
           Add supplier
         </Button>
       }
-      secondaryActions={[
-        {
-          content: "Vendor sources",
-          onAction: () => navigate("/app/suppliers/vendors"),
-        },
-      ]}
     >
       <Layout>
         <Layout.Section>
@@ -275,6 +274,28 @@ export default function Suppliers() {
               Saved successfully.
             </Banner>
           )}
+
+          <div style={{ marginBottom: "16px" }}>
+            <InlineStack align="end">
+              <a
+                href="https://admin.shopify.com/store/felineunderground/apps/madcatstockflow/app/suppliers/vendors"
+                style={{
+                  display: "inline-block",
+                  padding: "8px 16px",
+                  background: "#ffffff",
+                  border: "1px solid #8c9196",
+                  borderRadius: "6px",
+                  color: "#202223",
+                  textDecoration: "none",
+                  fontSize: "14px",
+                  fontWeight: "500",
+                  cursor: "pointer",
+                }}
+              >
+                Vendor sources
+              </a>
+            </InlineStack>
+          </div>
 
           {suppliers.length === 0 ? (
             <Card>
@@ -344,32 +365,26 @@ export default function Suppliers() {
                                 <tr
                                   style={{ borderBottom: "1px solid #e1e3e5" }}
                                 >
-                                  {[
-                                    "SKU",
-                                    "Product",
-                                    "Supplier Code",
-                                    "Cost",
-                                    "",
-                                  ].map((h) => (
-                                    <th
-                                      key={h}
-                                      style={{
-                                        padding: "8px 12px",
-                                        textAlign: "left",
-                                      }}
-                                    >
-                                      <Text variant="headingSm">{h}</Text>
-                                    </th>
-                                  ))}
+                                  {["SKU", "Product", "Supplier Code", "Cost", ""].map(
+                                    (h) => (
+                                      <th
+                                        key={h}
+                                        style={{
+                                          padding: "8px 12px",
+                                          textAlign: "left",
+                                        }}
+                                      >
+                                        <Text variant="headingSm">{h}</Text>
+                                      </th>
+                                    )
+                                  )}
                                 </tr>
                               </thead>
                               <tbody>
                                 {s.skus.map((sku) => {
-                                  const variant =
-                                    variantMap[sku.variantId] ?? {};
+                                  const variant = variantMap[sku.variantId] ?? {};
                                   const edits = skuEdits[sku.id] ?? {};
-                                  const isDirty =
-                                    Object.keys(edits).length > 0;
+                                  const isDirty = Object.keys(edits).length > 0;
                                   return (
                                     <tr
                                       key={sku.id}
@@ -438,12 +453,8 @@ export default function Suppliers() {
                                             <Button
                                               size="slim"
                                               variant="primary"
-                                              onClick={() =>
-                                                handleSkuSave(sku)
-                                              }
-                                              loading={
-                                                fetcher.state !== "idle"
-                                              }
+                                              onClick={() => handleSkuSave(sku)}
+                                              loading={fetcher.state !== "idle"}
                                             >
                                               Save
                                             </Button>
@@ -452,10 +463,7 @@ export default function Suppliers() {
                                             size="slim"
                                             tone="critical"
                                             onClick={() =>
-                                              handleRemoveSku(
-                                                s.id,
-                                                sku.variantId
-                                              )
+                                              handleRemoveSku(s.id, sku.variantId)
                                             }
                                           >
                                             Remove

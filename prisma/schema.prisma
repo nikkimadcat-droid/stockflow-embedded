@@ -41,12 +41,13 @@ model MinMax {
 }
 
 model Supplier {
-  id        String          @id @default(cuid())
-  shop      String
-  name      String
-  createdAt DateTime        @default(now())
-  skus      SupplierSku[]
-  orders    PurchaseOrder[]
+  id              String           @id @default(cuid())
+  shop            String
+  name            String
+  createdAt       DateTime         @default(now())
+  skus            SupplierSku[]
+  orders          PurchaseOrder[]
+  vendorSuppliers VendorSupplier[]
 }
 
 model Vendor {
@@ -54,6 +55,19 @@ model Vendor {
   shop      String
   name      String
   createdAt DateTime @default(now())
+}
+
+model VendorSupplier {
+  id         String   @id @default(cuid())
+  shop       String
+  vendorName String
+  supplierId String
+  supplier   Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  isPrimary  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([shop, vendorName, supplierId])
 }
 
 model SupplierSku {
@@ -122,17 +136,17 @@ model TransferTemplateVendor {
 }
 
 model Transfer {
-  id             String         @id @default(cuid())
+  id             String            @id @default(cuid())
   shop           String
   transferNumber String
   templateId     String?
   template       TransferTemplate? @relation(fields: [templateId], references: [id])
   fromLocationId String
   toLocationId   String
-  status         String         @default("draft")
+  status         String            @default("draft")
   notes          String?
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
   items          TransferItem[]
 }
 

@@ -97,14 +97,27 @@ async function main() {
   let skusSkippedNoCost = 0;
 
   for (const entry of data) {
-    // Split "Distributor - Vendor" naming convention
-    let supplierName = entry.supplier;
-    let vendorName = "";
-    const dashIdx = supplierName.indexOf(" - ");
-    if (dashIdx !== -1) {
-      vendorName = supplierName.substring(dashIdx + 3);
-      supplierName = supplierName.substring(0, dashIdx);
+    if (!entry.supplier) {
+      console.log("Skipping batch with null supplier");
+      continue;
     }
+
+    let supplierName = entry.supplier;
+    let vendorName = entry.vendor || "";
+
+    // Fallback: split "Distributor - Vendor" naming convention if no
+    // explicit vendor field was provided
+    if (!vendorName) {
+      const dashIdx = supplierName.indexOf(" - ");
+      if (dashIdx !== -1) {
+        vendorName = supplierName.substring(dashIdx + 3);
+        supplierName = supplierName.substring(0, dashIdx);
+      }
+    }
+
+    // Normalize known naming inconsistencies
+    if (supplierName === "Middlewest Distributors") supplierName = "Middle West Distributors";
+    if (vendorName === "pfX") vendorName = "PFX";
 
     // Find or create Supplier
     let supplier = await prisma.supplier.findFirst({
@@ -168,7 +181,7 @@ async function main() {
 
     suppliersProcessed++;
     console.log(
-      `${entry.supplier}: ${matchedCount}/${totalCount} matched${vendorName ? ` (vendor: ${vendorName})` : ""}`
+      `${supplierName}: ${matchedCount}/${totalCount} matched${vendorName ? ` (vendor: ${vendorName})` : ""}`
     );
   }
 

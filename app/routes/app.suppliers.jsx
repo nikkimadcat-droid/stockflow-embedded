@@ -16,6 +16,7 @@ import {
   Select,
   Banner,
   Divider,
+  RadioButton,
 } from "@shopify/polaris";
 import { useState } from "react";
 
@@ -28,6 +29,35 @@ export const loader = async ({ request }) => {
     include: { skus: true },
     orderBy: { name: "asc" },
   });
+
+  // Get all distinct vendorName -> supplierId combos from SupplierSku
+  const supplierSkuGroups = await prisma.supplierSku.findMany({
+    where: { shop },
+    select: { vendorName: true, supplierId: true },
+    distinct: ["vendorName", "supplierId"],
+    orderBy: { vendorName: "asc" },
+  });
+
+  // Group by vendorName
+  const vendorSupplierMap = {};
+  for (const row of supplierSkuGroups) {
+    if (!row.vendorName) continue;
+    if (!vendorSupplierMap[row.vendorName]) vendorSupplierMap[row.vendorName] = [];
+    vendorSupplierMap[row.vendorName].push(row.supplierId);
+  }
+
+  // Get existing primary designations
+  const vendorSuppliers = await prisma.vendorSupplier.findMany({
+    where: { shop },
+  });
+  const primaryMap = {};
+  for (const vs of vendorSuppliers) {
+    if (vs.isPrimary) primaryMap[vs.vendorName] = vs.supplierId;
+  }
+
+  // Build supplier id->name lookup
+  const supplierLookup = {};
+  for (const s of suppliers) supplierLookup[s.id] = s.name;
 
   const vendorMap = {};
   const variantMap = {};
@@ -64,7 +94,6 @@ export const loader = async ({ request }) => {
 
     const vendorData = await vendorResponse.json();
     const page = vendorData.data.products;
-    console.log("Sample variant:", JSON.stringify(page.edges[0]?.node?.variants?.edges[0]?.node, null, 2));
 
     for (const { node: p } of page.edges) {
       if (!p.vendor) continue;
@@ -92,7 +121,14 @@ export const loader = async ({ request }) => {
     cursor = page.pageInfo.endCursor;
   }
 
-  return { suppliers, vendorMap, variantMap };
+  return {
+    suppliers,
+    vendorMap,
+    variantMap,
+    vendorSupplierMap,
+    primaryMap,
+    supplierLookup,
+  };
 };
 
 export const action = async ({ request }) => {
@@ -172,22 +208,53 @@ export const action = async ({ request }) => {
     return { ok: true };
   }
 
+  if (intent === "set_primary") {
+    const vendorName = formData.get("vendorName");
+    const supplierId = formData.get("supplierId");
+
+    // Get all supplier IDs for this vendor
+    const existing = await prisma.vendorSupplier.findMany({
+      where: { shop, vendorName },
+    });
+    const existingIds = new Set(existing.map((e) => e.supplierId));
+
+    // Get all suppliers that carry this vendor from SupplierSku
+    const skuSuppliers = await prisma.supplierSku.findMany({
+      where: { shop, vendorName },
+      select: { supplierId: true },
+      distinct: ["supplierId"],
+    });
+
+    // Upsert all as non-primary, then set chosen one as primary
+    for (const { supplierId: sid } of skuSuppliers) {
+      await prisma.vendorSupplier.upsert({
+        where: { shop_vendorName_supplierId: { shop, vendorName, supplierId: sid } },
+        update: { isPrimary: sid === supplierId },
+        create: { shop, vendorName, supplierId: sid, isPrimary: sid === supplierId },
+      });
+    }
+
+    return { ok: true };
+  }
+
   return { ok: false };
 };
 
 export default function Suppliers() {
-  const { suppliers, vendorMap, variantMap } = useLoaderData();
+  const { suppliers, vendorMap, variantMap, vendorSupplierMap, primaryMap, supplierLookup } =
+    useLoaderData();
   const fetcher = useFetcher();
   const [modalOpen, setModalOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [expandedId, setExpandedId] = useState(null);
   const [selectedVendor, setSelectedVendor] = useState("");
   const [skuEdits, setSkuEdits] = useState({});
+  const [vendorSearch, setVendorSearch] = useState("");
 
   const vendors = Object.keys(vendorMap).sort();
   const vendorOptions = [
     { label: "Select a vendor...", value: "" },
-    ...vendors.map(v => ({ label: v, value: v })),
+    ...vendors.map((v) => ({ label: v, value: v })),
   ];
 
   const handleAdd = () => {
@@ -220,7 +287,7 @@ export default function Suppliers() {
   };
 
   const handleSkuEdit = (id, field, value) => {
-    setSkuEdits(prev => ({
+    setSkuEdits((prev) => ({
       ...prev,
       [id]: { ...prev[id], [field]: value },
     }));
@@ -236,7 +303,11 @@ export default function Suppliers() {
     form.append("cost", edits.cost ?? sku.cost ?? 0);
     form.append("inventoryItemId", variant.inventoryItemId ?? "");
     fetcher.submit(form, { method: "POST" });
-    setSkuEdits(prev => { const n = { ...prev }; delete n[sku.id]; return n; });
+    setSkuEdits((prev) => {
+      const n = { ...prev };
+      delete n[sku.id];
+      return n;
+    });
   };
 
   const handleRemoveSku = (supplierId, variantId) => {
@@ -247,7 +318,20 @@ export default function Suppliers() {
     fetcher.submit(form, { method: "POST" });
   };
 
+  const handleSetPrimary = (vendorName, supplierId) => {
+    const form = new FormData();
+    form.append("intent", "set_primary");
+    form.append("vendorName", vendorName);
+    form.append("supplierId", supplierId);
+    fetcher.submit(form, { method: "POST" });
+  };
+
   const saved = fetcher.state === "idle" && fetcher.data?.ok;
+
+  // Filter vendor list by search
+  const filteredVendors = Object.entries(vendorSupplierMap)
+    .filter(([v]) => v.toLowerCase().includes(vendorSearch.toLowerCase()))
+    .sort(([a], [b]) => a.localeCompare(b));
 
   return (
     <Page
@@ -265,6 +349,8 @@ export default function Suppliers() {
               Saved successfully.
             </Banner>
           )}
+
+          {/* ── Existing suppliers list ── */}
           {suppliers.length === 0 ? (
             <Card>
               <EmptyState heading="No suppliers yet" image="">
@@ -273,20 +359,26 @@ export default function Suppliers() {
             </Card>
           ) : (
             <BlockStack gap="400">
-              {suppliers.map(s => (
+              {suppliers.map((s) => (
                 <Card key={s.id}>
                   <BlockStack gap="400">
                     <InlineStack align="space-between">
                       <InlineStack gap="300" align="center">
                         <Button
                           variant="plain"
-                          onClick={() => setExpandedId(expandedId === s.id ? null : s.id)}
+                          onClick={() =>
+                            setExpandedId(expandedId === s.id ? null : s.id)
+                          }
                         >
                           {expandedId === s.id ? "▼" : "▶"} {s.name}
                         </Button>
                         <Badge>{String(s.skus.length)} SKUs</Badge>
                       </InlineStack>
-                      <Button size="slim" tone="critical" onClick={() => handleDeleteSupplier(s.id)}>
+                      <Button
+                        size="slim"
+                        tone="critical"
+                        onClick={() => handleDeleteSupplier(s.id)}
+                      >
                         Delete
                       </Button>
                     </InlineStack>
@@ -307,64 +399,126 @@ export default function Suppliers() {
                           disabled={!selectedVendor}
                           loading={fetcher.state !== "idle"}
                         >
-                          Add all SKUs from {selectedVendor || "selected vendor"}
+                          Add all SKUs from{" "}
+                          {selectedVendor || "selected vendor"}
                         </Button>
 
                         {s.skus.length > 0 && (
                           <BlockStack gap="200">
                             <Divider />
-                            <Text variant="headingSm">Linked SKUs ({s.skus.length})</Text>
-                            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                            <Text variant="headingSm">
+                              Linked SKUs ({s.skus.length})
+                            </Text>
+                            <table
+                              style={{
+                                width: "100%",
+                                borderCollapse: "collapse",
+                              }}
+                            >
                               <thead>
-                                <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                                  {["SKU", "Product", "Supplier Code", "Cost", ""].map(h => (
-                                    <th key={h} style={{ padding: "8px 12px", textAlign: "left" }}>
+                                <tr
+                                  style={{ borderBottom: "1px solid #e1e3e5" }}
+                                >
+                                  {[
+                                    "SKU",
+                                    "Product",
+                                    "Supplier Code",
+                                    "Cost",
+                                    "",
+                                  ].map((h) => (
+                                    <th
+                                      key={h}
+                                      style={{
+                                        padding: "8px 12px",
+                                        textAlign: "left",
+                                      }}
+                                    >
                                       <Text variant="headingSm">{h}</Text>
                                     </th>
                                   ))}
                                 </tr>
                               </thead>
                               <tbody>
-                                {s.skus.map(sku => {
-                                  const variant = variantMap[sku.variantId] ?? {};
+                                {s.skus.map((sku) => {
+                                  const variant =
+                                    variantMap[sku.variantId] ?? {};
                                   const edits = skuEdits[sku.id] ?? {};
-                                  const isDirty = Object.keys(edits).length > 0;
+                                  const isDirty =
+                                    Object.keys(edits).length > 0;
                                   return (
-                                    <tr key={sku.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
+                                    <tr
+                                      key={sku.id}
+                                      style={{
+                                        borderBottom: "1px solid #f1f2f3",
+                                      }}
+                                    >
                                       <td style={{ padding: "8px 12px" }}>
                                         <Text>{variant.sku || "—"}</Text>
                                       </td>
                                       <td style={{ padding: "8px 12px" }}>
                                         <Text>{variant.title || "—"}</Text>
                                       </td>
-                                      <td style={{ padding: "8px 12px", width: "150px" }}>
+                                      <td
+                                        style={{
+                                          padding: "8px 12px",
+                                          width: "150px",
+                                        }}
+                                      >
                                         <TextField
                                           label=""
                                           labelHidden
-                                          value={edits.supplierCode ?? sku.supplierCode ?? ""}
-                                          onChange={val => handleSkuEdit(sku.id, "supplierCode", val)}
+                                          value={
+                                            edits.supplierCode ??
+                                            sku.supplierCode ??
+                                            ""
+                                          }
+                                          onChange={(val) =>
+                                            handleSkuEdit(
+                                              sku.id,
+                                              "supplierCode",
+                                              val
+                                            )
+                                          }
                                           autoComplete="off"
                                         />
                                       </td>
-                                      <td style={{ padding: "8px 12px", width: "120px" }}>
+                                      <td
+                                        style={{
+                                          padding: "8px 12px",
+                                          width: "120px",
+                                        }}
+                                      >
                                         <TextField
                                           label=""
                                           labelHidden
                                           type="number"
                                           prefix="$"
-                                          value={String(edits.cost ?? sku.cost ?? 0)}
-                                          onChange={val => handleSkuEdit(sku.id, "cost", val)}
+                                          value={String(
+                                            edits.cost ?? sku.cost ?? 0
+                                          )}
+                                          onChange={(val) =>
+                                            handleSkuEdit(sku.id, "cost", val)
+                                          }
                                           autoComplete="off"
                                         />
                                       </td>
-                                      <td style={{ padding: "8px 12px", textAlign: "right" }}>
+                                      <td
+                                        style={{
+                                          padding: "8px 12px",
+                                          textAlign: "right",
+                                        }}
+                                      >
                                         <InlineStack gap="200">
                                           {isDirty && (
                                             <Button
                                               size="slim"
                                               variant="primary"
-                                              onClick={() => handleSkuSave(sku)}
-                                              loading={fetcher.state !== "idle"}
+                                              onClick={() =>
+                                                handleSkuSave(sku)
+                                              }
+                                              loading={
+                                                fetcher.state !== "idle"
+                                              }
                                             >
                                               Save
                                             </Button>
@@ -372,7 +526,12 @@ export default function Suppliers() {
                                           <Button
                                             size="slim"
                                             tone="critical"
-                                            onClick={() => handleRemoveSku(s.id, sku.variantId)}
+                                            onClick={() =>
+                                              handleRemoveSku(
+                                                s.id,
+                                                sku.variantId
+                                              )
+                                            }
                                           >
                                             Remove
                                           </Button>
@@ -393,6 +552,92 @@ export default function Suppliers() {
             </BlockStack>
           )}
         </Layout.Section>
+
+        {/* ── Vendor Primary Supplier section ── */}
+        <Layout.Section>
+          <Card>
+            <BlockStack gap="400">
+              <Text variant="headingMd">Vendor Primary Supplier</Text>
+              <Text variant="bodySm" tone="subdued">
+                Set which distributor is the primary source for each vendor.
+                All others are treated as secondary.
+              </Text>
+              <TextField
+                label="Search vendors"
+                value={vendorSearch}
+                onChange={setVendorSearch}
+                placeholder="Type to filter..."
+                autoComplete="off"
+                clearButton
+                onClearButtonClick={() => setVendorSearch("")}
+              />
+              {filteredVendors.length === 0 ? (
+                <Text tone="subdued">No vendors found.</Text>
+              ) : (
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead>
+                    <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
+                      {["Vendor", "Distributors", "Primary"].map((h) => (
+                        <th
+                          key={h}
+                          style={{ padding: "8px 12px", textAlign: "left" }}
+                        >
+                          <Text variant="headingSm">{h}</Text>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredVendors.map(([vendorName, supplierIds]) => {
+                      const currentPrimary = primaryMap[vendorName] ?? "";
+                      return (
+                        <tr
+                          key={vendorName}
+                          style={{ borderBottom: "1px solid #f1f2f3" }}
+                        >
+                          <td
+                            style={{
+                              padding: "10px 12px",
+                              verticalAlign: "top",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            <Text fontWeight="semibold">{vendorName}</Text>
+                          </td>
+                          <td style={{ padding: "10px 12px" }}>
+                            <BlockStack gap="100">
+                              {supplierIds.map((sid) => (
+                                <Text key={sid}>
+                                  {supplierLookup[sid] ?? sid}
+                                </Text>
+                              ))}
+                            </BlockStack>
+                          </td>
+                          <td style={{ padding: "10px 12px" }}>
+                            <BlockStack gap="100">
+                              {supplierIds.map((sid) => (
+                                <RadioButton
+                                  key={sid}
+                                  label={supplierLookup[sid] ?? sid}
+                                  checked={currentPrimary === sid}
+                                  id={`${vendorName}-${sid}`}
+                                  name={`primary-${vendorName}`}
+                                  onChange={() =>
+                                    handleSetPrimary(vendorName, sid)
+                                  }
+                                />
+                              ))}
+                            </BlockStack>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </BlockStack>
+          </Card>
+        </Layout.Section>
       </Layout>
 
       <Modal
@@ -400,7 +645,9 @@ export default function Suppliers() {
         onClose={() => setModalOpen(false)}
         title="Add supplier"
         primaryAction={{ content: "Add", onAction: handleAdd }}
-        secondaryActions={[{ content: "Cancel", onAction: () => setModalOpen(false) }]}
+        secondaryActions={[
+          { content: "Cancel", onAction: () => setModalOpen(false) },
+        ]}
       >
         <Modal.Section>
           <TextField

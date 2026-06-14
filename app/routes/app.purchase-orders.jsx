@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useRef } from "react";
+﻿import { useState, useRef } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -318,53 +318,101 @@ export const action = async ({ request }) => {
     return { ok: true, regenerated: true };
   }
 
-  if (intent === "searchSku") {
-    const sku = form.get("sku");
+  if (intent === "searchProducts") {
+    const query = form.get("query");
     const supplierId = form.get("supplierId");
     const poId = form.get("poId");
 
-    const res = await admin.graphql(`
-      query($query: String!) {
-        productVariants(first: 5, query: $query) {
-          edges {
-            node {
-              id
-              sku
-              title
-              product { title vendor }
-              inventoryItem { unitCost { amount } }
+    // Get all variantIds for this supplier
+    const supplierSkus = await db.supplierSku.findMany({
+      where: { shop, supplierId },
+      select: { variantId: true, supplierCode: true, cost: true },
+    });
+    const supplierSkuMap = new Map(supplierSkus.map((s) => [s.variantId, s]));
+
+    if (supplierSkuMap.size === 0) {
+      return { ok: true, intent: "searchProducts", poId, results: [] };
+    }
+
+    // Search Shopify by title and SKU
+    const [titleRes, skuRes] = await Promise.all([
+      admin.graphql(`
+        query($query: String!) {
+          products(first: 10, query: $query) {
+            edges {
+              node {
+                title
+                vendor
+                variants(first: 20) {
+                  edges {
+                    node {
+                      id sku title
+                      inventoryItem { unitCost { amount } }
+                    }
+                  }
+                }
+              }
             }
           }
         }
+      `, { variables: { query: `title:*${query}*` } }),
+      admin.graphql(`
+        query($query: String!) {
+          productVariants(first: 10, query: $query) {
+            edges {
+              node {
+                id sku title
+                product { title vendor }
+                inventoryItem { unitCost { amount } }
+              }
+            }
+          }
+        }
+      `, { variables: { query: `sku:${query}*` } }),
+    ]);
+
+    const [titleJson, skuJson] = await Promise.all([titleRes.json(), skuRes.json()]);
+
+    const seen = new Set();
+    const results = [];
+
+    // Process title matches
+    for (const { node: p } of titleJson.data?.products?.edges ?? []) {
+      for (const { node: v } of p.variants.edges) {
+        if (seen.has(v.id)) continue;
+        if (!supplierSkuMap.has(v.id)) continue;
+        seen.add(v.id);
+        const skuRec = supplierSkuMap.get(v.id);
+        results.push({
+          id: v.id,
+          sku: v.sku,
+          productTitle: p.title,
+          variantTitle: v.title === "Default Title" ? "" : v.title,
+          vendor: p.vendor,
+          supplierCode: skuRec?.supplierCode ?? "",
+          cost: skuRec?.cost ?? parseFloat(v.inventoryItem?.unitCost?.amount ?? 0),
+        });
       }
-    `, { variables: { query: `sku:${sku}` } });
-
-    const json = await res.json();
-    const variants = json.data?.productVariants?.edges?.map((e) => e.node) ?? [];
-
-    if (variants.length === 0) {
-      return { ok: false, intent: "searchSku", poId, error: "No variant found for that SKU" };
     }
 
-    const variant = variants[0];
-    const skuRec = await db.supplierSku.findFirst({
-      where: { shop, supplierId, variantId: variant.id },
-    });
-
-    return {
-      ok: true,
-      intent: "searchSku",
-      poId,
-      variant: {
-        id: variant.id,
-        sku: variant.sku,
-        productTitle: variant.product?.title ?? "",
-        variantTitle: variant.title === "Default Title" ? "" : variant.title,
-        vendor: variant.product?.vendor ?? "",
+    // Process SKU matches
+    for (const { node: v } of skuJson.data?.productVariants?.edges ?? []) {
+      if (seen.has(v.id)) continue;
+      if (!supplierSkuMap.has(v.id)) continue;
+      seen.add(v.id);
+      const skuRec = supplierSkuMap.get(v.id);
+      results.push({
+        id: v.id,
+        sku: v.sku,
+        productTitle: v.product?.title ?? "",
+        variantTitle: v.title === "Default Title" ? "" : v.title,
+        vendor: v.product?.vendor ?? "",
         supplierCode: skuRec?.supplierCode ?? "",
-        cost: skuRec?.cost ?? parseFloat(variant.inventoryItem?.unitCost?.amount ?? 0),
-      },
-    };
+        cost: skuRec?.cost ?? parseFloat(v.inventoryItem?.unitCost?.amount ?? 0),
+      });
+    }
+
+    return { ok: true, intent: "searchProducts", poId, results: results.slice(0, 10) };
   }
 
   if (intent === "addItem") {
@@ -575,11 +623,11 @@ export default function PurchaseOrders() {
   const [receiveModal, setReceiveModal] = useState(null);
   const [receiveError, setReceiveError] = useState(null);
   const [skuSearch, setSkuSearch] = useState({});
-  const [skuResults, setSkuResults] = useState({});
+  const [searchResults, setSearchResults] = useState({});
+  const [selectedResult, setSelectedResult] = useState({});
   const [skuQty, setSkuQty] = useState({});
   const [skuCost, setSkuCost] = useState({});
 
-  // Debounce refs — one timer per PO
   const debounceTimers = useRef({});
 
   const isSubmitting = fetcher.state !== "idle";
@@ -605,41 +653,42 @@ export default function PurchaseOrders() {
 
   if (
     fetcher.state === "idle" &&
-    fetcherData?.intent === "searchSku" &&
+    fetcherData?.intent === "searchProducts" &&
     fetcherData?.poId
   ) {
     const poId = fetcherData.poId;
-    if (fetcherData.ok && fetcherData.variant) {
-      if (!skuResults[poId] || skuResults[poId]?.id !== fetcherData.variant.id) {
-        setSkuResults((prev) => ({ ...prev, [poId]: fetcherData.variant }));
-        setSkuQty((prev) => ({ ...prev, [poId]: "1" }));
-        setSkuCost((prev) => ({ ...prev, [poId]: String(fetcherData.variant.cost) }));
-      }
-    } else if (!fetcherData.ok && !skuResults[poId]?.error) {
-      setSkuResults((prev) => ({ ...prev, [poId]: { error: fetcherData.error } }));
+    if (!searchResults[poId] || JSON.stringify(searchResults[poId]) !== JSON.stringify(fetcherData.results)) {
+      setSearchResults((prev) => ({ ...prev, [poId]: fetcherData.results ?? [] }));
     }
   }
 
-  function handleSkuChange(poId, supplierId, val) {
+  function handleSearchChange(poId, supplierId, val) {
     setSkuSearch((prev) => ({ ...prev, [poId]: val }));
-    setSkuResults((prev) => ({ ...prev, [poId]: null }));
+    setSearchResults((prev) => ({ ...prev, [poId]: [] }));
+    setSelectedResult((prev) => ({ ...prev, [poId]: null }));
 
-    // Clear existing timer for this PO
     if (debounceTimers.current[poId]) {
       clearTimeout(debounceTimers.current[poId]);
     }
 
-    if (!val.trim()) return;
+    if (!val.trim() || val.trim().length < 2) return;
 
-    // Set new debounce timer — fires 400ms after last keystroke
     debounceTimers.current[poId] = setTimeout(() => {
       const fd = new FormData();
-      fd.append("intent", "searchSku");
-      fd.append("sku", val.trim());
+      fd.append("intent", "searchProducts");
+      fd.append("query", val.trim());
       fd.append("supplierId", supplierId);
       fd.append("poId", poId);
       fetcher.submit(fd, { method: "post" });
     }, 400);
+  }
+
+  function handleSelectResult(poId, result) {
+    setSelectedResult((prev) => ({ ...prev, [poId]: result }));
+    setSearchResults((prev) => ({ ...prev, [poId]: [] }));
+    setSkuSearch((prev) => ({ ...prev, [poId]: `${result.productTitle}${result.variantTitle ? ` - ${result.variantTitle}` : ""}` }));
+    setSkuQty((prev) => ({ ...prev, [poId]: "1" }));
+    setSkuCost((prev) => ({ ...prev, [poId]: String(result.cost) }));
   }
 
   function handleCreate() {
@@ -774,8 +823,8 @@ export default function PurchaseOrders() {
   }
 
   function handleAddItem(po) {
-    const result = skuResults[po.id];
-    if (!result || result.error) return;
+    const result = selectedResult[po.id];
+    if (!result) return;
     const fd = new FormData();
     fd.append("intent", "addItem");
     fd.append("purchaseOrderId", po.id);
@@ -788,7 +837,8 @@ export default function PurchaseOrders() {
     fd.append("qtyCost", skuCost[po.id] ?? "0");
     fetcher.submit(fd, { method: "post" });
     setSkuSearch((prev) => ({ ...prev, [po.id]: "" }));
-    setSkuResults((prev) => ({ ...prev, [po.id]: null }));
+    setSearchResults((prev) => ({ ...prev, [po.id]: [] }));
+    setSelectedResult((prev) => ({ ...prev, [po.id]: null }));
     setSkuQty((prev) => ({ ...prev, [po.id]: "" }));
     setSkuCost((prev) => ({ ...prev, [po.id]: "" }));
   }
@@ -881,7 +931,6 @@ export default function PurchaseOrders() {
       <Layout>
         <Layout.Section>
 
-          {/* ── Create PO modal ── */}
           <Modal
             open={showCreate}
             onClose={() => setShowCreate(false)}
@@ -923,7 +972,6 @@ export default function PurchaseOrders() {
             </Modal.Section>
           </Modal>
 
-          {/* ── Receive modal ── */}
           {receiveModal && (
             <Modal
               open
@@ -1039,9 +1087,10 @@ export default function PurchaseOrders() {
               "Qty", "Unit Cost", "Line Total", "",
             ];
 
-            const skuResult = skuResults[po.id];
+            const poSearchResults = searchResults[po.id] ?? [];
+            const poSelected = selectedResult[po.id];
             const isSearching = isSubmitting &&
-              fetcher.formData?.get("intent") === "searchSku" &&
+              fetcher.formData?.get("intent") === "searchProducts" &&
               fetcher.formData?.get("poId") === po.id;
 
             return (
@@ -1177,34 +1226,66 @@ export default function PurchaseOrders() {
                               </InlineStack>
                             )}
 
-                            {/* ── Manual SKU add ── */}
+                            {/* ── Add item search ── */}
                             <Divider />
-                            <Text variant="headingSm">Add item by SKU</Text>
-                            <TextField
-                              label="SKU search"
-                              labelHidden
-                              value={skuSearch[po.id] ?? ""}
-                              onChange={(val) => handleSkuChange(po.id, po.supplierId, val)}
-                              autoComplete="off"
-                              placeholder="Type a SKU to search..."
-                              suffix={isSearching ? <Spinner size="small" /> : undefined}
-                            />
+                            <Text variant="headingSm">Add item</Text>
+                            <div style={{ position: "relative" }}>
+                              <TextField
+                                label="Search by product name or SKU"
+                                labelHidden
+                                value={skuSearch[po.id] ?? ""}
+                                onChange={(val) => handleSearchChange(po.id, po.supplierId, val)}
+                                autoComplete="off"
+                                placeholder="Type product name or SKU..."
+                                suffix={isSearching ? <Spinner size="small" /> : undefined}
+                              />
+                              {poSearchResults.length > 0 && (
+                                <div style={{
+                                  position: "absolute",
+                                  top: "100%",
+                                  left: 0,
+                                  right: 0,
+                                  zIndex: 100,
+                                  background: "#fff",
+                                  border: "1px solid #e1e3e5",
+                                  borderRadius: "4px",
+                                  boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
+                                  maxHeight: "300px",
+                                  overflowY: "auto",
+                                }}>
+                                  {poSearchResults.map((result) => (
+                                    <div
+                                      key={result.id}
+                                      onClick={() => handleSelectResult(po.id, result)}
+                                      style={{
+                                        padding: "10px 14px",
+                                        cursor: "pointer",
+                                        borderBottom: "1px solid #f1f2f3",
+                                      }}
+                                      onMouseEnter={(e) => e.currentTarget.style.background = "#f6f6f7"}
+                                      onMouseLeave={(e) => e.currentTarget.style.background = "#fff"}
+                                    >
+                                      <Text fontWeight="semibold">
+                                        {result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}
+                                      </Text>
+                                      <Text tone="subdued" variant="bodySm">
+                                        SKU: {result.sku} · ${result.cost.toFixed(2)}
+                                        {result.supplierCode ? ` · Code: ${result.supplierCode}` : ""}
+                                      </Text>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
 
-                            {skuResult?.error && (
-                              <Banner tone="critical">{skuResult.error}</Banner>
-                            )}
-
-                            {skuResult && !skuResult.error && (
+                            {poSelected && (
                               <Card>
                                 <BlockStack gap="300">
                                   <BlockStack gap="100">
-                                    <Text fontWeight="semibold">{skuResult.productTitle}</Text>
-                                    <Text tone="subdued">
-                                      {skuResult.variantTitle ? `${skuResult.variantTitle} · ` : ""}{skuResult.sku}
+                                    <Text fontWeight="semibold">
+                                      {poSelected.productTitle}{poSelected.variantTitle ? ` — ${poSelected.variantTitle}` : ""}
                                     </Text>
-                                    {skuResult.supplierCode && (
-                                      <Text tone="subdued">Supplier code: {skuResult.supplierCode}</Text>
-                                    )}
+                                    <Text tone="subdued">SKU: {poSelected.sku}{poSelected.supplierCode ? ` · Code: ${poSelected.supplierCode}` : ""}</Text>
                                   </BlockStack>
                                   <InlineStack gap="300" blockAlign="end">
                                     <div style={{ width: "100px" }}>
@@ -1234,10 +1315,7 @@ export default function PurchaseOrders() {
                                     <Button
                                       variant="primary"
                                       onClick={() => handleAddItem(po)}
-                                      loading={
-                                        isSubmitting &&
-                                        fetcher.formData?.get("intent") === "addItem"
-                                      }
+                                      loading={isSubmitting && fetcher.formData?.get("intent") === "addItem"}
                                     >
                                       Add to PO
                                     </Button>

@@ -70,12 +70,6 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
   });
   if (minmaxRows.length === 0) return [];
 
-  // Get primary designations for this supplier
-  const vendorSuppliers = await db.vendorSupplier.findMany({
-    where: { shop, supplierId, isPrimary: true },
-  });
-  const primaryVendors = new Set(vendorSuppliers.map((vs) => vs.vendorName));
-
   const onHandMap = {};
   let cursor = null;
   let hasMore = true;
@@ -88,7 +82,7 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
             edges {
               node {
                 quantities(names: ["available"]) { quantity }
-                item { variant { id title product { title vendor } } sku }
+                item { variant { id title product { title } } sku }
               }
             }
           }
@@ -107,7 +101,6 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
         productTitle: n.item?.variant?.product?.title ?? "",
         variantTitle: n.item?.variant?.title ?? "",
         sku: n.item?.sku ?? "",
-        vendor: n.item?.variant?.product?.vendor ?? "",
       };
     }
   }
@@ -128,11 +121,9 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
       productTitle: onHand.productTitle,
       variantTitle: onHand.variantTitle,
       sku: onHand.sku,
-      vendor: onHand.vendor,
       supplierCode: skuRec?.supplierCode ?? "",
       qtyOrdered,
       qtyCost: skuRec?.cost ?? 0,
-      isPrimary: primaryVendors.has(onHand.vendor),
     });
   }
   return items;
@@ -142,12 +133,6 @@ async function buildSalesItems(admin, db, shop, supplierId) {
   const supplierSkus = await db.supplierSku.findMany({ where: { shop, supplierId } });
   const variantIds = new Set(supplierSkus.map((s) => s.variantId));
   if (variantIds.size === 0) return [];
-
-  // Get primary designations for this supplier
-  const vendorSuppliers = await db.vendorSupplier.findMany({
-    where: { shop, supplierId, isPrimary: true },
-  });
-  const primaryVendors = new Set(vendorSuppliers.map((vs) => vs.vendorName));
 
   const since = new Date();
   since.setDate(since.getDate() - 30);
@@ -167,7 +152,7 @@ async function buildSalesItems(admin, db, shop, supplierId) {
               lineItems(first: 50) {
                 edges {
                   node {
-                    variant { id title sku product { title vendor } }
+                    variant { id title product { title } sku }
                     quantity
                   }
                 }
@@ -193,7 +178,6 @@ async function buildSalesItems(admin, db, shop, supplierId) {
           productTitle: n.variant?.product?.title ?? "",
           variantTitle: n.variant?.title ?? "",
           sku: n.variant?.sku ?? "",
-          vendor: n.variant?.product?.vendor ?? "",
         };
         salesMap[vid].qty += n.quantity;
       }
@@ -209,11 +193,9 @@ async function buildSalesItems(admin, db, shop, supplierId) {
       productTitle: data.productTitle,
       variantTitle: data.variantTitle,
       sku: data.sku,
-      vendor: data.vendor,
       supplierCode: skuRec?.supplierCode ?? "",
       qtyOrdered: data.qty,
       qtyCost: skuRec?.cost ?? 0,
-      isPrimary: primaryVendors.has(data.vendor),
     });
   }
   return items;
@@ -238,11 +220,22 @@ export const loader = async ({ request }) => {
   const vendorSuppliers = await db.vendorSupplier.findMany({
     where: { shop, isPrimary: true },
   });
-  // Map: supplierId -> Set of primary vendorNames
   const primaryVendorMap = {};
   for (const vs of vendorSuppliers) {
-    if (!primaryVendorMap[vs.supplierId]) primaryVendorMap[vs.supplierId] = new Set();
-    primaryVendorMap[vs.supplierId].add(vs.vendorName);
+    if (!primaryVendorMap[vs.supplierId]) primaryVendorMap[vs.supplierId] = [];
+    primaryVendorMap[vs.supplierId].push(vs.vendorName);
+  }
+
+  // Build variantId -> vendorName map from SupplierSku
+  const allSupplierSkus = await db.supplierSku.findMany({
+    where: { shop },
+    select: { variantId: true, vendorName: true },
+  });
+  const variantVendorMap = {};
+  for (const s of allSupplierSkus) {
+    if (s.vendorName && !variantVendorMap[s.variantId]) {
+      variantVendorMap[s.variantId] = s.vendorName;
+    }
   }
 
   const locRes = await admin.graphql(`
@@ -251,7 +244,7 @@ export const loader = async ({ request }) => {
   const locJson = await locRes.json();
   const locations = locJson.data.locations.edges.map((e) => e.node);
 
-  return { purchaseOrders, suppliers, locations, shop, primaryVendorMap };
+  return { purchaseOrders, suppliers, locations, shop, primaryVendorMap, variantVendorMap };
 };
 
 export const action = async ({ request }) => {
@@ -332,7 +325,6 @@ export const action = async ({ request }) => {
     const supplierId = form.get("supplierId");
     const poId = form.get("poId");
 
-    // Search Shopify for the variant by SKU
     const res = await admin.graphql(`
       query($query: String!) {
         productVariants(first: 5, query: $query) {
@@ -352,11 +344,11 @@ export const action = async ({ request }) => {
     const json = await res.json();
     const variants = json.data?.productVariants?.edges?.map((e) => e.node) ?? [];
 
-    if (variants.length === 0) return { ok: false, intent: "searchSku", poId, error: "No variant found for that SKU" };
+    if (variants.length === 0) {
+      return { ok: false, intent: "searchSku", poId, error: "No variant found for that SKU" };
+    }
 
     const variant = variants[0];
-
-    // Look up cost from SupplierSku
     const skuRec = await db.supplierSku.findFirst({
       where: { shop, supplierId, variantId: variant.id },
     });
@@ -570,7 +562,7 @@ export const action = async ({ request }) => {
 };
 
 export default function PurchaseOrders() {
-  const { purchaseOrders, suppliers, locations, primaryVendorMap } = useLoaderData();
+  const { purchaseOrders, suppliers, locations, primaryVendorMap, variantVendorMap } = useLoaderData();
   const fetcher = useFetcher();
 
   const [showCreate, setShowCreate] = useState(false);
@@ -584,8 +576,6 @@ export default function PurchaseOrders() {
   const [onHandData, setOnHandData] = useState({});
   const [receiveModal, setReceiveModal] = useState(null);
   const [receiveError, setReceiveError] = useState(null);
-
-  // SKU search state per PO
   const [skuSearch, setSkuSearch] = useState({});
   const [skuResults, setSkuResults] = useState({});
   const [skuQty, setSkuQty] = useState({});
@@ -612,13 +602,19 @@ export default function PurchaseOrders() {
     }
   }
 
-  if (fetcher.state === "idle" && fetcherData?.intent === "searchSku" && fetcherData?.poId) {
+  if (
+    fetcher.state === "idle" &&
+    fetcherData?.intent === "searchSku" &&
+    fetcherData?.poId
+  ) {
     const poId = fetcherData.poId;
     if (fetcherData.ok && fetcherData.variant) {
-      setSkuResults((prev) => ({ ...prev, [poId]: fetcherData.variant }));
-      setSkuQty((prev) => ({ ...prev, [poId]: "1" }));
-      setSkuCost((prev) => ({ ...prev, [poId]: String(fetcherData.variant.cost) }));
-    } else if (!fetcherData.ok) {
+      if (!skuResults[poId] || skuResults[poId]?.id !== fetcherData.variant.id) {
+        setSkuResults((prev) => ({ ...prev, [poId]: fetcherData.variant }));
+        setSkuQty((prev) => ({ ...prev, [poId]: "1" }));
+        setSkuCost((prev) => ({ ...prev, [poId]: String(fetcherData.variant.cost) }));
+      }
+    } else if (!fetcherData.ok && !skuResults[poId]?.error) {
       setSkuResults((prev) => ({ ...prev, [poId]: { error: fetcherData.error } }));
     }
   }
@@ -780,7 +776,6 @@ export default function PurchaseOrders() {
     fd.append("qtyOrdered", skuQty[po.id] ?? "1");
     fd.append("qtyCost", skuCost[po.id] ?? "0");
     fetcher.submit(fd, { method: "post" });
-    // Clear search state
     setSkuSearch((prev) => ({ ...prev, [po.id]: "" }));
     setSkuResults((prev) => ({ ...prev, [po.id]: null }));
     setSkuQty((prev) => ({ ...prev, [po.id]: "" }));
@@ -803,7 +798,7 @@ export default function PurchaseOrders() {
     { label: "Cancelled", value: "cancelled" },
   ];
 
-  function renderItemRow(item, po, poEdits, poRemoved, hasOnHand, poOnHand) {
+  function renderItemRow(item, po, poEdits, hasOnHand, poOnHand) {
     const qty = poEdits[item.id]?.qtyOrdered !== undefined
       ? poEdits[item.id].qtyOrdered
       : String(item.qtyOrdered);
@@ -937,7 +932,7 @@ export default function PurchaseOrders() {
                     Receiving at: <strong>{locationNameMap[receiveModal.po.locationId] ?? receiveModal.po.locationId}</strong>
                   </Text>
                   <Text tone="subdued">
-                    Adjust quantities below if you received a partial shipment.
+                    Adjust quantities below if you received a partial shipment. Each item's on-hand count will be increased by the amount shown.
                   </Text>
                   {receiveError && <Banner tone="critical">{receiveError}</Banner>}
                   <div style={{ overflowX: "auto" }}>
@@ -1005,8 +1000,8 @@ export default function PurchaseOrders() {
             const locationLabel = po.locationId ? (locationNameMap[po.locationId] ?? "") : null;
             const canReceive = po.status !== "received" && po.status !== "cancelled" && po.items.length > 0 && po.locationId;
 
-            // Determine primary vendors for this PO's supplier
-            const primaryVendors = primaryVendorMap[po.supplierId] ?? new Set();
+            // Primary vendors for this PO's supplier (array from loader)
+            const primaryVendors = new Set(primaryVendorMap[po.supplierId] ?? []);
 
             const displayItems = po.items.map((i) => ({
               ...i,
@@ -1019,18 +1014,21 @@ export default function PurchaseOrders() {
             const totalCost = activeItems.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0);
             const totalUnits = activeItems.reduce((s, i) => s + i.qtyOrdered, 0);
 
-            // Split into primary and secondary based on vendor designation
-            // Items without vendor info go to primary by default
-            const primaryItems = displayItems.filter((i) =>
-              primaryVendors.size === 0 || primaryVendors.has(i.vendor) || !i.vendor
-            );
-            const secondaryItems = displayItems.filter((i) =>
-              primaryVendors.size > 0 && !primaryVendors.has(i.vendor) && i.vendor
-            );
+            // Split primary vs secondary using variantVendorMap
+            const primaryItems = displayItems.filter((i) => {
+              const vendor = variantVendorMap[i.variantId] ?? "";
+              return primaryVendors.size === 0 || primaryVendors.has(vendor) || !vendor;
+            });
+            const secondaryItems = displayItems.filter((i) => {
+              const vendor = variantVendorMap[i.variantId] ?? "";
+              return primaryVendors.size > 0 && !primaryVendors.has(vendor) && vendor;
+            });
 
-            const tableHeaders = ["Supplier Code", "Product", "Variant", "SKU",
+            const tableHeaders = [
+              "Supplier Code", "Product", "Variant", "SKU",
               ...(hasOnHand ? ["On Hand"] : []),
-              "Qty", "Unit Cost", "Line Total", ""];
+              "Qty", "Unit Cost", "Line Total", "",
+            ];
 
             const skuResult = skuResults[po.id];
 
@@ -1123,10 +1121,10 @@ export default function PurchaseOrders() {
                                 <tbody>
                                   {/* Primary items */}
                                   {primaryItems.map((item) =>
-                                    renderItemRow(item, po, poEdits, poRemoved, hasOnHand, poOnHand)
+                                    renderItemRow(item, po, poEdits, hasOnHand, poOnHand)
                                   )}
 
-                                  {/* Secondary/backup items */}
+                                  {/* Secondary/backup section */}
                                   {secondaryItems.length > 0 && (
                                     <>
                                       <tr>
@@ -1143,12 +1141,12 @@ export default function PurchaseOrders() {
                                         </td>
                                       </tr>
                                       {secondaryItems.map((item) =>
-                                        renderItemRow(item, po, poEdits, poRemoved, hasOnHand, poOnHand)
+                                        renderItemRow(item, po, poEdits, hasOnHand, poOnHand)
                                       )}
                                     </>
                                   )}
 
-                                  {/* Totals row */}
+                                  {/* Totals */}
                                   <tr style={{ borderTop: "2px solid #e1e3e5" }}>
                                     <td colSpan={hasOnHand ? 5 : 4} style={{ padding: "8px 12px" }}>
                                       <Text variant="headingSm">Total</Text>
@@ -1180,7 +1178,9 @@ export default function PurchaseOrders() {
                                 <TextField
                                   label="SKU"
                                   value={skuSearch[po.id] ?? ""}
-                                  onChange={(val) => setSkuSearch((prev) => ({ ...prev, [po.id]: val }))}
+                                  onChange={(val) =>
+                                    setSkuSearch((prev) => ({ ...prev, [po.id]: val }))
+                                  }
                                   autoComplete="off"
                                   placeholder="Enter exact SKU..."
                                   onKeyDown={(e) => {
@@ -1190,7 +1190,11 @@ export default function PurchaseOrders() {
                               </div>
                               <Button
                                 onClick={() => handleSkuSearch(po.id, po.supplierId)}
-                                loading={isSubmitting && fetcher.formData?.get("intent") === "searchSku"}
+                                loading={
+                                  isSubmitting &&
+                                  fetcher.formData?.get("intent") === "searchSku" &&
+                                  fetcher.formData?.get("poId") === po.id
+                                }
                               >
                                 Search
                               </Button>
@@ -1203,22 +1207,24 @@ export default function PurchaseOrders() {
                             {skuResult && !skuResult.error && (
                               <Card>
                                 <BlockStack gap="300">
-                                  <InlineStack align="space-between">
-                                    <BlockStack gap="100">
-                                      <Text fontWeight="semibold">{skuResult.productTitle}</Text>
-                                      <Text tone="subdued">{skuResult.variantTitle} · {skuResult.sku}</Text>
-                                      {skuResult.supplierCode && (
-                                        <Text tone="subdued">Supplier code: {skuResult.supplierCode}</Text>
-                                      )}
-                                    </BlockStack>
-                                  </InlineStack>
+                                  <BlockStack gap="100">
+                                    <Text fontWeight="semibold">{skuResult.productTitle}</Text>
+                                    <Text tone="subdued">
+                                      {skuResult.variantTitle ? `${skuResult.variantTitle} · ` : ""}{skuResult.sku}
+                                    </Text>
+                                    {skuResult.supplierCode && (
+                                      <Text tone="subdued">Supplier code: {skuResult.supplierCode}</Text>
+                                    )}
+                                  </BlockStack>
                                   <InlineStack gap="300" blockAlign="end">
                                     <div style={{ width: "100px" }}>
                                       <TextField
                                         label="Qty"
                                         type="number"
                                         value={skuQty[po.id] ?? "1"}
-                                        onChange={(val) => setSkuQty((prev) => ({ ...prev, [po.id]: val }))}
+                                        onChange={(val) =>
+                                          setSkuQty((prev) => ({ ...prev, [po.id]: val }))
+                                        }
                                         autoComplete="off"
                                         min="1"
                                       />
@@ -1229,14 +1235,19 @@ export default function PurchaseOrders() {
                                         type="number"
                                         prefix="$"
                                         value={skuCost[po.id] ?? "0"}
-                                        onChange={(val) => setSkuCost((prev) => ({ ...prev, [po.id]: val }))}
+                                        onChange={(val) =>
+                                          setSkuCost((prev) => ({ ...prev, [po.id]: val }))
+                                        }
                                         autoComplete="off"
                                       />
                                     </div>
                                     <Button
                                       variant="primary"
                                       onClick={() => handleAddItem(po)}
-                                      loading={isSubmitting && fetcher.formData?.get("intent") === "addItem"}
+                                      loading={
+                                        isSubmitting &&
+                                        fetcher.formData?.get("intent") === "addItem"
+                                      }
                                     >
                                       Add to PO
                                     </Button>

@@ -1,4 +1,4 @@
-import { useLoaderData, useFetcher } from "react-router";
+import { useLoaderData, useFetcher, useNavigate } from "react-router";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import {
@@ -28,7 +28,6 @@ export const loader = async ({ request }) => {
   const supplierLookup = {};
   for (const s of suppliers) supplierLookup[s.id] = s.name;
 
-  // Get all distinct vendorName -> supplierId combos
   const supplierSkuGroups = await prisma.supplierSku.findMany({
     where: { shop },
     select: { vendorName: true, supplierId: true },
@@ -39,13 +38,13 @@ export const loader = async ({ request }) => {
   const vendorSupplierMap = {};
   for (const row of supplierSkuGroups) {
     if (!row.vendorName) continue;
-    if (!vendorSupplierMap[row.vendorName]) vendorSupplierMap[row.vendorName] = [];
+    if (!vendorSupplierMap[row.vendorName])
+      vendorSupplierMap[row.vendorName] = [];
     if (!vendorSupplierMap[row.vendorName].includes(row.supplierId)) {
       vendorSupplierMap[row.vendorName].push(row.supplierId);
     }
   }
 
-  // Get existing primary designations
   const vendorSuppliers = await prisma.vendorSupplier.findMany({
     where: { shop },
   });
@@ -76,7 +75,11 @@ export const action = async ({ request }) => {
     for (const { supplierId: sid } of skuSuppliers) {
       await prisma.vendorSupplier.upsert({
         where: {
-          shop_vendorName_supplierId: { shop, vendorName, supplierId: sid },
+          shop_vendorName_supplierId: {
+            shop,
+            vendorName,
+            supplierId: sid,
+          },
         },
         update: { isPrimary: sid === supplierId },
         create: {
@@ -97,6 +100,7 @@ export const action = async ({ request }) => {
 export default function VendorSources() {
   const { vendorSupplierMap, primaryMap, supplierLookup } = useLoaderData();
   const fetcher = useFetcher();
+  const navigate = useNavigate();
   const [search, setSearch] = useState("");
 
   const handleSetPrimary = (vendorName, supplierId) => {
@@ -119,7 +123,10 @@ export default function VendorSources() {
   return (
     <Page
       title="Vendor Sources"
-      backAction={{ content: "Suppliers", url: "/app/suppliers" }}
+      backAction={{
+        content: "Suppliers",
+        onAction: () => navigate("/app/suppliers"),
+      }}
     >
       <Layout>
         <Layout.Section>
@@ -138,11 +145,9 @@ export default function VendorSources() {
                     All others are treated as secondary.
                   </Text>
                 </BlockStack>
-                <InlineStack gap="200">
-                  <Badge>
-                    {assignedVendors}/{totalVendors} assigned
-                  </Badge>
-                </InlineStack>
+                <Badge>
+                  {assignedVendors}/{totalVendors} assigned
+                </Badge>
               </InlineStack>
 
               <TextField
@@ -161,22 +166,21 @@ export default function VendorSources() {
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead>
                     <tr style={{ borderBottom: "2px solid #e1e3e5" }}>
-                      {["Vendor", "Primary supplier", "All distributors"].map((h) => (
-                        <th
-                          key={h}
-                          style={{ padding: "8px 12px", textAlign: "left" }}
-                        >
-                          <Text variant="headingSm">{h}</Text>
-                        </th>
-                      ))}
+                      {["Vendor", "Primary supplier", "All distributors"].map(
+                        (h) => (
+                          <th
+                            key={h}
+                            style={{ padding: "8px 12px", textAlign: "left" }}
+                          >
+                            <Text variant="headingSm">{h}</Text>
+                          </th>
+                        )
+                      )}
                     </tr>
                   </thead>
                   <tbody>
                     {filteredVendors.map(([vendorName, supplierIds]) => {
                       const currentPrimary = primaryMap[vendorName] ?? "";
-                      const primaryName = currentPrimary
-                        ? supplierLookup[currentPrimary]
-                        : null;
                       return (
                         <tr
                           key={vendorName}

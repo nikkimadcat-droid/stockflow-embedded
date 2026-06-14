@@ -1,5 +1,4 @@
-import { useLoaderData, useFetcher } from "react-router";
-import { Link } from "react-router";
+import { useLoaderData, useFetcher, useNavigate } from "react-router";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import {
@@ -178,6 +177,7 @@ export const action = async ({ request }) => {
 export default function Suppliers() {
   const { suppliers, vendorMap, variantMap } = useLoaderData();
   const fetcher = useFetcher();
+  const navigate = useNavigate();
   const [modalOpen, setModalOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [expandedId, setExpandedId] = useState(null);
@@ -264,7 +264,7 @@ export default function Suppliers() {
       secondaryActions={[
         {
           content: "Vendor sources",
-          url: "/app/suppliers/vendors",
+          onAction: () => navigate("/app/suppliers/vendors"),
         },
       ]}
     >
@@ -344,26 +344,32 @@ export default function Suppliers() {
                                 <tr
                                   style={{ borderBottom: "1px solid #e1e3e5" }}
                                 >
-                                  {["SKU", "Product", "Supplier Code", "Cost", ""].map(
-                                    (h) => (
-                                      <th
-                                        key={h}
-                                        style={{
-                                          padding: "8px 12px",
-                                          textAlign: "left",
-                                        }}
-                                      >
-                                        <Text variant="headingSm">{h}</Text>
-                                      </th>
-                                    )
-                                  )}
+                                  {[
+                                    "SKU",
+                                    "Product",
+                                    "Supplier Code",
+                                    "Cost",
+                                    "",
+                                  ].map((h) => (
+                                    <th
+                                      key={h}
+                                      style={{
+                                        padding: "8px 12px",
+                                        textAlign: "left",
+                                      }}
+                                    >
+                                      <Text variant="headingSm">{h}</Text>
+                                    </th>
+                                  ))}
                                 </tr>
                               </thead>
                               <tbody>
                                 {s.skus.map((sku) => {
-                                  const variant = variantMap[sku.variantId] ?? {};
+                                  const variant =
+                                    variantMap[sku.variantId] ?? {};
                                   const edits = skuEdits[sku.id] ?? {};
-                                  const isDirty = Object.keys(edits).length > 0;
+                                  const isDirty =
+                                    Object.keys(edits).length > 0;
                                   return (
                                     <tr
                                       key={sku.id}
@@ -432,8 +438,12 @@ export default function Suppliers() {
                                             <Button
                                               size="slim"
                                               variant="primary"
-                                              onClick={() => handleSkuSave(sku)}
-                                              loading={fetcher.state !== "idle"}
+                                              onClick={() =>
+                                                handleSkuSave(sku)
+                                              }
+                                              loading={
+                                                fetcher.state !== "idle"
+                                              }
                                             >
                                               Save
                                             </Button>
@@ -442,7 +452,10 @@ export default function Suppliers() {
                                             size="slim"
                                             tone="critical"
                                             onClick={() =>
-                                              handleRemoveSku(s.id, sku.variantId)
+                                              handleRemoveSku(
+                                                s.id,
+                                                sku.variantId
+                                              )
                                             }
                                           >
                                             Remove

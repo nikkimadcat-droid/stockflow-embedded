@@ -323,7 +323,6 @@ export const action = async ({ request }) => {
     const supplierId = form.get("supplierId");
     const poId = form.get("poId");
 
-    // Get all variantIds for this supplier
     const supplierSkus = await db.supplierSku.findMany({
       where: { shop, supplierId },
       select: { variantId: true, supplierCode: true, cost: true },
@@ -334,7 +333,6 @@ export const action = async ({ request }) => {
       return { ok: true, intent: "searchProducts", poId, results: [] };
     }
 
-    // Search Shopify by title and SKU
     const [titleRes, skuRes] = await Promise.all([
       admin.graphql(`
         query($query: String!) {
@@ -376,7 +374,6 @@ export const action = async ({ request }) => {
     const seen = new Set();
     const results = [];
 
-    // Process title matches
     for (const { node: p } of titleJson.data?.products?.edges ?? []) {
       for (const { node: v } of p.variants.edges) {
         if (seen.has(v.id)) continue;
@@ -395,7 +392,6 @@ export const action = async ({ request }) => {
       }
     }
 
-    // Process SKU matches
     for (const { node: v } of skuJson.data?.productVariants?.edges ?? []) {
       if (seen.has(v.id)) continue;
       if (!supplierSkuMap.has(v.id)) continue;
@@ -1229,54 +1225,49 @@ export default function PurchaseOrders() {
                             {/* ── Add item search ── */}
                             <Divider />
                             <Text variant="headingSm">Add item</Text>
-                            <div style={{ position: "relative" }}>
-                              <TextField
-                                label="Search by product name or SKU"
-                                labelHidden
-                                value={skuSearch[po.id] ?? ""}
-                                onChange={(val) => handleSearchChange(po.id, po.supplierId, val)}
-                                autoComplete="off"
-                                placeholder="Type product name or SKU..."
-                                suffix={isSearching ? <Spinner size="small" /> : undefined}
-                              />
-                              {poSearchResults.length > 0 && (
-                                <div style={{
-                                  position: "absolute",
-                                  top: "100%",
-                                  left: 0,
-                                  right: 0,
-                                  zIndex: 100,
-                                  background: "#fff",
-                                  border: "1px solid #e1e3e5",
-                                  borderRadius: "4px",
-                                  boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
-                                  maxHeight: "300px",
-                                  overflowY: "auto",
-                                }}>
-                                  {poSearchResults.map((result) => (
-                                    <div
-                                      key={result.id}
-                                      onClick={() => handleSelectResult(po.id, result)}
-                                      style={{
-                                        padding: "10px 14px",
-                                        cursor: "pointer",
-                                        borderBottom: "1px solid #f1f2f3",
-                                      }}
-                                      onMouseEnter={(e) => e.currentTarget.style.background = "#f6f6f7"}
-                                      onMouseLeave={(e) => e.currentTarget.style.background = "#fff"}
-                                    >
-                                      <Text fontWeight="semibold">
-                                        {result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}
-                                      </Text>
-                                      <Text tone="subdued" variant="bodySm">
-                                        SKU: {result.sku} · ${result.cost.toFixed(2)}
-                                        {result.supplierCode ? ` · Code: ${result.supplierCode}` : ""}
-                                      </Text>
-                                    </div>
-                                  ))}
-                                </div>
-                              )}
-                            </div>
+                            <TextField
+                              label="Search by product name or SKU"
+                              labelHidden
+                              value={skuSearch[po.id] ?? ""}
+                              onChange={(val) => handleSearchChange(po.id, po.supplierId, val)}
+                              autoComplete="off"
+                              placeholder="Type product name or SKU..."
+                              suffix={isSearching ? <Spinner size="small" /> : undefined}
+                            />
+
+                            {poSearchResults.length > 0 && (
+                              <div style={{
+                                background: "#fff",
+                                border: "1px solid #e1e3e5",
+                                borderRadius: "4px",
+                                boxShadow: "0 2px 8px rgba(0,0,0,0.1)",
+                                maxHeight: "300px",
+                                overflowY: "auto",
+                                marginTop: "4px",
+                              }}>
+                                {poSearchResults.map((result) => (
+                                  <div
+                                    key={result.id}
+                                    onClick={() => handleSelectResult(po.id, result)}
+                                    style={{
+                                      padding: "10px 14px",
+                                      cursor: "pointer",
+                                      borderBottom: "1px solid #f1f2f3",
+                                    }}
+                                    onMouseEnter={(e) => e.currentTarget.style.background = "#f6f6f7"}
+                                    onMouseLeave={(e) => e.currentTarget.style.background = "#fff"}
+                                  >
+                                    <Text fontWeight="semibold">
+                                      {result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}
+                                    </Text>
+                                    <Text tone="subdued" variant="bodySm">
+                                      SKU: {result.sku} · ${result.cost.toFixed(2)}
+                                      {result.supplierCode ? ` · Code: ${result.supplierCode}` : ""}
+                                    </Text>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
 
                             {poSelected && (
                               <Card>
@@ -1285,7 +1276,9 @@ export default function PurchaseOrders() {
                                     <Text fontWeight="semibold">
                                       {poSelected.productTitle}{poSelected.variantTitle ? ` — ${poSelected.variantTitle}` : ""}
                                     </Text>
-                                    <Text tone="subdued">SKU: {poSelected.sku}{poSelected.supplierCode ? ` · Code: ${poSelected.supplierCode}` : ""}</Text>
+                                    <Text tone="subdued">
+                                      SKU: {poSelected.sku}{poSelected.supplierCode ? ` · Code: ${poSelected.supplierCode}` : ""}
+                                    </Text>
                                   </BlockStack>
                                   <InlineStack gap="300" blockAlign="end">
                                     <div style={{ width: "100px" }}>

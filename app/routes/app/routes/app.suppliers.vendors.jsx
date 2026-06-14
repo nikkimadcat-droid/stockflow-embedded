@@ -274,11 +274,9 @@ export default function Suppliers() {
               Saved successfully.
             </Banner>
           )}
-
-          {/* Vendor sources link */}
-          <div style={{ marginBottom: "16px" }}>
+<div style={{ marginBottom: "16px" }}>
             <InlineStack align="end">
-              <Button url="/app/suppliers/vendors">
+              <Button onClick={() => navigate("/app/suppliers/vendors")}>
                 Vendor sources
               </Button>
             </InlineStack>

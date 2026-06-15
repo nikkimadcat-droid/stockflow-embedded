@@ -52,14 +52,14 @@ export const loader = async ({ request }) => {
       query($cursor: String) {
         products(first: 250, after: $cursor) {
           pageInfo { hasNextPage endCursor }
-          edges { node { vendor productType requiresComponents } }
+          edges { node { vendor productType hasVariantsThatRequiresComponents } }
         }
       }
     `, { variables: { cursor } });
     const json = await res.json();
     const page = json.data.products;
     for (const { node: p } of page.edges) {
-      if (p.requiresComponents) continue; // skip bundles
+      if (p.hasVariantsThatRequiresComponents) continue;
       if (p.vendor) vendors.add(p.vendor);
       if (p.productType) types.add(p.productType);
     }
@@ -107,7 +107,7 @@ export const action = async ({ request }) => {
                 title
                 vendor
                 productType
-                requiresComponents
+                hasVariantsThatRequiresComponents
                 variants(first: 100) {
                   edges {
                     node {
@@ -133,7 +133,7 @@ export const action = async ({ request }) => {
 
     // filter by vendor/type and exclude bundles
     const filtered = products.filter(p =>
-      !p.requiresComponents &&
+      !p.hasVariantsThatRequiresComponents &&
       (!vendorFilter || p.vendor === vendorFilter) &&
       (!typeFilter || p.productType === typeFilter)
     );
@@ -198,7 +198,7 @@ export const action = async ({ request }) => {
       .flatMap(p =>
         p.variants.edges
           .map(({ node: v }) => ({ v, p }))
-          .filter(({ v }) => minmaxSet.has(v.id)) // only variants with min/max
+          .filter(({ v }) => minmaxSet.has(v.id))
           .map(({ v, p }) => ({
             variantId: v.id,
             productTitle: p.title,

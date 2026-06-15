@@ -508,12 +508,12 @@ export const action = async ({ request }) => {
           input: {
             reason: "redistribution",
             referenceDocumentUri: `stockflow://transfer/${transfer.transferNumber}`,
-            changes: [{
-              inventoryItemId,
-              quantity: item.qty,
-              from: { locationId: transfer.fromLocationId },
-              to: { locationId: transfer.toLocationId },
-            }],
+           changes: [{
+  inventoryItemId,
+  quantity: item.qty,
+  from: { locationId: transfer.fromLocationId, name: "available" },
+  to: { locationId: transfer.toLocationId, name: "available" },
+}],
           },
         },
       });

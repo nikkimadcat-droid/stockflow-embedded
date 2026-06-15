@@ -35,11 +35,10 @@ function downloadCSV(po, onHandMap) {
     ["PO Number", "Supplier", "Status", "Created"],
     [po.poNumber, po.supplier?.name ?? "", po.status, new Date(po.createdAt).toLocaleDateString()],
     [],
-    ["Supplier Code", "Product", "Variant", "SKU", "On Hand", "Qty Ordered", "Unit Cost", "Line Total"],
+    ["Supplier Code", "Product", "SKU", "On Hand", "Qty Ordered", "Unit Cost", "Line Total"],
     ...po.items.map((i) => [
       i.supplierCode ?? "",
       i.productTitle,
-      i.variantTitle,
       i.sku,
       onHandMap?.[i.variantId] !== undefined ? onHandMap[i.variantId] : "",
       i.qtyOrdered,
@@ -47,7 +46,7 @@ function downloadCSV(po, onHandMap) {
       (i.qtyOrdered * i.qtyCost).toFixed(2),
     ]),
     [],
-    ["", "", "", "", "TOTAL", "", "", po.items.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0).toFixed(2)],
+    ["", "", "", "TOTAL", "", "", po.items.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0).toFixed(2)],
   ];
 
   const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
@@ -335,7 +334,6 @@ export const action = async ({ request }) => {
       select: { variantId: true, supplierCode: true, cost: true },
     });
 
-    // Build map preferring records with non-empty supplierCode
     const supplierSkuMap = new Map();
     for (const s of supplierSkus) {
       const existing = supplierSkuMap.get(s.variantId);
@@ -883,8 +881,8 @@ export default function PurchaseOrders() {
     if (item.removed) {
       return (
         <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3", opacity: 0.4 }}>
-          <td colSpan={hasOnHand ? 8 : 7} style={{ padding: "8px 12px" }}>
-            <Text tone="subdued"><s>{item.productTitle} — {item.variantTitle}</s></Text>
+          <td colSpan={hasOnHand ? 7 : 6} style={{ padding: "8px 12px" }}>
+            <Text tone="subdued"><s>{item.productTitle}</s></Text>
           </td>
           <td style={{ padding: "8px 12px" }}>
             <Button variant="plain" onClick={() => handleRestoreItem(po.id, item.id)}>Restore</Button>
@@ -905,7 +903,6 @@ export default function PurchaseOrders() {
           />
         </td>
         <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>
-        <td style={{ padding: "8px 12px" }}><Text>{item.variantTitle}</Text></td>
         <td style={{ padding: "8px 12px" }}><Text>{item.sku}</Text></td>
         {hasOnHand && (
           <td style={{ padding: "8px 12px", width: "80px", textAlign: "center" }}>
@@ -1009,7 +1006,7 @@ export default function PurchaseOrders() {
                     <table style={{ width: "100%", borderCollapse: "collapse" }}>
                       <thead>
                         <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                          {["Product", "Variant", "SKU", "Qty to Receive"].map((h, i) => (
+                          {["Product", "SKU", "Qty to Receive"].map((h, i) => (
                             <th key={i} style={{ padding: "8px 12px", textAlign: "left" }}>
                               <Text variant="headingSm">{h}</Text>
                             </th>
@@ -1022,7 +1019,6 @@ export default function PurchaseOrders() {
                           .map((item) => (
                             <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
                               <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>
-                              <td style={{ padding: "8px 12px" }}><Text>{item.variantTitle}</Text></td>
                               <td style={{ padding: "8px 12px" }}><Text>{item.sku}</Text></td>
                               <td style={{ padding: "8px 12px", width: "110px" }}>
                                 <TextField
@@ -1093,7 +1089,7 @@ export default function PurchaseOrders() {
             });
 
             const tableHeaders = [
-              "Supplier Code", "Product", "Variant", "SKU",
+              "Supplier Code", "Product", "SKU",
               ...(hasOnHand ? ["On Hand"] : []),
               "Qty", "Unit Cost", "Line Total", "",
             ];
@@ -1215,7 +1211,7 @@ export default function PurchaseOrders() {
                                     </>
                                   )}
                                   <tr style={{ borderTop: "2px solid #e1e3e5" }}>
-                                    <td colSpan={hasOnHand ? 5 : 4} style={{ padding: "8px 12px" }}>
+                                    <td colSpan={hasOnHand ? 4 : 3} style={{ padding: "8px 12px" }}>
                                       <Text variant="headingSm">Total</Text>
                                     </td>
                                     <td style={{ padding: "8px 12px" }}>

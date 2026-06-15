@@ -52,13 +52,14 @@ export const loader = async ({ request }) => {
       query($cursor: String) {
         products(first: 250, after: $cursor) {
           pageInfo { hasNextPage endCursor }
-          edges { node { vendor productType } }
+          edges { node { vendor productType requiresComponents } }
         }
       }
     `, { variables: { cursor } });
     const json = await res.json();
     const page = json.data.products;
     for (const { node: p } of page.edges) {
+      if (p.requiresComponents) continue; // skip bundles
       if (p.vendor) vendors.add(p.vendor);
       if (p.productType) types.add(p.productType);
     }
@@ -83,6 +84,7 @@ export const action = async ({ request }) => {
     const locationId = form.get("locationId");
     const vendorFilter = form.get("vendorFilter");
     const typeFilter = form.get("typeFilter");
+    const shop = session.shop;
 
     const products = [];
     let cursor = null;
@@ -105,6 +107,7 @@ export const action = async ({ request }) => {
                 title
                 vendor
                 productType
+                requiresComponents
                 variants(first: 100) {
                   edges {
                     node {
@@ -128,11 +131,14 @@ export const action = async ({ request }) => {
       cursor = page.pageInfo.endCursor;
     }
 
+    // filter by vendor/type and exclude bundles
     const filtered = products.filter(p =>
+      !p.requiresComponents &&
       (!vendorFilter || p.vendor === vendorFilter) &&
       (!typeFilter || p.productType === typeFilter)
     );
 
+    // collect all variant IDs
     const variantIds = new Set();
     for (const p of filtered) {
       for (const { node: v } of p.variants.edges) {
@@ -140,6 +146,14 @@ export const action = async ({ request }) => {
       }
     }
 
+    // load min/max for this location — only keep variants that have a record
+    const minmaxRows = await db.minMax.findMany({
+      where: { shop, locationId, variantId: { in: [...variantIds] } },
+      select: { variantId: true },
+    });
+    const minmaxSet = new Set(minmaxRows.map(m => m.variantId));
+
+    // get inventory levels
     const invMap = {};
     let invCursor = null;
     let invHasMore = true;
@@ -182,16 +196,19 @@ export const action = async ({ request }) => {
 
     const rows = filtered
       .flatMap(p =>
-        p.variants.edges.map(({ node: v }) => ({
-          variantId: v.id,
-          productTitle: p.title,
-          variantTitle: v.title === "Default Title" ? "" : v.title,
-          vendor: p.vendor,
-          productType: p.productType,
-          sku: v.sku || "—",
-          onHand: invMap[v.id]?.qty ?? 0,
-          inventoryItemId: invMap[v.id]?.inventoryItemId ?? null,
-        }))
+        p.variants.edges
+          .map(({ node: v }) => ({ v, p }))
+          .filter(({ v }) => minmaxSet.has(v.id)) // only variants with min/max
+          .map(({ v, p }) => ({
+            variantId: v.id,
+            productTitle: p.title,
+            variantTitle: v.title === "Default Title" ? "" : v.title,
+            vendor: p.vendor,
+            productType: p.productType,
+            sku: v.sku || "—",
+            onHand: invMap[v.id]?.qty ?? 0,
+            inventoryItemId: invMap[v.id]?.inventoryItemId ?? null,
+          }))
       )
       .sort((a, b) => a.productTitle.localeCompare(b.productTitle));
 
@@ -397,7 +414,6 @@ export default function Stocktake() {
       fd.append("stocktakeId", loadId);
       fetcher.submit(fd, { method: "post" });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams]);
 
   if (!isListView && fetcher.data?.intent === "fetchInventory" && fetcher.data.rows !== rows) {

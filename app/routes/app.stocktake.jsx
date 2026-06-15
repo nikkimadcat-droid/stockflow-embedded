@@ -398,7 +398,7 @@ export default function Stocktake() {
       fetcher.submit(fd, { method: "post" });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [searchParams]);
 
   if (!isListView && fetcher.data?.intent === "fetchInventory" && fetcher.data.rows !== rows) {
     setRows(fetcher.data.rows);

@@ -386,8 +386,7 @@ export const action = async ({ request }) => {
         if (seen.has(v.id)) continue;
         seen.add(v.id);
         variants.push({
-          id: v.id,
-          sku: v.sku,
+          id: v.id, sku: v.sku,
           productTitle: p.title,
           variantTitle: v.title === "Default Title" ? "" : v.title,
           vendor: p.vendor,
@@ -399,15 +398,13 @@ export const action = async ({ request }) => {
       if (seen.has(v.id)) continue;
       seen.add(v.id);
       variants.push({
-        id: v.id,
-        sku: v.sku,
+        id: v.id, sku: v.sku,
         productTitle: v.product?.title ?? "",
         variantTitle: v.title === "Default Title" ? "" : v.title,
         vendor: v.product?.vendor ?? "",
       });
     }
 
-    // fetch on-hand at source for matched variants
     const variantIdSet = new Set(variants.map(v => v.id));
     const onHand = {};
     let cursor = null;
@@ -434,9 +431,7 @@ export const action = async ({ request }) => {
       cursor = levels?.pageInfo?.endCursor ?? null;
       for (const e of levels?.edges ?? []) {
         const vid = e.node?.item?.variant?.id;
-        if (vid && variantIdSet.has(vid)) {
-          onHand[vid] = e.node.quantities?.[0]?.quantity ?? 0;
-        }
+        if (vid && variantIdSet.has(vid)) onHand[vid] = e.node.quantities?.[0]?.quantity ?? 0;
       }
       if (Object.keys(onHand).length === variants.length) break;
     }
@@ -458,8 +453,7 @@ export const action = async ({ request }) => {
       data: {
         transferId, variantId,
         productTitle, variantTitle,
-        vendor, sku,
-        qty,
+        vendor, sku, qty,
         updatedAt: new Date(),
       },
     });
@@ -513,12 +507,12 @@ export const action = async ({ request }) => {
         variables: {
           input: {
             reason: "redistribution",
+            referenceDocumentUri: `stockflow://transfer/${transfer.transferNumber}`,
             changes: [{
               inventoryItemId,
-              fromLocationId: transfer.fromLocationId,
-              toLocationId: transfer.toLocationId,
               quantity: item.qty,
-              ledgerDocumentUri: `stockflow://transfer/${transfer.transferNumber}`,
+              from: { locationId: transfer.fromLocationId },
+              to: { locationId: transfer.toLocationId },
             }],
           },
         },
@@ -573,7 +567,6 @@ export default function Transfers() {
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
 
-  // handle search results coming back
   if (
     fetcher.state === "idle" &&
     fetcherData?.intent === "searchProducts" &&
@@ -657,10 +650,8 @@ export default function Transfers() {
     setItemSearch(prev => ({ ...prev, [transferId]: val }));
     setSearchResults(prev => ({ ...prev, [transferId]: [] }));
     setSelectedResult(prev => ({ ...prev, [transferId]: null }));
-
     if (debounceTimers.current[transferId]) clearTimeout(debounceTimers.current[transferId]);
     if (!val.trim() || val.trim().length < 2) return;
-
     debounceTimers.current[transferId] = setTimeout(() => {
       const fd = new FormData();
       fd.append("intent", "searchProducts");
@@ -981,6 +972,8 @@ export default function Transfers() {
               fetcher.formData?.get("intent") === "searchProducts" &&
               fetcher.formData?.get("transferId") === transfer.id;
 
+            const canPush = transfer.status === "draft" && activeItems.length > 0;
+
             return (
               <div key={transfer.id} style={{ marginBottom: "1rem" }}>
                 <Card>
@@ -1010,13 +1003,11 @@ export default function Transfers() {
                         <Button variant="plain" onClick={() => downloadPickListCSV(transfer, locationName(transfer.toLocationId), activeItems)}>
                           ↓ Pick List CSV
                         </Button>
-                        <Button
-                          variant="primary"
-                          onClick={() => handlePushToShopify(transfer.id)}
-                          disabled={transfer.status === "received" || transfer.status === "cancelled" || activeItems.length === 0}
-                        >
-                          Push to Shopify
-                        </Button>
+                        {canPush && (
+                          <Button variant="primary" onClick={() => handlePushToShopify(transfer.id)}>
+                            Push to Shopify
+                          </Button>
+                        )}
                         <Button variant="plain" onClick={() => setExpandedId(isExpanded ? null : transfer.id)}>
                           {isExpanded ? "Hide items" : "View items"}
                         </Button>
@@ -1028,7 +1019,6 @@ export default function Transfers() {
                       <>
                         <Divider />
                         <BlockStack gap="400">
-                          {/* removed items */}
                           {displayItems.filter(i => i.removed).map(item => (
                             <div key={item.id} style={{ opacity: 0.4 }}>
                               <InlineStack align="space-between">
@@ -1042,7 +1032,6 @@ export default function Transfers() {
                             <Banner tone="info">No items yet — search below to add products.</Banner>
                           )}
 
-                          {/* grouped by vendor */}
                           {Object.entries(byVendor).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) => (
                             <BlockStack key={vendor} gap="200">
                               <div style={{ background: "#f6f6f7", padding: "6px 12px", borderRadius: "6px" }}>
@@ -1092,7 +1081,6 @@ export default function Transfers() {
                             </InlineStack>
                           )}
 
-                          {/* ── add item search ── */}
                           <Divider />
                           <Text variant="headingSm">Add item</Text>
                           <TextField

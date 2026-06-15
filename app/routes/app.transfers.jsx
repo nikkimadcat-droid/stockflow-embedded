@@ -497,28 +497,27 @@ export const action = async ({ request }) => {
       const inventoryItemId = json.data?.productVariant?.inventoryItem?.id;
       if (!inventoryItemId) continue;
 
-      const moveRes = await admin.graphql(`
-        mutation($input: InventoryMoveQuantitiesInput!) {
-          inventoryMoveQuantities(input: $input) {
+      const adjRes = await admin.graphql(`
+        mutation($input: InventoryAdjustQuantitiesInput!) {
+          inventoryAdjustQuantities(input: $input) {
+            inventoryAdjustmentGroup { id }
             userErrors { field message }
           }
         }
       `, {
         variables: {
           input: {
-            reason: "redistribution",
-            referenceDocumentUri: `stockflow://transfer/${transfer.transferNumber}`,
-           changes: [{
-  inventoryItemId,
-  quantity: item.qty,
-  from: { locationId: transfer.fromLocationId, name: "available" },
-  to: { locationId: transfer.toLocationId, name: "available" },
-}],
+            reason: "restock",
+            name: "available",
+            changes: [
+              { inventoryItemId, locationId: transfer.fromLocationId, delta: -item.qty },
+              { inventoryItemId, locationId: transfer.toLocationId, delta: item.qty },
+            ],
           },
         },
       });
-      const moveJson = await moveRes.json();
-      const errs = moveJson.data?.inventoryMoveQuantities?.userErrors ?? [];
+      const adjJson = await adjRes.json();
+      const errs = adjJson.data?.inventoryAdjustQuantities?.userErrors ?? [];
       if (errs.length > 0) errors.push(...errs.map(e => e.message));
     }
 
@@ -797,7 +796,6 @@ export default function Transfers() {
             </Banner>
           )}
 
-          {/* ── template transfer modal ── */}
           <Modal
             open={showCreate}
             onClose={() => setShowCreate(false)}
@@ -828,7 +826,6 @@ export default function Transfers() {
             </Modal.Section>
           </Modal>
 
-          {/* ── ad-hoc transfer modal ── */}
           <Modal
             open={showAdHoc}
             onClose={() => setShowAdHoc(false)}
@@ -854,7 +851,6 @@ export default function Transfers() {
             </Modal.Section>
           </Modal>
 
-          {/* ── manage templates modal ── */}
           <Modal
             open={showTemplates}
             onClose={() => setShowTemplates(false)}
@@ -901,7 +897,6 @@ export default function Transfers() {
             </Modal.Section>
           </Modal>
 
-          {/* ── edit template vendors modal ── */}
           {showEditTemplate && (
             <Modal
               open={!!showEditTemplate}
@@ -925,7 +920,6 @@ export default function Transfers() {
             </Modal>
           )}
 
-          {/* ── loading ── */}
           {isSubmitting && (
             <div style={{ textAlign: "center", padding: "2rem" }}>
               <Spinner size="large" />
@@ -935,7 +929,6 @@ export default function Transfers() {
             </div>
           )}
 
-          {/* ── empty state ── */}
           {!isSubmitting && transfers.length === 0 && (
             <Card>
               <EmptyState heading="No transfers yet" image="">
@@ -944,7 +937,6 @@ export default function Transfers() {
             </Card>
           )}
 
-          {/* ── transfer list ── */}
           {!isSubmitting && transfers.map(transfer => {
             const isExpanded = expandedId === transfer.id;
             const poEdits = qtyEdits[transfer.id] ?? {};

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -51,7 +51,6 @@ function downloadPickListCSV(transfer, locationName, items) {
 }
 
 async function buildDistributionItems(admin, db, shop, fromLocationId, toLocationId, vendorNames) {
-  // get all products for these vendors
   const products = [];
   for (const vendor of vendorNames) {
     let cursor = null;
@@ -63,13 +62,9 @@ async function buildDistributionItems(admin, db, shop, fromLocationId, toLocatio
             pageInfo { hasNextPage endCursor }
             edges {
               node {
-                id
-                title
-                vendor
+                id title vendor
                 variants(first: 100) {
-                  edges {
-                    node { id sku }
-                  }
+                  edges { node { id sku } }
                 }
               }
             }
@@ -84,39 +79,26 @@ async function buildDistributionItems(admin, db, shop, fromLocationId, toLocatio
     }
   }
 
-  // build variant map
   const variantMap = {};
   for (const p of products) {
     for (const { node: v } of p.variants.edges) {
-      variantMap[v.id] = {
-        variantId: v.id,
-        productTitle: p.title,
-        vendor: p.vendor,
-        sku: v.sku || "—",
-      };
+      variantMap[v.id] = { variantId: v.id, productTitle: p.title, vendor: p.vendor, sku: v.sku || "—" };
     }
   }
   const variantIds = new Set(Object.keys(variantMap));
 
-  // get min/max at destination
   const destMinMax = {};
   const minmaxRows = await db.minMax.findMany({
     where: { shop, locationId: toLocationId, variantId: { in: [...variantIds] } },
   });
-  for (const mm of minmaxRows) {
-    destMinMax[mm.variantId] = mm;
-  }
+  for (const mm of minmaxRows) destMinMax[mm.variantId] = mm;
 
-  // get min/max at source (for floor)
   const srcMinMax = {};
   const srcMinmaxRows = await db.minMax.findMany({
     where: { shop, locationId: fromLocationId, variantId: { in: [...variantIds] } },
   });
-  for (const mm of srcMinmaxRows) {
-    srcMinMax[mm.variantId] = mm;
-  }
+  for (const mm of srcMinmaxRows) srcMinMax[mm.variantId] = mm;
 
-  // paginate inventory at destination
   const destInv = {};
   let cursor = null;
   let hasMore = true;
@@ -142,13 +124,10 @@ async function buildDistributionItems(admin, db, shop, fromLocationId, toLocatio
     cursor = levels?.pageInfo?.endCursor ?? null;
     for (const e of levels?.edges ?? []) {
       const vid = e.node.item?.variant?.id;
-      if (vid && variantIds.has(vid)) {
-        destInv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
-      }
+      if (vid && variantIds.has(vid)) destInv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
     }
   }
 
-  // paginate inventory at source
   const srcInv = {};
   let srcCursor = null;
   let srcHasMore = true;
@@ -174,52 +153,35 @@ async function buildDistributionItems(admin, db, shop, fromLocationId, toLocatio
     srcCursor = levels?.pageInfo?.endCursor ?? null;
     for (const e of levels?.edges ?? []) {
       const vid = e.node.item?.variant?.id;
-      if (vid && variantIds.has(vid)) {
-        srcInv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
-      }
+      if (vid && variantIds.has(vid)) srcInv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
     }
   }
 
-  // calculate transfer quantities
   const items = [];
   for (const [vid, info] of Object.entries(variantMap)) {
     const mm = destMinMax[vid];
-    if (!mm) continue; // no min/max set at destination — skip
-
+    if (!mm) continue;
     const destOnHand = destInv[vid] ?? 0;
     const destNeed = mm.maxLevel - destOnHand;
-    if (destNeed <= 0) continue; // destination is stocked up
-
+    if (destNeed <= 0) continue;
     const srcOnHand = srcInv[vid] ?? 0;
     const srcMin = srcMinMax[vid]?.minLevel ?? 0;
     const available = srcOnHand - srcMin;
-    if (available <= 0) continue; // source has nothing above their own min
-
-    // round need up to case pack
+    if (available <= 0) continue;
     const casePack = mm.casePackSize || 1;
     const rawQty = Math.min(destNeed, available);
-    const qty = casePack > 1
-      ? Math.min(Math.ceil(rawQty / casePack) * casePack, available)
-      : rawQty;
-
+    const qty = casePack > 1 ? Math.min(Math.ceil(rawQty / casePack) * casePack, available) : rawQty;
     if (qty <= 0) continue;
-
     items.push({
       variantId: vid,
       productTitle: info.productTitle,
       variantTitle: "",
       vendor: info.vendor,
       sku: info.sku,
-      qty,
-      srcOnHand,
-      srcMin,
-      available,
-      destOnHand,
-      destNeed,
+      qty, srcOnHand, srcMin, available, destOnHand, destNeed,
     });
   }
 
-  // sort by vendor then product title
   items.sort((a, b) => {
     if (a.vendor !== b.vendor) return a.vendor.localeCompare(b.vendor);
     return a.productTitle.localeCompare(b.productTitle);
@@ -238,7 +200,6 @@ export const loader = async ({ request }) => {
   const locJson = await locRes.json();
   const locations = locJson.data.locations.edges.map(e => e.node);
 
-  // get all vendors from Shopify
   const vendors = new Set();
   let cursor = null;
   let hasMore = true;
@@ -253,9 +214,7 @@ export const loader = async ({ request }) => {
     `, { variables: { cursor } });
     const json = await res.json();
     const page = json.data.products;
-    for (const { node: p } of page.edges) {
-      if (p.vendor) vendors.add(p.vendor);
-    }
+    for (const { node: p } of page.edges) { if (p.vendor) vendors.add(p.vendor); }
     hasMore = page.pageInfo.hasNextPage;
     cursor = page.pageInfo.endCursor;
   }
@@ -272,13 +231,7 @@ export const loader = async ({ request }) => {
     orderBy: { createdAt: "desc" },
   });
 
-  return {
-    locations,
-    allVendors: [...vendors].sort(),
-    templates,
-    transfers,
-    shop,
-  };
+  return { locations, allVendors: [...vendors].sort(), templates, transfers, shop };
 };
 
 export const action = async ({ request }) => {
@@ -292,17 +245,12 @@ export const action = async ({ request }) => {
     const fromLocationId = form.get("fromLocationId");
     const toLocationId = form.get("toLocationId");
     const vendorList = JSON.parse(form.get("vendors") || "[]");
-
     await db.transferTemplate.create({
       data: {
-        shop, name,
-        type: "distribution",
-        fromLocationId,
-        toLocationId,
+        shop, name, type: "distribution",
+        fromLocationId, toLocationId,
         updatedAt: new Date(),
-        vendors: {
-          create: vendorList.map(v => ({ vendor: v })),
-        },
+        vendors: { create: vendorList.map(v => ({ vendor: v })) },
       },
     });
     return { ok: true };
@@ -331,19 +279,20 @@ export const action = async ({ request }) => {
     const notes = form.get("notes") || "";
     const transferNumber = transferNumberGen();
 
-    const template = await db.transferTemplate.findUnique({
-      where: { id: templateId },
-      include: { vendors: true },
-    });
-    const vendorNames = template?.vendors.map(v => v.vendor) ?? [];
-
-    const items = await buildDistributionItems(
-      admin, db, shop, fromLocationId, toLocationId, vendorNames
-    );
+    let items = [];
+    if (templateId) {
+      const template = await db.transferTemplate.findUnique({
+        where: { id: templateId },
+        include: { vendors: true },
+      });
+      const vendorNames = template?.vendors.map(v => v.vendor) ?? [];
+      items = await buildDistributionItems(admin, db, shop, fromLocationId, toLocationId, vendorNames);
+    }
 
     await db.transfer.create({
       data: {
-        shop, transferNumber, templateId,
+        shop, transferNumber,
+        templateId: templateId || null,
         fromLocationId, toLocationId,
         status: "draft", notes,
         items: {
@@ -370,15 +319,8 @@ export const action = async ({ request }) => {
       include: { template: { include: { vendors: true } } },
     });
     if (!transfer) return { ok: false };
-
     const vendorNames = transfer.template?.vendors.map(v => v.vendor) ?? [];
-    const items = await buildDistributionItems(
-      admin, db, shop,
-      transfer.fromLocationId,
-      transfer.toLocationId,
-      vendorNames
-    );
-
+    const items = await buildDistributionItems(admin, db, shop, transfer.fromLocationId, transfer.toLocationId, vendorNames);
     await db.transferItem.deleteMany({ where: { transferId: id } });
     await db.transfer.update({
       where: { id },
@@ -400,11 +342,134 @@ export const action = async ({ request }) => {
     return { ok: true, regenerated: true };
   }
 
+  if (intent === "searchProducts") {
+    const query = form.get("query");
+    const transferId = form.get("transferId");
+    const fromLocationId = form.get("fromLocationId");
+
+    const [titleRes, skuRes] = await Promise.all([
+      admin.graphql(`
+        query($query: String!) {
+          products(first: 10, query: $query) {
+            edges {
+              node {
+                title vendor
+                variants(first: 20) {
+                  edges { node { id sku title } }
+                }
+              }
+            }
+          }
+        }
+      `, { variables: { query: `title:*${query}*` } }),
+      admin.graphql(`
+        query($query: String!) {
+          productVariants(first: 10, query: $query) {
+            edges {
+              node {
+                id sku title
+                product { title vendor }
+              }
+            }
+          }
+        }
+      `, { variables: { query: `sku:${query}*` } }),
+    ]);
+
+    const [titleJson, skuJson] = await Promise.all([titleRes.json(), skuRes.json()]);
+
+    const seen = new Set();
+    const variants = [];
+
+    for (const { node: p } of titleJson.data?.products?.edges ?? []) {
+      for (const { node: v } of p.variants.edges) {
+        if (seen.has(v.id)) continue;
+        seen.add(v.id);
+        variants.push({
+          id: v.id,
+          sku: v.sku,
+          productTitle: p.title,
+          variantTitle: v.title === "Default Title" ? "" : v.title,
+          vendor: p.vendor,
+        });
+      }
+    }
+
+    for (const { node: v } of skuJson.data?.productVariants?.edges ?? []) {
+      if (seen.has(v.id)) continue;
+      seen.add(v.id);
+      variants.push({
+        id: v.id,
+        sku: v.sku,
+        productTitle: v.product?.title ?? "",
+        variantTitle: v.title === "Default Title" ? "" : v.title,
+        vendor: v.product?.vendor ?? "",
+      });
+    }
+
+    // fetch on-hand at source for matched variants
+    const variantIdSet = new Set(variants.map(v => v.id));
+    const onHand = {};
+    let cursor = null;
+    let hasMore = true;
+    while (hasMore) {
+      const invRes = await admin.graphql(`
+        query($locationId: ID!, $cursor: String) {
+          location(id: $locationId) {
+            inventoryLevels(first: 250, after: $cursor) {
+              pageInfo { hasNextPage endCursor }
+              edges {
+                node {
+                  quantities(names: ["available"]) { quantity }
+                  item { variant { id } }
+                }
+              }
+            }
+          }
+        }
+      `, { variables: { locationId: fromLocationId, cursor } });
+      const invJson = await invRes.json();
+      const levels = invJson.data?.location?.inventoryLevels;
+      hasMore = levels?.pageInfo?.hasNextPage ?? false;
+      cursor = levels?.pageInfo?.endCursor ?? null;
+      for (const e of levels?.edges ?? []) {
+        const vid = e.node?.item?.variant?.id;
+        if (vid && variantIdSet.has(vid)) {
+          onHand[vid] = e.node.quantities?.[0]?.quantity ?? 0;
+        }
+      }
+      if (Object.keys(onHand).length === variants.length) break;
+    }
+
+    const results = variants.slice(0, 10).map(v => ({ ...v, onHand: onHand[v.id] ?? 0 }));
+    return { ok: true, intent: "searchProducts", transferId, results };
+  }
+
+  if (intent === "addItem") {
+    const transferId = form.get("transferId");
+    const variantId = form.get("variantId");
+    const productTitle = form.get("productTitle");
+    const variantTitle = form.get("variantTitle");
+    const vendor = form.get("vendor");
+    const sku = form.get("sku");
+    const qty = Number(form.get("qty")) || 1;
+
+    await db.transferItem.create({
+      data: {
+        transferId, variantId,
+        productTitle, variantTitle,
+        vendor, sku,
+        qty,
+        updatedAt: new Date(),
+      },
+    });
+    return { ok: true, intent: "addItem", transferId };
+  }
+
   if (intent === "updateItems") {
     const id = form.get("id");
     const updates = JSON.parse(form.get("updates"));
     const removedIds = JSON.parse(form.get("removedIds") || "[]");
-
     if (removedIds.length > 0) {
       await db.transferItem.deleteMany({ where: { id: { in: removedIds } } });
     }
@@ -426,21 +491,13 @@ export const action = async ({ request }) => {
 
   if (intent === "pushToShopify") {
     const id = form.get("id");
-    const transfer = await db.transfer.findUnique({
-      where: { id },
-      include: { items: true },
-    });
+    const transfer = await db.transfer.findUnique({ where: { id }, include: { items: true } });
     if (!transfer) return { ok: false };
 
     const errors = [];
     for (const item of transfer.items) {
-      // get inventory item ID
       const res = await admin.graphql(`
-        query($id: ID!) {
-          productVariant(id: $id) {
-            inventoryItem { id }
-          }
-        }
+        query($id: ID!) { productVariant(id: $id) { inventoryItem { id } } }
       `, { variables: { id: item.variantId } });
       const json = await res.json();
       const inventoryItemId = json.data?.productVariant?.inventoryItem?.id;
@@ -466,18 +523,13 @@ export const action = async ({ request }) => {
           },
         },
       });
-
       const moveJson = await moveRes.json();
       const errs = moveJson.data?.inventoryMoveQuantities?.userErrors ?? [];
       if (errs.length > 0) errors.push(...errs.map(e => e.message));
     }
 
     if (errors.length > 0) return { ok: false, errors };
-
-    await db.transfer.update({
-      where: { id },
-      data: { status: "sent", updatedAt: new Date() },
-    });
+    await db.transfer.update({ where: { id }, data: { status: "sent", updatedAt: new Date() } });
     return { ok: true, pushed: true };
   }
 
@@ -495,39 +547,51 @@ export default function Transfers() {
   const fetcher = useFetcher();
 
   const [showCreate, setShowCreate] = useState(false);
+  const [showAdHoc, setShowAdHoc] = useState(false);
   const [showTemplates, setShowTemplates] = useState(false);
   const [showEditTemplate, setShowEditTemplate] = useState(null);
   const [selectedTemplateId, setSelectedTemplateId] = useState(templates[0]?.id ?? "");
   const [notes, setNotes] = useState("");
+  const [adHocFrom, setAdHocFrom] = useState(locations[0]?.id ?? "");
+  const [adHocTo, setAdHocTo] = useState(locations[1]?.id ?? "");
+  const [adHocNotes, setAdHocNotes] = useState("");
   const [expandedId, setExpandedId] = useState(null);
   const [qtyEdits, setQtyEdits] = useState({});
   const [removedItems, setRemovedItems] = useState({});
+  const [itemSearch, setItemSearch] = useState({});
+  const [searchResults, setSearchResults] = useState({});
+  const [selectedResult, setSelectedResult] = useState({});
+  const [itemQty, setItemQty] = useState({});
 
-  // template form state
   const [newTemplateName, setNewTemplateName] = useState("");
   const [newTemplateFrom, setNewTemplateFrom] = useState(locations[0]?.id ?? "");
   const [newTemplateTo, setNewTemplateTo] = useState(locations[1]?.id ?? "");
   const [newTemplateVendors, setNewTemplateVendors] = useState(new Set());
   const [editVendors, setEditVendors] = useState(new Set());
 
+  const debounceTimers = useRef({});
   const isSubmitting = fetcher.state !== "idle";
+  const fetcherData = fetcher.data;
+
+  // handle search results coming back
+  if (
+    fetcher.state === "idle" &&
+    fetcherData?.intent === "searchProducts" &&
+    fetcherData?.transferId
+  ) {
+    const tid = fetcherData.transferId;
+    if (!searchResults[tid] || JSON.stringify(searchResults[tid]) !== JSON.stringify(fetcherData.results)) {
+      setSearchResults(prev => ({ ...prev, [tid]: fetcherData.results ?? [] }));
+    }
+  }
 
   const selectedTemplate = templates.find(t => t.id === selectedTemplateId);
 
   function toggleNewVendor(v) {
-    setNewTemplateVendors(prev => {
-      const s = new Set(prev);
-      s.has(v) ? s.delete(v) : s.add(v);
-      return s;
-    });
+    setNewTemplateVendors(prev => { const s = new Set(prev); s.has(v) ? s.delete(v) : s.add(v); return s; });
   }
-
   function toggleEditVendor(v) {
-    setEditVendors(prev => {
-      const s = new Set(prev);
-      s.has(v) ? s.delete(v) : s.add(v);
-      return s;
-    });
+    setEditVendors(prev => { const s = new Set(prev); s.has(v) ? s.delete(v) : s.add(v); return s; });
   }
 
   function handleCreateTemplate() {
@@ -578,6 +642,61 @@ export default function Transfers() {
     setNotes("");
   }
 
+  function handleCreateAdHoc() {
+    const fd = new FormData();
+    fd.append("intent", "create");
+    fd.append("fromLocationId", adHocFrom);
+    fd.append("toLocationId", adHocTo);
+    fd.append("notes", adHocNotes);
+    fetcher.submit(fd, { method: "post" });
+    setShowAdHoc(false);
+    setAdHocNotes("");
+  }
+
+  function handleSearchChange(transferId, fromLocationId, val) {
+    setItemSearch(prev => ({ ...prev, [transferId]: val }));
+    setSearchResults(prev => ({ ...prev, [transferId]: [] }));
+    setSelectedResult(prev => ({ ...prev, [transferId]: null }));
+
+    if (debounceTimers.current[transferId]) clearTimeout(debounceTimers.current[transferId]);
+    if (!val.trim() || val.trim().length < 2) return;
+
+    debounceTimers.current[transferId] = setTimeout(() => {
+      const fd = new FormData();
+      fd.append("intent", "searchProducts");
+      fd.append("query", val.trim());
+      fd.append("transferId", transferId);
+      fd.append("fromLocationId", fromLocationId);
+      fetcher.submit(fd, { method: "post" });
+    }, 400);
+  }
+
+  function handleSelectResult(transferId, result) {
+    setSelectedResult(prev => ({ ...prev, [transferId]: result }));
+    setSearchResults(prev => ({ ...prev, [transferId]: [] }));
+    setItemSearch(prev => ({ ...prev, [transferId]: `${result.productTitle}${result.variantTitle ? ` — ${result.variantTitle}` : ""}` }));
+    setItemQty(prev => ({ ...prev, [transferId]: "1" }));
+  }
+
+  function handleAddItem(transfer) {
+    const result = selectedResult[transfer.id];
+    if (!result) return;
+    const fd = new FormData();
+    fd.append("intent", "addItem");
+    fd.append("transferId", transfer.id);
+    fd.append("variantId", result.id);
+    fd.append("productTitle", result.productTitle);
+    fd.append("variantTitle", result.variantTitle);
+    fd.append("vendor", result.vendor);
+    fd.append("sku", result.sku);
+    fd.append("qty", itemQty[transfer.id] ?? "1");
+    fetcher.submit(fd, { method: "post" });
+    setItemSearch(prev => ({ ...prev, [transfer.id]: "" }));
+    setSearchResults(prev => ({ ...prev, [transfer.id]: [] }));
+    setSelectedResult(prev => ({ ...prev, [transfer.id]: null }));
+    setItemQty(prev => ({ ...prev, [transfer.id]: "" }));
+  }
+
   function handleRegenerate(id) {
     if (!confirm("Regenerate this transfer? Current items will be replaced with fresh inventory data.")) return;
     const fd = new FormData();
@@ -589,17 +708,11 @@ export default function Transfers() {
   }
 
   function handleQtyEdit(transferId, itemId, val) {
-    setQtyEdits(prev => ({
-      ...prev,
-      [transferId]: { ...prev[transferId], [itemId]: val },
-    }));
+    setQtyEdits(prev => ({ ...prev, [transferId]: { ...prev[transferId], [itemId]: val } }));
   }
 
   function handleRemoveItem(transferId, itemId) {
-    setRemovedItems(prev => ({
-      ...prev,
-      [transferId]: new Set([...(prev[transferId] ?? []), itemId]),
-    }));
+    setRemovedItems(prev => ({ ...prev, [transferId]: new Set([...(prev[transferId] ?? []), itemId]) }));
   }
 
   function handleRestoreItem(transferId, itemId) {
@@ -616,7 +729,6 @@ export default function Transfers() {
     const updates = transfer.items
       .filter(i => !removed.has(i.id) && edits[i.id] !== undefined)
       .map(i => ({ id: i.id, qty: edits[i.id] }));
-
     const fd = new FormData();
     fd.append("intent", "updateItems");
     fd.append("id", transfer.id);
@@ -675,6 +787,7 @@ export default function Transfers() {
         </Button>
       }
       secondaryActions={[
+        { content: "+ Ad-hoc Transfer", onAction: () => setShowAdHoc(true) },
         { content: "Manage Templates", onAction: () => setShowTemplates(true) },
       ]}
     >
@@ -689,11 +802,11 @@ export default function Transfers() {
 
           {templates.length === 0 && (
             <Banner tone="info">
-              Set up a transfer template first — click "Manage Templates" to get started.
+              Set up a transfer template first — click "Manage Templates" to get started. Or use "Ad-hoc Transfer" for one-off stock moves.
             </Banner>
           )}
 
-          {/* ── create transfer modal ── */}
+          {/* ── template transfer modal ── */}
           <Modal
             open={showCreate}
             onClose={() => setShowCreate(false)}
@@ -724,6 +837,32 @@ export default function Transfers() {
             </Modal.Section>
           </Modal>
 
+          {/* ── ad-hoc transfer modal ── */}
+          <Modal
+            open={showAdHoc}
+            onClose={() => setShowAdHoc(false)}
+            title="New Ad-hoc Transfer"
+            primaryAction={{ content: "Create Transfer", onAction: handleCreateAdHoc }}
+            secondaryActions={[{ content: "Cancel", onAction: () => setShowAdHoc(false) }]}
+          >
+            <Modal.Section>
+              <BlockStack gap="400">
+                <Select label="From location" options={locationOptions} value={adHocFrom} onChange={setAdHocFrom} />
+                <Select label="To location" options={locationOptions} value={adHocTo} onChange={setAdHocTo} />
+                <Banner tone="info">
+                  A blank transfer will be created. Search for items to add once it's open.
+                </Banner>
+                <TextField
+                  label="Notes (optional)"
+                  value={adHocNotes}
+                  onChange={setAdHocNotes}
+                  multiline={2}
+                  placeholder="Reason for transfer, etc."
+                />
+              </BlockStack>
+            </Modal.Section>
+          </Modal>
+
           {/* ── manage templates modal ── */}
           <Modal
             open={showTemplates}
@@ -733,9 +872,7 @@ export default function Transfers() {
           >
             <Modal.Section>
               <BlockStack gap="400">
-                {templates.length === 0 && (
-                  <Text tone="subdued">No templates yet — create one below.</Text>
-                )}
+                {templates.length === 0 && <Text tone="subdued">No templates yet — create one below.</Text>}
                 {templates.map(t => (
                   <Card key={t.id}>
                     <BlockStack gap="200">
@@ -753,35 +890,20 @@ export default function Transfers() {
                     </BlockStack>
                   </Card>
                 ))}
-
                 <Divider />
                 <Text variant="headingSm">Create new template</Text>
-                <TextField
-                  label="Template name"
-                  value={newTemplateName}
-                  onChange={setNewTemplateName}
-                  placeholder="e.g. Mineral Point → Monroe Street"
-                  autoComplete="off"
-                />
+                <TextField label="Template name" value={newTemplateName} onChange={setNewTemplateName} placeholder="e.g. Mineral Point → Monroe Street" autoComplete="off" />
                 <Select label="From location" options={locationOptions} value={newTemplateFrom} onChange={setNewTemplateFrom} />
                 <Select label="To location" options={locationOptions} value={newTemplateTo} onChange={setNewTemplateTo} />
                 <Text variant="headingSm">Vendors included ({newTemplateVendors.size} selected)</Text>
                 <div style={{ maxHeight: "300px", overflowY: "auto", border: "1px solid #e1e3e5", borderRadius: "8px", padding: "8px" }}>
                   {allVendors.map(v => (
                     <div key={v} style={{ padding: "4px 0" }}>
-                      <Checkbox
-                        label={v}
-                        checked={newTemplateVendors.has(v)}
-                        onChange={() => toggleNewVendor(v)}
-                      />
+                      <Checkbox label={v} checked={newTemplateVendors.has(v)} onChange={() => toggleNewVendor(v)} />
                     </div>
                   ))}
                 </div>
-                <Button
-                  variant="primary"
-                  onClick={handleCreateTemplate}
-                  disabled={!newTemplateName || newTemplateVendors.size === 0}
-                >
+                <Button variant="primary" onClick={handleCreateTemplate} disabled={!newTemplateName || newTemplateVendors.size === 0}>
                   Save template
                 </Button>
               </BlockStack>
@@ -803,11 +925,7 @@ export default function Transfers() {
                   <div style={{ maxHeight: "400px", overflowY: "auto", border: "1px solid #e1e3e5", borderRadius: "8px", padding: "8px" }}>
                     {allVendors.map(v => (
                       <div key={v} style={{ padding: "4px 0" }}>
-                        <Checkbox
-                          label={v}
-                          checked={editVendors.has(v)}
-                          onChange={() => toggleEditVendor(v)}
-                        />
+                        <Checkbox label={v} checked={editVendors.has(v)} onChange={() => toggleEditVendor(v)} />
                       </div>
                     ))}
                   </div>
@@ -827,10 +945,10 @@ export default function Transfers() {
           )}
 
           {/* ── empty state ── */}
-          {!isSubmitting && transfers.length === 0 && templates.length > 0 && (
+          {!isSubmitting && transfers.length === 0 && (
             <Card>
               <EmptyState heading="No transfers yet" image="">
-                <p>Create a transfer to move inventory between your locations.</p>
+                <p>Create a template-based transfer or use Ad-hoc Transfer for one-off stock moves.</p>
               </EmptyState>
             </Card>
           )}
@@ -850,13 +968,18 @@ export default function Transfers() {
             const activeItems = displayItems.filter(i => !i.removed);
             const totalUnits = activeItems.reduce((s, i) => s + i.qty, 0);
 
-            // group by vendor for display
             const byVendor = {};
             for (const item of activeItems) {
               const v = item.vendor || "Other";
               if (!byVendor[v]) byVendor[v] = [];
               byVendor[v].push(item);
             }
+
+            const tSearchResults = searchResults[transfer.id] ?? [];
+            const tSelected = selectedResult[transfer.id];
+            const isSearching = isSubmitting &&
+              fetcher.formData?.get("intent") === "searchProducts" &&
+              fetcher.formData?.get("transferId") === transfer.id;
 
             return (
               <div key={transfer.id} style={{ marginBottom: "1rem" }}>
@@ -867,6 +990,7 @@ export default function Transfers() {
                         <InlineStack gap="200" blockAlign="center">
                           <Text variant="headingMd">{transfer.transferNumber}</Text>
                           {statusBadge(transfer.status)}
+                          {!transfer.templateId && <Badge tone="attention">Ad-hoc</Badge>}
                         </InlineStack>
                         <Text tone="subdued">
                           {locationName(transfer.fromLocationId)} → {locationName(transfer.toLocationId)}
@@ -879,24 +1003,11 @@ export default function Transfers() {
                         </Text>
                       </BlockStack>
                       <InlineStack gap="200" wrap>
-                        <Select
-                          label=""
-                          labelHidden
-                          options={statusOptions}
-                          value={transfer.status}
-                          onChange={val => handleStatusChange(transfer.id, val)}
-                        />
-                        <Button variant="plain" onClick={() => handleRegenerate(transfer.id)}>
-                          ↺ Regenerate
-                        </Button>
-                        <Button
-                          variant="plain"
-                          onClick={() => downloadPickListCSV(
-                            transfer,
-                            locationName(transfer.toLocationId),
-                            activeItems
-                          )}
-                        >
+                        <Select label="" labelHidden options={statusOptions} value={transfer.status} onChange={val => handleStatusChange(transfer.id, val)} />
+                        {transfer.templateId && (
+                          <Button variant="plain" onClick={() => handleRegenerate(transfer.id)}>↺ Regenerate</Button>
+                        )}
+                        <Button variant="plain" onClick={() => downloadPickListCSV(transfer, locationName(transfer.toLocationId), activeItems)}>
                           ↓ Pick List CSV
                         </Button>
                         <Button
@@ -909,85 +1020,154 @@ export default function Transfers() {
                         <Button variant="plain" onClick={() => setExpandedId(isExpanded ? null : transfer.id)}>
                           {isExpanded ? "Hide items" : "View items"}
                         </Button>
-                        <Button variant="plain" tone="critical" onClick={() => handleDelete(transfer.id)}>
-                          Delete
-                        </Button>
+                        <Button variant="plain" tone="critical" onClick={() => handleDelete(transfer.id)}>Delete</Button>
                       </InlineStack>
                     </InlineStack>
 
                     {isExpanded && (
                       <>
                         <Divider />
-                        {transfer.items.length === 0 ? (
-                          <Banner tone="info">
-                            No items needed — all SKUs at the destination are at or above minimum levels, or the source has no stock above its own minimum.
-                          </Banner>
-                        ) : (
-                          <BlockStack gap="400">
-                            {/* removed items at top */}
-                            {displayItems.filter(i => i.removed).map(item => (
-                              <div key={item.id} style={{ opacity: 0.4 }}>
-                                <InlineStack align="space-between">
-                                  <Text tone="subdued"><s>{item.vendor} · {item.productTitle} · {item.sku}</s></Text>
-                                  <Button variant="plain" onClick={() => handleRestoreItem(transfer.id, item.id)}>Restore</Button>
-                                </InlineStack>
-                              </div>
-                            ))}
-
-                            {/* grouped by vendor */}
-                            {Object.entries(byVendor).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) => (
-                              <BlockStack key={vendor} gap="200">
-                                <div style={{ background: "#f6f6f7", padding: "6px 12px", borderRadius: "6px" }}>
-                                  <Text variant="headingSm">{vendor}</Text>
-                                </div>
-                                <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                                  <thead>
-                                    <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                                      <th style={{ padding: "6px 12px", textAlign: "left" }}><Text variant="headingSm">Product</Text></th>
-                                      <th style={{ padding: "6px 12px", textAlign: "left" }}><Text variant="headingSm">SKU</Text></th>
-                                      <th style={{ padding: "6px 12px", textAlign: "right" }}><Text variant="headingSm">Qty</Text></th>
-                                      <th style={{ padding: "6px 12px" }}></th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {items.map(item => {
-                                      const qty = poEdits[item.id] !== undefined ? poEdits[item.id] : String(item.qty);
-                                      return (
-                                        <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
-                                          <td style={{ padding: "6px 12px" }}><Text>{item.productTitle}</Text></td>
-                                          <td style={{ padding: "6px 12px" }}><Text>{item.sku}</Text></td>
-                                          <td style={{ padding: "6px 12px", width: "100px" }}>
-                                            <TextField
-                                              label=""
-                                              labelHidden
-                                              type="number"
-                                              value={qty}
-                                              onChange={val => handleQtyEdit(transfer.id, item.id, val)}
-                                              autoComplete="off"
-                                            />
-                                          </td>
-                                          <td style={{ padding: "6px 12px" }}>
-                                            <Button variant="plain" tone="critical" onClick={() => handleRemoveItem(transfer.id, item.id)}>
-                                              Remove
-                                            </Button>
-                                          </td>
-                                        </tr>
-                                      );
-                                    })}
-                                  </tbody>
-                                </table>
-                              </BlockStack>
-                            ))}
-
-                            {hasChanges && (
-                              <InlineStack align="end">
-                                <Button variant="primary" onClick={() => handleSaveItems(transfer)}>
-                                  Save changes
-                                </Button>
+                        <BlockStack gap="400">
+                          {/* removed items */}
+                          {displayItems.filter(i => i.removed).map(item => (
+                            <div key={item.id} style={{ opacity: 0.4 }}>
+                              <InlineStack align="space-between">
+                                <Text tone="subdued"><s>{item.vendor} · {item.productTitle} · {item.sku}</s></Text>
+                                <Button variant="plain" onClick={() => handleRestoreItem(transfer.id, item.id)}>Restore</Button>
                               </InlineStack>
-                            )}
-                          </BlockStack>
-                        )}
+                            </div>
+                          ))}
+
+                          {activeItems.length === 0 && !tSelected && (
+                            <Banner tone="info">No items yet — search below to add products.</Banner>
+                          )}
+
+                          {/* grouped by vendor */}
+                          {Object.entries(byVendor).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) => (
+                            <BlockStack key={vendor} gap="200">
+                              <div style={{ background: "#f6f6f7", padding: "6px 12px", borderRadius: "6px" }}>
+                                <Text variant="headingSm">{vendor}</Text>
+                              </div>
+                              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                                <thead>
+                                  <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
+                                    <th style={{ padding: "6px 12px", textAlign: "left" }}><Text variant="headingSm">Product</Text></th>
+                                    <th style={{ padding: "6px 12px", textAlign: "left" }}><Text variant="headingSm">SKU</Text></th>
+                                    <th style={{ padding: "6px 12px", textAlign: "right" }}><Text variant="headingSm">Qty</Text></th>
+                                    <th style={{ padding: "6px 12px" }}></th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {items.map(item => {
+                                    const qty = poEdits[item.id] !== undefined ? poEdits[item.id] : String(item.qty);
+                                    return (
+                                      <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
+                                        <td style={{ padding: "6px 12px" }}><Text>{item.productTitle}</Text></td>
+                                        <td style={{ padding: "6px 12px" }}><Text>{item.sku}</Text></td>
+                                        <td style={{ padding: "6px 12px", width: "100px" }}>
+                                          <TextField
+                                            label="" labelHidden
+                                            type="number"
+                                            value={qty}
+                                            onChange={val => handleQtyEdit(transfer.id, item.id, val)}
+                                            autoComplete="off"
+                                          />
+                                        </td>
+                                        <td style={{ padding: "6px 12px" }}>
+                                          <Button variant="plain" tone="critical" onClick={() => handleRemoveItem(transfer.id, item.id)}>
+                                            Remove
+                                          </Button>
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            </BlockStack>
+                          ))}
+
+                          {hasChanges && (
+                            <InlineStack align="end">
+                              <Button variant="primary" onClick={() => handleSaveItems(transfer)}>Save changes</Button>
+                            </InlineStack>
+                          )}
+
+                          {/* ── add item search ── */}
+                          <Divider />
+                          <Text variant="headingSm">Add item</Text>
+                          <TextField
+                            label="Search by product name or SKU"
+                            labelHidden
+                            value={itemSearch[transfer.id] ?? ""}
+                            onChange={val => handleSearchChange(transfer.id, transfer.fromLocationId, val)}
+                            autoComplete="off"
+                            placeholder="Type product name or SKU..."
+                            suffix={isSearching ? <Spinner size="small" /> : undefined}
+                          />
+
+                          {tSearchResults.length > 0 && (
+                            <div style={{
+                              background: "#fff",
+                              border: "1px solid #e1e3e5",
+                              borderRadius: "4px",
+                              boxShadow: "0 2px 8px rgba(0,0,0,0.1)",
+                              maxHeight: "300px",
+                              overflowY: "auto",
+                              marginTop: "4px",
+                            }}>
+                              {tSearchResults.map(result => (
+                                <div
+                                  key={result.id}
+                                  onClick={() => handleSelectResult(transfer.id, result)}
+                                  style={{ padding: "10px 14px", cursor: "pointer", borderBottom: "1px solid #f1f2f3" }}
+                                  onMouseEnter={e => e.currentTarget.style.background = "#f6f6f7"}
+                                  onMouseLeave={e => e.currentTarget.style.background = "#fff"}
+                                >
+                                  <Text fontWeight="semibold">
+                                    {result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}
+                                  </Text>
+                                  <Text tone="subdued" variant="bodySm">
+                                    SKU: {result.sku} · On hand at source: <strong>{result.onHand}</strong>
+                                  </Text>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          {tSelected && (
+                            <Card>
+                              <BlockStack gap="300">
+                                <BlockStack gap="100">
+                                  <Text fontWeight="semibold">
+                                    {tSelected.productTitle}{tSelected.variantTitle ? ` — ${tSelected.variantTitle}` : ""}
+                                  </Text>
+                                  <Text tone="subdued">
+                                    SKU: {tSelected.sku} · On hand at {locationName(transfer.fromLocationId)}: <strong>{tSelected.onHand}</strong>
+                                  </Text>
+                                </BlockStack>
+                                <InlineStack gap="300" blockAlign="end">
+                                  <div style={{ width: "100px" }}>
+                                    <TextField
+                                      label="Qty to transfer"
+                                      type="number"
+                                      value={itemQty[transfer.id] ?? "1"}
+                                      onChange={val => setItemQty(prev => ({ ...prev, [transfer.id]: val }))}
+                                      autoComplete="off"
+                                      min="1"
+                                    />
+                                  </div>
+                                  <Button
+                                    variant="primary"
+                                    onClick={() => handleAddItem(transfer)}
+                                    loading={isSubmitting && fetcher.formData?.get("intent") === "addItem"}
+                                  >
+                                    Add to transfer
+                                  </Button>
+                                </InlineStack>
+                              </BlockStack>
+                            </Card>
+                          )}
+                        </BlockStack>
                       </>
                     )}
                   </BlockStack>

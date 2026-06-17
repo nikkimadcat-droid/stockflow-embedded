@@ -150,7 +150,7 @@ model Transfer {
   items          TransferItem[]
 }
 
-mmodel TransferItem {
+model TransferItem {
   id           String   @id @default(cuid())
   transferId   String
   transfer     Transfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
@@ -160,10 +160,10 @@ mmodel TransferItem {
   vendor       String   @default("")
   sku          String   @default("")
   qty          Int
-  srcOnHand    Int      @default(0)   // ADD THIS
-  destOnHand   Int      @default(0)   // ADD THIS
-  srcMin       Int      @default(0)   // ADD THIS
-  destNeed     Int      @default(0)   // ADD THIS
+  srcOnHand    Int      @default(0)
+  destOnHand   Int      @default(0)
+  srcMin       Int      @default(0)
+  destNeed     Int      @default(0)
   createdAt    DateTime @default(now())
   updatedAt    DateTime
 }

@@ -48,7 +48,6 @@ function downloadCSV(po, onHandMap) {
     [],
     ["", "", "", "TOTAL", "", "", po.items.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0).toFixed(2)],
   ];
-
   const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
   const blob = new Blob([csv], { type: "text/csv" });
   const url = URL.createObjectURL(blob);
@@ -59,7 +58,6 @@ function downloadCSV(po, onHandMap) {
   URL.revokeObjectURL(url);
 }
 
-// Helper: pick best SupplierSku record for a variantId (prefer non-empty supplierCode)
 function bestSkuRec(supplierSkus, variantId) {
   const matches = supplierSkus.filter((s) => s.variantId === variantId);
   if (matches.length === 0) return null;
@@ -352,8 +350,7 @@ export const action = async ({ request }) => {
           products(first: 10, query: $query) {
             edges {
               node {
-                title
-                vendor
+                title vendor
                 variants(first: 20) {
                   edges {
                     node {
@@ -394,8 +391,7 @@ export const action = async ({ request }) => {
         seen.add(v.id);
         const skuRec = supplierSkuMap.get(v.id);
         results.push({
-          id: v.id,
-          sku: v.sku,
+          id: v.id, sku: v.sku,
           productTitle: p.title,
           variantTitle: v.title === "Default Title" ? "" : v.title,
           vendor: p.vendor,
@@ -411,8 +407,7 @@ export const action = async ({ request }) => {
       seen.add(v.id);
       const skuRec = supplierSkuMap.get(v.id);
       results.push({
-        id: v.id,
-        sku: v.sku,
+        id: v.id, sku: v.sku,
         productTitle: v.product?.title ?? "",
         variantTitle: v.title === "Default Title" ? "" : v.title,
         vendor: v.product?.vendor ?? "",
@@ -436,18 +431,12 @@ export const action = async ({ request }) => {
 
     await db.purchaseOrderItem.create({
       data: {
-        purchaseOrderId,
-        variantId,
-        productTitle,
-        variantTitle,
-        sku,
-        supplierCode,
-        qtyOrdered,
-        qtyCost,
+        purchaseOrderId, variantId,
+        productTitle, variantTitle,
+        sku, supplierCode, qtyOrdered, qtyCost,
         updatedAt: new Date(),
       },
     });
-
     return { ok: true, intent: "addItem", purchaseOrderId };
   }
 
@@ -491,7 +480,6 @@ export const action = async ({ request }) => {
           onHand[vid] = e.node.quantities?.[0]?.quantity ?? 0;
         }
       }
-
       if (Object.keys(onHand).length === variantIds.length) break;
     }
 
@@ -502,10 +490,7 @@ export const action = async ({ request }) => {
     const id = form.get("id");
     const receiveQtys = JSON.parse(form.get("receiveQtys"));
 
-    const po = await db.purchaseOrder.findUnique({
-      where: { id },
-      include: { items: true },
-    });
+    const po = await db.purchaseOrder.findUnique({ where: { id }, include: { items: true } });
     if (!po || !po.locationId) return { ok: false, error: "PO not found or no location set" };
 
     const variantIds = po.items.map((i) => i.variantId);
@@ -516,10 +501,7 @@ export const action = async ({ request }) => {
       const varRes = await admin.graphql(`
         query($ids: [ID!]!) {
           nodes(ids: $ids) {
-            ... on ProductVariant {
-              id
-              inventoryItem { id }
-            }
+            ... on ProductVariant { id inventoryItem { id } }
           }
         }
       `, { variables: { ids: batch } });
@@ -552,11 +534,7 @@ export const action = async ({ request }) => {
             userErrors { field message }
           }
         }
-      `, {
-        variables: {
-          input: { reason: "received", name: "available", changes: batch },
-        },
-      });
+      `, { variables: { input: { reason: "received", name: "available", changes: batch } } });
       const adjJson = await adjRes.json();
       const userErrors = adjJson.data?.inventoryAdjustQuantities?.userErrors ?? [];
       if (userErrors.length > 0) errors.push(...userErrors.map((e) => e.message));
@@ -564,11 +542,7 @@ export const action = async ({ request }) => {
 
     if (errors.length > 0) return { ok: false, intent: "receive", error: errors.join("; ") };
 
-    await db.purchaseOrder.update({
-      where: { id },
-      data: { status: "received", updatedAt: new Date() },
-    });
-
+    await db.purchaseOrder.update({ where: { id }, data: { status: "received", updatedAt: new Date() } });
     return { ok: true, intent: "receive", poId: id };
   }
 
@@ -587,15 +561,10 @@ export const action = async ({ request }) => {
     if (removedIds.length > 0) {
       await db.purchaseOrderItem.deleteMany({ where: { id: { in: removedIds } } });
     }
-
     for (const u of updates) {
       await db.purchaseOrderItem.update({
         where: { id: u.id },
-        data: {
-          qtyOrdered: Number(u.qtyOrdered),
-          supplierCode: u.supplierCode,
-          updatedAt: new Date(),
-        },
+        data: { qtyOrdered: Number(u.qtyOrdered), supplierCode: u.supplierCode, updatedAt: new Date() },
       });
       if (u.supplierCode !== undefined) {
         await db.supplierSku.updateMany({
@@ -638,7 +607,6 @@ export default function PurchaseOrders() {
   const [skuCost, setSkuCost] = useState({});
 
   const debounceTimers = useRef({});
-
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
 
@@ -675,13 +643,8 @@ export default function PurchaseOrders() {
     setSkuSearch((prev) => ({ ...prev, [poId]: val }));
     setSearchResults((prev) => ({ ...prev, [poId]: [] }));
     setSelectedResult((prev) => ({ ...prev, [poId]: null }));
-
-    if (debounceTimers.current[poId]) {
-      clearTimeout(debounceTimers.current[poId]);
-    }
-
+    if (debounceTimers.current[poId]) clearTimeout(debounceTimers.current[poId]);
     if (!val.trim() || val.trim().length < 2) return;
-
     debounceTimers.current[poId] = setTimeout(() => {
       const fd = new FormData();
       fd.append("intent", "searchProducts");
@@ -751,13 +714,23 @@ export default function PurchaseOrders() {
   }
 
   function handleRemoveItem(poId, itemId) {
-    setRemovedItems((prev) => ({
-      ...prev,
-      [poId]: new Set([...(prev[poId] ?? []), itemId]),
-    }));
+    setRemovedItems((prev) => ({ ...prev, [poId]: new Set([...(prev[poId] ?? []), itemId]) }));
     setItemEdits((prev) => {
       const poEdits = { ...prev[poId] };
       delete poEdits[itemId];
+      return { ...prev, [poId]: poEdits };
+    });
+  }
+
+  // Remove all items for a given vendor on a PO
+  function handleRemoveVendor(poId, itemIds) {
+    setRemovedItems((prev) => ({
+      ...prev,
+      [poId]: new Set([...(prev[poId] ?? []), ...itemIds]),
+    }));
+    setItemEdits((prev) => {
+      const poEdits = { ...prev[poId] };
+      for (const id of itemIds) delete poEdits[id];
       return { ...prev, [poId]: poEdits };
     });
   }
@@ -1079,14 +1052,24 @@ export default function PurchaseOrders() {
             const totalCost = activeItems.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0);
             const totalUnits = activeItems.reduce((s, i) => s + i.qtyOrdered, 0);
 
-            const primaryItems = displayItems.filter((i) => {
-              const vendor = variantVendorMap[i.variantId] ?? "";
-              return primaryVendors.size === 0 || primaryVendors.has(vendor) || !vendor;
-            });
-            const secondaryItems = displayItems.filter((i) => {
-              const vendor = variantVendorMap[i.variantId] ?? "";
-              return primaryVendors.size > 0 && !primaryVendors.has(vendor) && vendor;
-            });
+            // Group active items by vendor for display
+            const vendorGroups = {};
+            for (const item of displayItems) {
+              const vendor = variantVendorMap[item.variantId] || item.productTitle.split(" ")[0] || "Other";
+              if (!vendorGroups[vendor]) vendorGroups[vendor] = [];
+              vendorGroups[vendor].push(item);
+            }
+
+            // Separate primary and secondary vendor groups
+            const primaryGroups = {};
+            const secondaryGroups = {};
+            for (const [vendor, items] of Object.entries(vendorGroups)) {
+              if (primaryVendors.size === 0 || primaryVendors.has(vendor)) {
+                primaryGroups[vendor] = items;
+              } else {
+                secondaryGroups[vendor] = items;
+              }
+            }
 
             const tableHeaders = [
               "Supplier Code", "Product", "SKU",
@@ -1099,6 +1082,53 @@ export default function PurchaseOrders() {
             const isSearching = isSubmitting &&
               fetcher.formData?.get("intent") === "searchProducts" &&
               fetcher.formData?.get("poId") === po.id;
+
+            // Check if selected result is a duplicate on this PO
+            const isDuplicate = poSelected &&
+              po.items.some((i) => i.variantId === poSelected.id && !poRemoved.has(i.id));
+
+            function renderVendorGroup(vendor, items, isSecondary = false) {
+              const activeGroupItems = items.filter((i) => !i.removed);
+              const activeGroupIds = activeGroupItems.map((i) => i.id);
+              return (
+                <BlockStack key={vendor} gap="200">
+                  <div style={{ background: isSecondary ? "#fff8f0" : "#f6f6f7", padding: "6px 12px", borderRadius: "6px" }}>
+                    <InlineStack align="space-between" blockAlign="center">
+                      <InlineStack gap="200" blockAlign="center">
+                        <Text variant="headingSm">{vendor}</Text>
+                        {isSecondary && <Badge tone="warning">Not primary</Badge>}
+                        <Text tone="subdued" variant="bodySm">
+                          {activeGroupItems.length} SKUs
+                        </Text>
+                      </InlineStack>
+                      {activeGroupIds.length > 0 && (
+                        <Button
+                          variant="plain"
+                          tone="critical"
+                          onClick={() => handleRemoveVendor(po.id, activeGroupIds)}
+                        >
+                          Remove all
+                        </Button>
+                      )}
+                    </InlineStack>
+                  </div>
+                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead>
+                      <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
+                        {tableHeaders.map((h, i) => (
+                          <th key={i} style={{ padding: "8px 12px", textAlign: "left" }}>
+                            <Text variant="headingSm">{h}</Text>
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {items.map((item) => renderItemRow(item, po, poEdits, hasOnHand, poOnHand))}
+                    </tbody>
+                  </table>
+                </BlockStack>
+              );
+            }
 
             return (
               <div key={po.id} style={{ marginBottom: "1rem" }}>
@@ -1122,16 +1152,13 @@ export default function PurchaseOrders() {
                       </BlockStack>
                       <InlineStack gap="200">
                         <Select
-                          label=""
-                          labelHidden
+                          label="" labelHidden
                           options={statusOptions}
                           value={po.status}
                           onChange={(val) => handleStatusChange(po.id, val)}
                         />
                         {canReceive && (
-                          <Button variant="primary" onClick={() => handleOpenReceive(po)}>
-                            ✓ Receive
-                          </Button>
+                          <Button variant="primary" onClick={() => handleOpenReceive(po)}>✓ Receive</Button>
                         )}
                         {po.mode !== "manual" && (
                           <Button variant="plain" onClick={() => handleRegenerate(po.id)}>↺ Regenerate</Button>
@@ -1154,7 +1181,7 @@ export default function PurchaseOrders() {
                             No items needed — all SKUs for this supplier are at or above their minimum levels.
                           </Banner>
                         ) : (
-                          <BlockStack gap="300">
+                          <BlockStack gap="400">
                             <InlineStack align="space-between" blockAlign="center">
                               <Text tone="subdued" variant="bodySm">
                                 {hasOnHand
@@ -1175,56 +1202,32 @@ export default function PurchaseOrders() {
                               )}
                             </InlineStack>
 
-                            <div style={{ overflowX: "auto" }}>
-                              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                                <thead>
-                                  <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                                    {tableHeaders.map((h, i) => (
-                                      <th key={i} style={{ padding: "8px 12px", textAlign: "left" }}>
-                                        <Text variant="headingSm">{h}</Text>
-                                      </th>
-                                    ))}
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {primaryItems.map((item) =>
-                                    renderItemRow(item, po, poEdits, hasOnHand, poOnHand)
-                                  )}
-                                  {secondaryItems.length > 0 && (
-                                    <>
-                                      <tr>
-                                        <td
-                                          colSpan={tableHeaders.length}
-                                          style={{ padding: "12px 12px 6px", background: "#f6f6f7" }}
-                                        >
-                                          <InlineStack gap="200" blockAlign="center">
-                                            <Text variant="headingSm" tone="subdued">
-                                              Backup / Secondary source
-                                            </Text>
-                                            <Badge tone="warning">Not primary</Badge>
-                                          </InlineStack>
-                                        </td>
-                                      </tr>
-                                      {secondaryItems.map((item) =>
-                                        renderItemRow(item, po, poEdits, hasOnHand, poOnHand)
-                                      )}
-                                    </>
-                                  )}
-                                  <tr style={{ borderTop: "2px solid #e1e3e5" }}>
-                                    <td colSpan={hasOnHand ? 4 : 3} style={{ padding: "8px 12px" }}>
-                                      <Text variant="headingSm">Total</Text>
-                                    </td>
-                                    <td style={{ padding: "8px 12px" }}>
-                                      <Text variant="headingSm">{totalUnits}</Text>
-                                    </td>
-                                    <td />
-                                    <td style={{ padding: "8px 12px" }}>
-                                      <Text variant="headingSm">${totalCost.toFixed(2)}</Text>
-                                    </td>
-                                    <td />
-                                  </tr>
-                                </tbody>
-                              </table>
+                            {/* Primary vendor groups */}
+                            {Object.entries(primaryGroups).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) =>
+                              renderVendorGroup(vendor, items, false)
+                            )}
+
+                            {/* Secondary vendor groups */}
+                            {Object.keys(secondaryGroups).length > 0 && (
+                              <BlockStack gap="300">
+                                <div style={{ padding: "8px 12px", background: "#fff4e5", borderRadius: "6px" }}>
+                                  <Text variant="headingSm" tone="subdued">Backup / Secondary source</Text>
+                                </div>
+                                {Object.entries(secondaryGroups).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) =>
+                                  renderVendorGroup(vendor, items, true)
+                                )}
+                              </BlockStack>
+                            )}
+
+                            {/* Total row */}
+                            <div style={{ borderTop: "2px solid #e1e3e5", padding: "8px 12px" }}>
+                              <InlineStack align="space-between">
+                                <Text variant="headingSm">Total</Text>
+                                <InlineStack gap="600">
+                                  <Text variant="headingSm">{totalUnits} units</Text>
+                                  <Text variant="headingSm">${totalCost.toFixed(2)}</Text>
+                                </InlineStack>
+                              </InlineStack>
                             </div>
 
                             {hasChanges && (
@@ -1233,7 +1236,6 @@ export default function PurchaseOrders() {
                               </InlineStack>
                             )}
 
-                            {/* ── Add item search ── */}
                             <Divider />
                             <Text variant="headingSm">Add item</Text>
                             <TextField
@@ -1256,33 +1258,47 @@ export default function PurchaseOrders() {
                                 overflowY: "auto",
                                 marginTop: "4px",
                               }}>
-                                {poSearchResults.map((result) => (
-                                  <div
-                                    key={result.id}
-                                    onClick={() => handleSelectResult(po.id, result)}
-                                    style={{
-                                      padding: "10px 14px",
-                                      cursor: "pointer",
-                                      borderBottom: "1px solid #f1f2f3",
-                                    }}
-                                    onMouseEnter={(e) => e.currentTarget.style.background = "#f6f6f7"}
-                                    onMouseLeave={(e) => e.currentTarget.style.background = "#fff"}
-                                  >
-                                    <Text fontWeight="semibold">
-                                      {result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}
-                                    </Text>
-                                    <Text tone="subdued" variant="bodySm">
-                                      SKU: {result.sku} · ${result.cost.toFixed(2)}
-                                      {result.supplierCode ? ` · Code: ${result.supplierCode}` : ""}
-                                    </Text>
-                                  </div>
-                                ))}
+                                {poSearchResults.map((result) => {
+                                  const alreadyOnPO = po.items.some(
+                                    (i) => i.variantId === result.id && !poRemoved.has(i.id)
+                                  );
+                                  return (
+                                    <div
+                                      key={result.id}
+                                      onClick={() => handleSelectResult(po.id, result)}
+                                      style={{
+                                        padding: "10px 14px",
+                                        cursor: "pointer",
+                                        borderBottom: "1px solid #f1f2f3",
+                                        background: alreadyOnPO ? "#fff4e5" : "#fff",
+                                      }}
+                                      onMouseEnter={(e) => e.currentTarget.style.background = alreadyOnPO ? "#ffe8cc" : "#f6f6f7"}
+                                      onMouseLeave={(e) => e.currentTarget.style.background = alreadyOnPO ? "#fff4e5" : "#fff"}
+                                    >
+                                      <InlineStack align="space-between">
+                                        <Text fontWeight="semibold">
+                                          {result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}
+                                        </Text>
+                                        {alreadyOnPO && <Badge tone="warning">Already on PO</Badge>}
+                                      </InlineStack>
+                                      <Text tone="subdued" variant="bodySm">
+                                        SKU: {result.sku} · ${result.cost.toFixed(2)}
+                                        {result.supplierCode ? ` · Code: ${result.supplierCode}` : ""}
+                                      </Text>
+                                    </div>
+                                  );
+                                })}
                               </div>
                             )}
 
                             {poSelected && (
                               <Card>
                                 <BlockStack gap="300">
+                                  {isDuplicate && (
+                                    <Banner tone="warning">
+                                      This SKU is already on this PO. Adding it again will create a duplicate line item.
+                                    </Banner>
+                                  )}
                                   <BlockStack gap="100">
                                     <Text fontWeight="semibold">
                                       {poSelected.productTitle}{poSelected.variantTitle ? ` — ${poSelected.variantTitle}` : ""}
@@ -1297,9 +1313,7 @@ export default function PurchaseOrders() {
                                         label="Qty"
                                         type="number"
                                         value={skuQty[po.id] ?? "1"}
-                                        onChange={(val) =>
-                                          setSkuQty((prev) => ({ ...prev, [po.id]: val }))
-                                        }
+                                        onChange={(val) => setSkuQty((prev) => ({ ...prev, [po.id]: val }))}
                                         autoComplete="off"
                                         min="1"
                                       />
@@ -1310,9 +1324,7 @@ export default function PurchaseOrders() {
                                         type="number"
                                         prefix="$"
                                         value={skuCost[po.id] ?? "0"}
-                                        onChange={(val) =>
-                                          setSkuCost((prev) => ({ ...prev, [po.id]: val }))
-                                        }
+                                        onChange={(val) => setSkuCost((prev) => ({ ...prev, [po.id]: val }))}
                                         autoComplete="off"
                                       />
                                     </div>

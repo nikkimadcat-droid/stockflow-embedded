@@ -150,17 +150,22 @@ model Transfer {
   items          TransferItem[]
 }
 
-model TransferItem {
+mmodel TransferItem {
   id           String   @id @default(cuid())
   transferId   String
   transfer     Transfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
   variantId    String
   productTitle String
-  variantTitle String
+  variantTitle String   @default("")
   vendor       String   @default("")
-  sku          String
+  sku          String   @default("")
   qty          Int
-  updatedAt    DateTime @updatedAt
+  srcOnHand    Int      @default(0)   // ADD THIS
+  destOnHand   Int      @default(0)   // ADD THIS
+  srcMin       Int      @default(0)   // ADD THIS
+  destNeed     Int      @default(0)   // ADD THIS
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime
 }
 
 model SnapshotCache {

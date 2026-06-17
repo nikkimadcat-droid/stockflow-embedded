@@ -37,8 +37,8 @@ function downloadPickListCSV(transfer, locationName, items) {
     [`Transfer: ${transfer.transferNumber}`],
     [`Date: ${new Date().toLocaleDateString()}`],
     [],
-    ["Vendor", "Product", "SKU", "Qty to Pull"],
-    ...items.map(i => [i.vendor, i.productTitle, i.sku, i.qty]),
+    ["Vendor", "Product", "SKU", "Qty to Pull", "Source On Hand", "Dest On Hand", "Dest Need"],
+    ...items.map(i => [i.vendor, i.productTitle, i.sku, i.qty, i.srcOnHand ?? "", i.destOnHand ?? "", i.destNeed ?? ""]),
   ];
   const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
   const blob = new Blob([csv], { type: "text/csv" });
@@ -162,6 +162,7 @@ async function buildDistributionItems(admin, db, shop, fromLocationId, toLocatio
     const mm = destMinMax[vid];
     if (!mm) continue;
     const destOnHand = destInv[vid] ?? 0;
+    if (destOnHand >= mm.minLevel) continue;
     const destNeed = mm.maxLevel - destOnHand;
     if (destNeed <= 0) continue;
     const srcOnHand = srcInv[vid] ?? 0;
@@ -303,6 +304,10 @@ export const action = async ({ request }) => {
             vendor: i.vendor,
             sku: i.sku,
             qty: Number(i.qty),
+            srcOnHand: Number(i.srcOnHand ?? 0),
+            destOnHand: Number(i.destOnHand ?? 0),
+            srcMin: Number(i.srcMin ?? 0),
+            destNeed: Number(i.destNeed ?? 0),
             updatedAt: new Date(),
           })),
         },
@@ -334,6 +339,10 @@ export const action = async ({ request }) => {
             vendor: i.vendor,
             sku: i.sku,
             qty: Number(i.qty),
+            srcOnHand: Number(i.srcOnHand ?? 0),
+            destOnHand: Number(i.destOnHand ?? 0),
+            srcMin: Number(i.srcMin ?? 0),
+            destNeed: Number(i.destNeed ?? 0),
             updatedAt: new Date(),
           })),
         },
@@ -342,10 +351,79 @@ export const action = async ({ request }) => {
     return { ok: true, regenerated: true };
   }
 
+  if (intent === "loadOnHand") {
+    const id = form.get("id");
+    const transfer = await db.transfer.findUnique({ where: { id }, include: { items: true } });
+    if (!transfer) return { ok: false };
+
+    const variantIds = [...new Set(transfer.items.map(i => i.variantId))];
+    const variantIdSet = new Set(variantIds);
+
+    const fetchInv = async (locationId) => {
+      const inv = {};
+      let cursor = null;
+      let hasMore = true;
+      while (hasMore) {
+        const res = await admin.graphql(`
+          query($locationId: ID!, $cursor: String) {
+            location(id: $locationId) {
+              inventoryLevels(first: 250, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
+                edges {
+                  node {
+                    quantities(names: ["available"]) { quantity }
+                    item { variant { id } }
+                  }
+                }
+              }
+            }
+          }
+        `, { variables: { locationId, cursor } });
+        const json = await res.json();
+        const levels = json.data?.location?.inventoryLevels;
+        hasMore = levels?.pageInfo?.hasNextPage ?? false;
+        cursor = levels?.pageInfo?.endCursor ?? null;
+        for (const e of levels?.edges ?? []) {
+          const vid = e.node.item?.variant?.id;
+          if (vid && variantIdSet.has(vid)) inv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
+        }
+        if (Object.keys(inv).length === variantIds.length) break;
+      }
+      return inv;
+    };
+
+    const [srcInv, destInv] = await Promise.all([
+      fetchInv(transfer.fromLocationId),
+      fetchInv(transfer.toLocationId),
+    ]);
+
+    const [srcMM, destMM] = await Promise.all([
+      db.minMax.findMany({ where: { shop, locationId: transfer.fromLocationId, variantId: { in: variantIds } } }),
+      db.minMax.findMany({ where: { shop, locationId: transfer.toLocationId, variantId: { in: variantIds } } }),
+    ]);
+    const srcMinMax = Object.fromEntries(srcMM.map(m => [m.variantId, m]));
+    const destMinMax = Object.fromEntries(destMM.map(m => [m.variantId, m]));
+
+    for (const item of transfer.items) {
+      const srcOnHand = srcInv[item.variantId] ?? 0;
+      const destOnHand = destInv[item.variantId] ?? 0;
+      const srcMin = srcMinMax[item.variantId]?.minLevel ?? 0;
+      const destMax = destMinMax[item.variantId]?.maxLevel ?? 0;
+      const destNeed = Math.max(0, destMax - destOnHand);
+      await db.transferItem.update({
+        where: { id: item.id },
+        data: { srcOnHand, destOnHand, srcMin, destNeed, updatedAt: new Date() },
+      });
+    }
+
+    return { ok: true, intent: "loadOnHand", transferId: id };
+  }
+
   if (intent === "searchProducts") {
     const query = form.get("query");
     const transferId = form.get("transferId");
     const fromLocationId = form.get("fromLocationId");
+    const toLocationId = form.get("toLocationId");
 
     const [titleRes, skuRes] = await Promise.all([
       admin.graphql(`
@@ -385,58 +463,61 @@ export const action = async ({ request }) => {
       for (const { node: v } of p.variants.edges) {
         if (seen.has(v.id)) continue;
         seen.add(v.id);
-        variants.push({
-          id: v.id, sku: v.sku,
-          productTitle: p.title,
-          variantTitle: v.title === "Default Title" ? "" : v.title,
-          vendor: p.vendor,
-        });
+        variants.push({ id: v.id, sku: v.sku, productTitle: p.title, variantTitle: v.title === "Default Title" ? "" : v.title, vendor: p.vendor });
       }
     }
 
     for (const { node: v } of skuJson.data?.productVariants?.edges ?? []) {
       if (seen.has(v.id)) continue;
       seen.add(v.id);
-      variants.push({
-        id: v.id, sku: v.sku,
-        productTitle: v.product?.title ?? "",
-        variantTitle: v.title === "Default Title" ? "" : v.title,
-        vendor: v.product?.vendor ?? "",
-      });
+      variants.push({ id: v.id, sku: v.sku, productTitle: v.product?.title ?? "", variantTitle: v.title === "Default Title" ? "" : v.title, vendor: v.product?.vendor ?? "" });
     }
 
     const variantIdSet = new Set(variants.map(v => v.id));
-    const onHand = {};
-    let cursor = null;
-    let hasMore = true;
-    while (hasMore) {
-      const invRes = await admin.graphql(`
-        query($locationId: ID!, $cursor: String) {
-          location(id: $locationId) {
-            inventoryLevels(first: 250, after: $cursor) {
-              pageInfo { hasNextPage endCursor }
-              edges {
-                node {
-                  quantities(names: ["available"]) { quantity }
-                  item { variant { id } }
+
+    const fetchInvForVariants = async (locationId) => {
+      const inv = {};
+      let cursor = null;
+      let hasMore = true;
+      while (hasMore) {
+        const invRes = await admin.graphql(`
+          query($locationId: ID!, $cursor: String) {
+            location(id: $locationId) {
+              inventoryLevels(first: 250, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
+                edges {
+                  node {
+                    quantities(names: ["available"]) { quantity }
+                    item { variant { id } }
+                  }
                 }
               }
             }
           }
+        `, { variables: { locationId, cursor } });
+        const invJson = await invRes.json();
+        const levels = invJson.data?.location?.inventoryLevels;
+        hasMore = levels?.pageInfo?.hasNextPage ?? false;
+        cursor = levels?.pageInfo?.endCursor ?? null;
+        for (const e of levels?.edges ?? []) {
+          const vid = e.node?.item?.variant?.id;
+          if (vid && variantIdSet.has(vid)) inv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
         }
-      `, { variables: { locationId: fromLocationId, cursor } });
-      const invJson = await invRes.json();
-      const levels = invJson.data?.location?.inventoryLevels;
-      hasMore = levels?.pageInfo?.hasNextPage ?? false;
-      cursor = levels?.pageInfo?.endCursor ?? null;
-      for (const e of levels?.edges ?? []) {
-        const vid = e.node?.item?.variant?.id;
-        if (vid && variantIdSet.has(vid)) onHand[vid] = e.node.quantities?.[0]?.quantity ?? 0;
+        if (Object.keys(inv).length === variants.length) break;
       }
-      if (Object.keys(onHand).length === variants.length) break;
-    }
+      return inv;
+    };
 
-    const results = variants.slice(0, 10).map(v => ({ ...v, onHand: onHand[v.id] ?? 0 }));
+    const [srcOnHandMap, destOnHandMap] = await Promise.all([
+      fetchInvForVariants(fromLocationId),
+      toLocationId ? fetchInvForVariants(toLocationId) : Promise.resolve({}),
+    ]);
+
+    const results = variants.slice(0, 10).map(v => ({
+      ...v,
+      srcOnHand: srcOnHandMap[v.id] ?? 0,
+      destOnHand: destOnHandMap[v.id] ?? 0,
+    }));
     return { ok: true, intent: "searchProducts", transferId, results };
   }
 
@@ -448,12 +529,16 @@ export const action = async ({ request }) => {
     const vendor = form.get("vendor");
     const sku = form.get("sku");
     const qty = Number(form.get("qty")) || 1;
+    const srcOnHand = Number(form.get("srcOnHand")) || 0;
+    const destOnHand = Number(form.get("destOnHand")) || 0;
 
     await db.transferItem.create({
       data: {
         transferId, variantId,
         productTitle, variantTitle,
         vendor, sku, qty,
+        srcOnHand, destOnHand,
+        srcMin: 0, destNeed: 0,
         updatedAt: new Date(),
       },
     });
@@ -555,6 +640,7 @@ export default function Transfers() {
   const [searchResults, setSearchResults] = useState({});
   const [selectedResult, setSelectedResult] = useState({});
   const [itemQty, setItemQty] = useState({});
+  const [loadedOnHand, setLoadedOnHand] = useState(new Set());
 
   const [newTemplateName, setNewTemplateName] = useState("");
   const [newTemplateFrom, setNewTemplateFrom] = useState(locations[0]?.id ?? "");
@@ -566,14 +652,17 @@ export default function Transfers() {
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
 
-  if (
-    fetcher.state === "idle" &&
-    fetcherData?.intent === "searchProducts" &&
-    fetcherData?.transferId
-  ) {
+  if (fetcher.state === "idle" && fetcherData?.intent === "searchProducts" && fetcherData?.transferId) {
     const tid = fetcherData.transferId;
     if (!searchResults[tid] || JSON.stringify(searchResults[tid]) !== JSON.stringify(fetcherData.results)) {
       setSearchResults(prev => ({ ...prev, [tid]: fetcherData.results ?? [] }));
+    }
+  }
+
+  if (fetcher.state === "idle" && fetcherData?.intent === "loadOnHand" && fetcherData?.transferId) {
+    const tid = fetcherData.transferId;
+    if (!loadedOnHand.has(tid)) {
+      setLoadedOnHand(prev => new Set([...prev, tid]));
     }
   }
 
@@ -645,7 +734,14 @@ export default function Transfers() {
     setAdHocNotes("");
   }
 
-  function handleSearchChange(transferId, fromLocationId, val) {
+  function handleLoadOnHand(transferId) {
+    const fd = new FormData();
+    fd.append("intent", "loadOnHand");
+    fd.append("id", transferId);
+    fetcher.submit(fd, { method: "post" });
+  }
+
+  function handleSearchChange(transferId, fromLocationId, toLocationId, val) {
     setItemSearch(prev => ({ ...prev, [transferId]: val }));
     setSearchResults(prev => ({ ...prev, [transferId]: [] }));
     setSelectedResult(prev => ({ ...prev, [transferId]: null }));
@@ -657,6 +753,7 @@ export default function Transfers() {
       fd.append("query", val.trim());
       fd.append("transferId", transferId);
       fd.append("fromLocationId", fromLocationId);
+      fd.append("toLocationId", toLocationId);
       fetcher.submit(fd, { method: "post" });
     }, 400);
   }
@@ -680,6 +777,8 @@ export default function Transfers() {
     fd.append("vendor", result.vendor);
     fd.append("sku", result.sku);
     fd.append("qty", itemQty[transfer.id] ?? "1");
+    fd.append("srcOnHand", result.srcOnHand ?? 0);
+    fd.append("destOnHand", result.destOnHand ?? 0);
     fetcher.submit(fd, { method: "post" });
     setItemSearch(prev => ({ ...prev, [transfer.id]: "" }));
     setSearchResults(prev => ({ ...prev, [transfer.id]: [] }));
@@ -695,6 +794,7 @@ export default function Transfers() {
     fetcher.submit(fd, { method: "post" });
     setQtyEdits(prev => { const n = { ...prev }; delete n[id]; return n; });
     setRemovedItems(prev => { const n = { ...prev }; delete n[id]; return n; });
+    setLoadedOnHand(prev => { const s = new Set(prev); s.delete(id); return s; });
   }
 
   function handleQtyEdit(transferId, itemId, val) {
@@ -767,6 +867,7 @@ export default function Transfers() {
   ];
 
   const pushError = fetcher.data?.errors;
+  const isLoadingOnHand = isSubmitting && fetcher.formData?.get("intent") === "loadOnHand";
 
   return (
     <Page
@@ -813,7 +914,7 @@ export default function Transfers() {
                   helpText={selectedTemplate ? `${locationName(selectedTemplate.fromLocationId)} → ${locationName(selectedTemplate.toLocationId)} · ${selectedTemplate.vendors.length} vendors` : ""}
                 />
                 <Banner tone="info">
-                  Items below min at the destination will be auto-populated based on current inventory at the source, capped by the source's own min level.
+                  Only items below min at the destination will be included. Qty is capped by what the source can spare above its own min level.
                 </Banner>
                 <TextField
                   label="Notes (optional)"
@@ -879,7 +980,7 @@ export default function Transfers() {
                 ))}
                 <Divider />
                 <Text variant="headingSm">Create new template</Text>
-                <TextField label="Template name" value={newTemplateName} onChange={setNewTemplateName} placeholder="e.g. Mineral Point → Monroe Street" autoComplete="off" />
+                <TextField label="Template name" value={newTemplateName} onChange={setNewTemplateName} placeholder="e.g. Mineral Point → Willy Street" autoComplete="off" />
                 <Select label="From location" options={locationOptions} value={newTemplateFrom} onChange={setNewTemplateFrom} />
                 <Select label="To location" options={locationOptions} value={newTemplateTo} onChange={setNewTemplateTo} />
                 <Text variant="headingSm">Vendors included ({newTemplateVendors.size} selected)</Text>
@@ -920,7 +1021,7 @@ export default function Transfers() {
             </Modal>
           )}
 
-          {isSubmitting && (
+          {isSubmitting && fetcher.formData?.get("intent") === "create" && (
             <div style={{ textAlign: "center", padding: "2rem" }}>
               <Spinner size="large" />
               <div style={{ marginTop: "1rem" }}>
@@ -929,7 +1030,7 @@ export default function Transfers() {
             </div>
           )}
 
-          {!isSubmitting && transfers.length === 0 && (
+          {transfers.length === 0 && (
             <Card>
               <EmptyState heading="No transfers yet" image="">
                 <p>Create a template-based transfer or use Ad-hoc Transfer for one-off stock moves.</p>
@@ -937,7 +1038,7 @@ export default function Transfers() {
             </Card>
           )}
 
-          {!isSubmitting && transfers.map(transfer => {
+          {transfers.map(transfer => {
             const isExpanded = expandedId === transfer.id;
             const poEdits = qtyEdits[transfer.id] ?? {};
             const poRemoved = removedItems[transfer.id] ?? new Set();
@@ -950,6 +1051,9 @@ export default function Transfers() {
             }));
             const activeItems = displayItems.filter(i => !i.removed);
             const totalUnits = activeItems.reduce((s, i) => s + i.qty, 0);
+
+            const hasOnHandData = transfer.items.some(i => i.srcOnHand > 0 || i.destOnHand > 0);
+            const isThisLoadingOnHand = isLoadingOnHand && fetcher.formData?.get("id") === transfer.id;
 
             const byVendor = {};
             for (const item of activeItems) {
@@ -965,6 +1069,8 @@ export default function Transfers() {
               fetcher.formData?.get("transferId") === transfer.id;
 
             const canPush = transfer.status === "draft" && activeItems.length > 0;
+            const srcName = locationName(transfer.fromLocationId);
+            const destName = locationName(transfer.toLocationId);
 
             return (
               <div key={transfer.id} style={{ marginBottom: "1rem" }}>
@@ -978,7 +1084,7 @@ export default function Transfers() {
                           {!transfer.templateId && <Badge tone="attention">Ad-hoc</Badge>}
                         </InlineStack>
                         <Text tone="subdued">
-                          {locationName(transfer.fromLocationId)} → {locationName(transfer.toLocationId)}
+                          {srcName} → {destName}
                           {transfer.template ? ` · ${transfer.template.name}` : ""}
                         </Text>
                         <Text tone="subdued" variant="bodySm">
@@ -992,7 +1098,7 @@ export default function Transfers() {
                         {transfer.templateId && (
                           <Button variant="plain" onClick={() => handleRegenerate(transfer.id)}>↺ Regenerate</Button>
                         )}
-                        <Button variant="plain" onClick={() => downloadPickListCSV(transfer, locationName(transfer.toLocationId), activeItems)}>
+                        <Button variant="plain" onClick={() => downloadPickListCSV(transfer, destName, activeItems)}>
                           ↓ Pick List CSV
                         </Button>
                         {canPush && (
@@ -1011,6 +1117,26 @@ export default function Transfers() {
                       <>
                         <Divider />
                         <BlockStack gap="400">
+
+                          {!hasOnHandData && !isThisLoadingOnHand && (
+                            <Banner tone="info">
+                              <InlineStack gap="300" blockAlign="center">
+                                <Text>On-hand quantities not loaded for this transfer.</Text>
+                                <Button variant="plain" onClick={() => handleLoadOnHand(transfer.id)}>
+                                  Load on-hand qty
+                                </Button>
+                              </InlineStack>
+                            </Banner>
+                          )}
+                          {isThisLoadingOnHand && (
+                            <Banner tone="info">
+                              <InlineStack gap="200" blockAlign="center">
+                                <Spinner size="small" />
+                                <Text>Loading on-hand quantities…</Text>
+                              </InlineStack>
+                            </Banner>
+                          )}
+
                           {displayItems.filter(i => i.removed).map(item => (
                             <div key={item.id} style={{ opacity: 0.4 }}>
                               <InlineStack align="space-between">
@@ -1029,23 +1155,48 @@ export default function Transfers() {
                               <div style={{ background: "#f6f6f7", padding: "6px 12px", borderRadius: "6px" }}>
                                 <Text variant="headingSm">{vendor}</Text>
                               </div>
-                              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
                                 <thead>
                                   <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
                                     <th style={{ padding: "6px 12px", textAlign: "left" }}><Text variant="headingSm">Product</Text></th>
                                     <th style={{ padding: "6px 12px", textAlign: "left" }}><Text variant="headingSm">SKU</Text></th>
-                                    <th style={{ padding: "6px 12px", textAlign: "right" }}><Text variant="headingSm">Qty</Text></th>
+                                    <th style={{ padding: "6px 12px", textAlign: "right" }}><Text variant="headingSm">{srcName} OH</Text></th>
+                                    <th style={{ padding: "6px 12px", textAlign: "right" }}><Text variant="headingSm">Src Min</Text></th>
+                                    <th style={{ padding: "6px 12px", textAlign: "right" }}><Text variant="headingSm">{destName} OH</Text></th>
+                                    <th style={{ padding: "6px 12px", textAlign: "right" }}><Text variant="headingSm">Dest Need</Text></th>
+                                    <th style={{ padding: "6px 12px", textAlign: "right" }}><Text variant="headingSm">Transfer Qty</Text></th>
                                     <th style={{ padding: "6px 12px" }}></th>
                                   </tr>
                                 </thead>
                                 <tbody>
                                   {items.map(item => {
                                     const qty = poEdits[item.id] !== undefined ? poEdits[item.id] : String(item.qty);
+                                    const srcOH = item.srcOnHand ?? 0;
+                                    const destOH = item.destOnHand ?? 0;
+                                    const srcMinVal = item.srcMin ?? 0;
+                                    const destNeedVal = item.destNeed ?? 0;
+                                    const srcLow = srcOH <= srcMinVal;
                                     return (
                                       <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
                                         <td style={{ padding: "6px 12px" }}><Text>{item.productTitle}</Text></td>
-                                        <td style={{ padding: "6px 12px" }}><Text>{item.sku}</Text></td>
-                                        <td style={{ padding: "6px 12px", width: "100px" }}>
+                                        <td style={{ padding: "6px 12px" }}><Text tone="subdued">{item.sku}</Text></td>
+                                        <td style={{ padding: "6px 12px", textAlign: "right" }}>
+                                          <Text tone={srcLow ? "critical" : "success"} fontWeight={srcLow ? "semibold" : undefined}>
+                                            {hasOnHandData ? srcOH : "—"}
+                                          </Text>
+                                        </td>
+                                        <td style={{ padding: "6px 12px", textAlign: "right" }}>
+                                          <Text tone="subdued">{hasOnHandData ? srcMinVal : "—"}</Text>
+                                        </td>
+                                        <td style={{ padding: "6px 12px", textAlign: "right" }}>
+                                          <Text tone={destOH === 0 ? "critical" : "subdued"}>
+                                            {hasOnHandData ? destOH : "—"}
+                                          </Text>
+                                        </td>
+                                        <td style={{ padding: "6px 12px", textAlign: "right" }}>
+                                          <Text tone="subdued">{hasOnHandData ? destNeedVal : "—"}</Text>
+                                        </td>
+                                        <td style={{ padding: "6px 12px", width: "90px" }}>
                                           <TextField
                                             label="" labelHidden
                                             type="number"
@@ -1079,7 +1230,7 @@ export default function Transfers() {
                             label="Search by product name or SKU"
                             labelHidden
                             value={itemSearch[transfer.id] ?? ""}
-                            onChange={val => handleSearchChange(transfer.id, transfer.fromLocationId, val)}
+                            onChange={val => handleSearchChange(transfer.id, transfer.fromLocationId, transfer.toLocationId, val)}
                             autoComplete="off"
                             placeholder="Type product name or SKU..."
                             suffix={isSearching ? <Spinner size="small" /> : undefined}
@@ -1107,7 +1258,7 @@ export default function Transfers() {
                                     {result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}
                                   </Text>
                                   <Text tone="subdued" variant="bodySm">
-                                    SKU: {result.sku} · On hand at source: <strong>{result.onHand}</strong>
+                                    SKU: {result.sku} · {srcName}: <strong>{result.srcOnHand}</strong> · {destName}: <strong>{result.destOnHand}</strong>
                                   </Text>
                                 </div>
                               ))}
@@ -1122,7 +1273,9 @@ export default function Transfers() {
                                     {tSelected.productTitle}{tSelected.variantTitle ? ` — ${tSelected.variantTitle}` : ""}
                                   </Text>
                                   <Text tone="subdued">
-                                    SKU: {tSelected.sku} · On hand at {locationName(transfer.fromLocationId)}: <strong>{tSelected.onHand}</strong>
+                                    SKU: {tSelected.sku}
+                                    &nbsp;·&nbsp;{srcName} on hand: <strong>{tSelected.srcOnHand}</strong>
+                                    &nbsp;·&nbsp;{destName} on hand: <strong>{tSelected.destOnHand}</strong>
                                   </Text>
                                 </BlockStack>
                                 <InlineStack gap="300" blockAlign="end">

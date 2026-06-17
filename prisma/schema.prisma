@@ -112,6 +112,7 @@ model PurchaseOrderItem {
   sku             String
   supplierCode    String        @default("")
   qtyOrdered      Int
+  casePackSize    Int           @default(1)
   qtyCost         Float
   updatedAt       DateTime      @updatedAt
 }

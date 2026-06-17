@@ -35,19 +35,23 @@ function downloadCSV(po, onHandMap) {
     ["PO Number", "Supplier", "Status", "Created"],
     [po.poNumber, po.supplier?.name ?? "", po.status, new Date(po.createdAt).toLocaleDateString()],
     [],
-    ["Vendor", "Supplier Code", "Product", "SKU", "On Hand", "Qty Ordered", "Unit Cost", "Line Total"],
-    ...po.items.map((i) => [
-      i.vendor ?? "",
-      i.supplierCode ?? "",
-      i.productTitle,
-      i.sku,
-      onHandMap?.[i.variantId] !== undefined ? onHandMap[i.variantId] : "",
-      i.qtyOrdered,
-      i.qtyCost.toFixed(2),
-      (i.qtyOrdered * i.qtyCost).toFixed(2),
-    ]),
+    ["Vendor", "Supplier Code", "Product", "SKU", "On Hand", "Qty (Eaches)", "Cases", "Unit Cost", "Line Total"],
+    ...po.items.map((i) => {
+      const cases = i.casePackSize > 1 ? Math.floor(i.qtyOrdered / i.casePackSize) : "";
+      return [
+        i.vendor ?? "",
+        i.supplierCode ?? "",
+        i.productTitle,
+        i.sku,
+        onHandMap?.[i.variantId] !== undefined ? onHandMap[i.variantId] : "",
+        i.qtyOrdered,
+        cases,
+        i.qtyCost.toFixed(2),
+        (i.qtyOrdered * i.qtyCost).toFixed(2),
+      ];
+    }),
     [],
-    ["", "", "", "TOTAL", "", "", "", po.items.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0).toFixed(2)],
+    ["", "", "", "TOTAL", "", "", "", "", po.items.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0).toFixed(2)],
   ];
   const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
   const blob = new Blob([csv], { type: "text/csv" });
@@ -111,6 +115,9 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
     }
   }
 
+  const minmaxByVariant = {};
+  for (const mm of minmaxRows) minmaxByVariant[mm.variantId] = mm;
+
   const items = [];
   for (const mm of minmaxRows) {
     const onHand = onHandMap[mm.variantId];
@@ -118,8 +125,9 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
     if (onHand.qty >= mm.minLevel) continue;
     const needed = mm.maxLevel - onHand.qty;
     if (needed <= 0) continue;
-    const qtyOrdered = mm.casePackSize > 1
-      ? Math.ceil(needed / mm.casePackSize) * mm.casePackSize
+    const casePackSize = mm.casePackSize > 1 ? mm.casePackSize : 1;
+    const qtyOrdered = casePackSize > 1
+      ? Math.ceil(needed / casePackSize) * casePackSize
       : needed;
     const skuRec = bestSkuRec(supplierSkus, mm.variantId);
     items.push({
@@ -130,6 +138,7 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
       sku: onHand.sku,
       supplierCode: skuRec?.supplierCode ?? "",
       qtyOrdered,
+      casePackSize,
       qtyCost: skuRec?.cost ?? 0,
     });
   }
@@ -204,6 +213,7 @@ async function buildSalesItems(admin, db, shop, supplierId) {
       sku: data.sku,
       supplierCode: skuRec?.supplierCode ?? "",
       qtyOrdered: data.qty,
+      casePackSize: 1,
       qtyCost: skuRec?.cost ?? 0,
     });
   }
@@ -276,6 +286,7 @@ export const action = async ({ request }) => {
             sku: i.sku,
             supplierCode: i.supplierCode ?? "",
             qtyOrdered: Number(i.qtyOrdered),
+            casePackSize: Number(i.casePackSize ?? 1),
             qtyCost: Number(i.qtyCost),
             updatedAt: new Date(),
           })),
@@ -309,6 +320,7 @@ export const action = async ({ request }) => {
             sku: i.sku,
             supplierCode: i.supplierCode ?? "",
             qtyOrdered: Number(i.qtyOrdered),
+            casePackSize: Number(i.casePackSize ?? 1),
             qtyCost: Number(i.qtyCost),
             updatedAt: new Date(),
           })),
@@ -424,13 +436,14 @@ export const action = async ({ request }) => {
     const sku = form.get("sku");
     const supplierCode = form.get("supplierCode") || "";
     const qtyOrdered = Number(form.get("qtyOrdered")) || 1;
+    const casePackSize = Number(form.get("casePackSize")) || 1;
     const qtyCost = Number(form.get("qtyCost")) || 0;
 
     await db.purchaseOrderItem.create({
       data: {
         purchaseOrderId, variantId,
         productTitle, variantTitle, vendor,
-        sku, supplierCode, qtyOrdered, qtyCost,
+        sku, supplierCode, qtyOrdered, casePackSize, qtyCost,
         updatedAt: new Date(),
       },
     });
@@ -813,6 +826,7 @@ export default function PurchaseOrders() {
     fd.append("sku", result.sku);
     fd.append("supplierCode", result.supplierCode);
     fd.append("qtyOrdered", skuQty[po.id] ?? "1");
+    fd.append("casePackSize", "1");
     fd.append("qtyCost", skuCost[po.id] ?? "0");
     fetcher.submit(fd, { method: "post" });
     setSkuSearch((prev) => ({ ...prev, [po.id]: "" }));
@@ -847,11 +861,13 @@ export default function PurchaseOrders() {
       : (item.supplierCode ?? "");
     const lineTotal = (Number(qty) * item.qtyCost).toFixed(2);
     const onHandQty = hasOnHand ? (poOnHand[item.variantId] ?? 0) : null;
+    const casePackSize = item.casePackSize ?? 1;
+    const casesOrdered = casePackSize > 1 ? Math.floor(Number(qty) / casePackSize) : null;
 
     if (item.removed) {
       return (
         <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3", opacity: 0.4 }}>
-          <td colSpan={hasOnHand ? 6 : 5} style={{ padding: "8px 12px" }}>
+          <td colSpan={hasOnHand ? 7 : 6} style={{ padding: "8px 12px" }}>
             <Text tone="subdued"><s>{item.productTitle}</s></Text>
           </td>
           <td style={{ padding: "8px 12px" }}>
@@ -889,6 +905,12 @@ export default function PurchaseOrders() {
             onChange={(val) => handleItemEdit(po.id, item.id, "qtyOrdered", val)}
             autoComplete="off"
           />
+        </td>
+        <td style={{ padding: "8px 12px", width: "70px", textAlign: "center" }}>
+          {casesOrdered !== null
+            ? <Text tone="subdued">{casesOrdered}</Text>
+            : <Text tone="subdued">—</Text>
+          }
         </td>
         <td style={{ padding: "8px 12px" }}><Text>${item.qtyCost.toFixed(2)}</Text></td>
         <td style={{ padding: "8px 12px" }}><Text>${lineTotal}</Text></td>
@@ -1048,7 +1070,6 @@ export default function PurchaseOrders() {
             const totalCost = activeItems.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0);
             const totalUnits = activeItems.reduce((s, i) => s + i.qtyOrdered, 0);
 
-            // Group by vendor using stored vendor field
             const vendorGroups = {};
             for (const item of displayItems) {
               const v = item.vendor || "Other";
@@ -1069,7 +1090,7 @@ export default function PurchaseOrders() {
             const tableHeaders = [
               "Supplier Code", "Product", "SKU",
               ...(hasOnHand ? ["On Hand"] : []),
-              "Qty", "Unit Cost", "Line Total", "",
+              "Eaches", "Cases", "Unit Cost", "Line Total", "",
             ];
 
             const poSearchResults = searchResults[po.id] ?? [];
@@ -1108,7 +1129,7 @@ export default function PurchaseOrders() {
                     <thead>
                       <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
                         {tableHeaders.map((h, i) => (
-                          <th key={i} style={{ padding: "8px 12px", textAlign: "left" }}>
+                          <th key={i} style={{ padding: "8px 12px", textAlign: i >= (hasOnHand ? 4 : 3) && i <= (hasOnHand ? 5 : 4) ? "center" : "left" }}>
                             <Text variant="headingSm">{h}</Text>
                           </th>
                         ))}
@@ -1299,7 +1320,7 @@ export default function PurchaseOrders() {
                                   <InlineStack gap="300" blockAlign="end">
                                     <div style={{ width: "100px" }}>
                                       <TextField
-                                        label="Qty"
+                                        label="Qty (eaches)"
                                         type="number"
                                         value={skuQty[po.id] ?? "1"}
                                         onChange={(val) => setSkuQty((prev) => ({ ...prev, [po.id]: val }))}

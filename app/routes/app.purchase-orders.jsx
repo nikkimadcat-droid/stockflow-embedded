@@ -35,8 +35,9 @@ function downloadCSV(po, onHandMap) {
     ["PO Number", "Supplier", "Status", "Created"],
     [po.poNumber, po.supplier?.name ?? "", po.status, new Date(po.createdAt).toLocaleDateString()],
     [],
-    ["Supplier Code", "Product", "SKU", "On Hand", "Qty Ordered", "Unit Cost", "Line Total"],
+    ["Vendor", "Supplier Code", "Product", "SKU", "On Hand", "Qty Ordered", "Unit Cost", "Line Total"],
     ...po.items.map((i) => [
+      i.vendor ?? "",
       i.supplierCode ?? "",
       i.productTitle,
       i.sku,
@@ -46,7 +47,7 @@ function downloadCSV(po, onHandMap) {
       (i.qtyOrdered * i.qtyCost).toFixed(2),
     ]),
     [],
-    ["", "", "", "TOTAL", "", "", po.items.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0).toFixed(2)],
+    ["", "", "", "TOTAL", "", "", "", po.items.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0).toFixed(2)],
   ];
   const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
   const blob = new Blob([csv], { type: "text/csv" });
@@ -86,7 +87,7 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
             edges {
               node {
                 quantities(names: ["available"]) { quantity }
-                item { variant { id title product { title } } sku }
+                item { variant { id title product { title vendor } } sku }
               }
             }
           }
@@ -104,6 +105,7 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
         qty: n.quantities?.[0]?.quantity ?? 0,
         productTitle: n.item?.variant?.product?.title ?? "",
         variantTitle: n.item?.variant?.title ?? "",
+        vendor: n.item?.variant?.product?.vendor ?? "",
         sku: n.item?.sku ?? "",
       };
     }
@@ -124,6 +126,7 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
       variantId: mm.variantId,
       productTitle: onHand.productTitle,
       variantTitle: onHand.variantTitle,
+      vendor: onHand.vendor,
       sku: onHand.sku,
       supplierCode: skuRec?.supplierCode ?? "",
       qtyOrdered,
@@ -156,7 +159,7 @@ async function buildSalesItems(admin, db, shop, supplierId) {
               lineItems(first: 50) {
                 edges {
                   node {
-                    variant { id title product { title } sku }
+                    variant { id title sku product { title vendor } }
                     quantity
                   }
                 }
@@ -181,6 +184,7 @@ async function buildSalesItems(admin, db, shop, supplierId) {
           qty: 0,
           productTitle: n.variant?.product?.title ?? "",
           variantTitle: n.variant?.title ?? "",
+          vendor: n.variant?.product?.vendor ?? "",
           sku: n.variant?.sku ?? "",
         };
         salesMap[vid].qty += n.quantity;
@@ -196,6 +200,7 @@ async function buildSalesItems(admin, db, shop, supplierId) {
       variantId,
       productTitle: data.productTitle,
       variantTitle: data.variantTitle,
+      vendor: data.vendor,
       sku: data.sku,
       supplierCode: skuRec?.supplierCode ?? "",
       qtyOrdered: data.qty,
@@ -229,24 +234,13 @@ export const loader = async ({ request }) => {
     primaryVendorMap[vs.supplierId].push(vs.vendorName);
   }
 
-  const allSupplierSkus = await db.supplierSku.findMany({
-    where: { shop },
-    select: { variantId: true, vendorName: true },
-  });
-  const variantVendorMap = {};
-  for (const s of allSupplierSkus) {
-    if (s.vendorName && !variantVendorMap[s.variantId]) {
-      variantVendorMap[s.variantId] = s.vendorName;
-    }
-  }
-
   const locRes = await admin.graphql(`
     query { locations(first: 10) { edges { node { id name } } } }
   `);
   const locJson = await locRes.json();
   const locations = locJson.data.locations.edges.map((e) => e.node);
 
-  return { purchaseOrders, suppliers, locations, shop, primaryVendorMap, variantVendorMap };
+  return { purchaseOrders, suppliers, locations, shop, primaryVendorMap };
 };
 
 export const action = async ({ request }) => {
@@ -278,6 +272,7 @@ export const action = async ({ request }) => {
             variantId: i.variantId,
             productTitle: i.productTitle,
             variantTitle: i.variantTitle,
+            vendor: i.vendor ?? "",
             sku: i.sku,
             supplierCode: i.supplierCode ?? "",
             qtyOrdered: Number(i.qtyOrdered),
@@ -310,6 +305,7 @@ export const action = async ({ request }) => {
             variantId: i.variantId,
             productTitle: i.productTitle,
             variantTitle: i.variantTitle,
+            vendor: i.vendor ?? "",
             sku: i.sku,
             supplierCode: i.supplierCode ?? "",
             qtyOrdered: Number(i.qtyOrdered),
@@ -394,7 +390,7 @@ export const action = async ({ request }) => {
           id: v.id, sku: v.sku,
           productTitle: p.title,
           variantTitle: v.title === "Default Title" ? "" : v.title,
-          vendor: p.vendor,
+          vendor: p.vendor ?? "",
           supplierCode: skuRec?.supplierCode ?? "",
           cost: skuRec?.cost ?? parseFloat(v.inventoryItem?.unitCost?.amount ?? 0),
         });
@@ -424,6 +420,7 @@ export const action = async ({ request }) => {
     const variantId = form.get("variantId");
     const productTitle = form.get("productTitle");
     const variantTitle = form.get("variantTitle");
+    const vendor = form.get("vendor") || "";
     const sku = form.get("sku");
     const supplierCode = form.get("supplierCode") || "";
     const qtyOrdered = Number(form.get("qtyOrdered")) || 1;
@@ -432,7 +429,7 @@ export const action = async ({ request }) => {
     await db.purchaseOrderItem.create({
       data: {
         purchaseOrderId, variantId,
-        productTitle, variantTitle,
+        productTitle, variantTitle, vendor,
         sku, supplierCode, qtyOrdered, qtyCost,
         updatedAt: new Date(),
       },
@@ -586,7 +583,7 @@ export const action = async ({ request }) => {
 };
 
 export default function PurchaseOrders() {
-  const { purchaseOrders, suppliers, locations, primaryVendorMap, variantVendorMap } = useLoaderData();
+  const { purchaseOrders, suppliers, locations, primaryVendorMap } = useLoaderData();
   const fetcher = useFetcher();
 
   const [showCreate, setShowCreate] = useState(false);
@@ -722,7 +719,6 @@ export default function PurchaseOrders() {
     });
   }
 
-  // Remove all items for a given vendor on a PO
   function handleRemoveVendor(poId, itemIds) {
     setRemovedItems((prev) => ({
       ...prev,
@@ -813,6 +809,7 @@ export default function PurchaseOrders() {
     fd.append("variantId", result.id);
     fd.append("productTitle", result.productTitle);
     fd.append("variantTitle", result.variantTitle);
+    fd.append("vendor", result.vendor ?? "");
     fd.append("sku", result.sku);
     fd.append("supplierCode", result.supplierCode);
     fd.append("qtyOrdered", skuQty[po.id] ?? "1");
@@ -854,7 +851,7 @@ export default function PurchaseOrders() {
     if (item.removed) {
       return (
         <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3", opacity: 0.4 }}>
-          <td colSpan={hasOnHand ? 7 : 6} style={{ padding: "8px 12px" }}>
+          <td colSpan={hasOnHand ? 6 : 5} style={{ padding: "8px 12px" }}>
             <Text tone="subdued"><s>{item.productTitle}</s></Text>
           </td>
           <td style={{ padding: "8px 12px" }}>
@@ -876,7 +873,7 @@ export default function PurchaseOrders() {
           />
         </td>
         <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>
-        <td style={{ padding: "8px 12px" }}><Text>{item.sku}</Text></td>
+        <td style={{ padding: "8px 12px" }}><Text tone="subdued">{item.sku}</Text></td>
         {hasOnHand && (
           <td style={{ padding: "8px 12px", width: "80px", textAlign: "center" }}>
             <Text tone={onHandQty <= 0 ? "critical" : onHandQty < 3 ? "caution" : "success"}>
@@ -1038,7 +1035,6 @@ export default function PurchaseOrders() {
             const hasOnHand = poOnHand && poOnHand !== "loading";
             const locationLabel = po.locationId ? (locationNameMap[po.locationId] ?? "") : null;
             const canReceive = po.status !== "received" && po.status !== "cancelled" && po.items.length > 0 && po.locationId;
-
             const primaryVendors = new Set(primaryVendorMap[po.supplierId] ?? []);
 
             const displayItems = po.items.map((i) => ({
@@ -1052,15 +1048,14 @@ export default function PurchaseOrders() {
             const totalCost = activeItems.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0);
             const totalUnits = activeItems.reduce((s, i) => s + i.qtyOrdered, 0);
 
-            // Group active items by vendor for display
+            // Group by vendor using stored vendor field
             const vendorGroups = {};
             for (const item of displayItems) {
-              const vendor = variantVendorMap[item.variantId] || item.productTitle.split(" ")[0] || "Other";
-              if (!vendorGroups[vendor]) vendorGroups[vendor] = [];
-              vendorGroups[vendor].push(item);
+              const v = item.vendor || "Other";
+              if (!vendorGroups[v]) vendorGroups[v] = [];
+              vendorGroups[v].push(item);
             }
 
-            // Separate primary and secondary vendor groups
             const primaryGroups = {};
             const secondaryGroups = {};
             for (const [vendor, items] of Object.entries(vendorGroups)) {
@@ -1083,30 +1078,27 @@ export default function PurchaseOrders() {
               fetcher.formData?.get("intent") === "searchProducts" &&
               fetcher.formData?.get("poId") === po.id;
 
-            // Check if selected result is a duplicate on this PO
             const isDuplicate = poSelected &&
               po.items.some((i) => i.variantId === poSelected.id && !poRemoved.has(i.id));
 
-            function renderVendorGroup(vendor, items, isSecondary = false) {
-              const activeGroupItems = items.filter((i) => !i.removed);
-              const activeGroupIds = activeGroupItems.map((i) => i.id);
+            function renderVendorGroup(vendor, items, isSecondary) {
+              const activeGroupIds = items.filter((i) => !i.removed).map((i) => i.id);
+              const activeCount = activeGroupIds.length;
               return (
-                <BlockStack key={vendor} gap="200">
-                  <div style={{ background: isSecondary ? "#fff8f0" : "#f6f6f7", padding: "6px 12px", borderRadius: "6px" }}>
+                <BlockStack key={vendor} gap="100">
+                  <div style={{
+                    background: isSecondary ? "#fff8f0" : "#f6f6f7",
+                    padding: "6px 12px",
+                    borderRadius: "6px",
+                  }}>
                     <InlineStack align="space-between" blockAlign="center">
                       <InlineStack gap="200" blockAlign="center">
                         <Text variant="headingSm">{vendor}</Text>
                         {isSecondary && <Badge tone="warning">Not primary</Badge>}
-                        <Text tone="subdued" variant="bodySm">
-                          {activeGroupItems.length} SKUs
-                        </Text>
+                        <Text tone="subdued" variant="bodySm">{activeCount} SKU{activeCount !== 1 ? "s" : ""}</Text>
                       </InlineStack>
-                      {activeGroupIds.length > 0 && (
-                        <Button
-                          variant="plain"
-                          tone="critical"
-                          onClick={() => handleRemoveVendor(po.id, activeGroupIds)}
-                        >
+                      {activeCount > 0 && (
+                        <Button variant="plain" tone="critical" onClick={() => handleRemoveVendor(po.id, activeGroupIds)}>
                           Remove all
                         </Button>
                       )}
@@ -1202,12 +1194,10 @@ export default function PurchaseOrders() {
                               )}
                             </InlineStack>
 
-                            {/* Primary vendor groups */}
                             {Object.entries(primaryGroups).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) =>
                               renderVendorGroup(vendor, items, false)
                             )}
 
-                            {/* Secondary vendor groups */}
                             {Object.keys(secondaryGroups).length > 0 && (
                               <BlockStack gap="300">
                                 <div style={{ padding: "8px 12px", background: "#fff4e5", borderRadius: "6px" }}>
@@ -1219,7 +1209,6 @@ export default function PurchaseOrders() {
                               </BlockStack>
                             )}
 
-                            {/* Total row */}
                             <div style={{ borderTop: "2px solid #e1e3e5", padding: "8px 12px" }}>
                               <InlineStack align="space-between">
                                 <Text variant="headingSm">Total</Text>

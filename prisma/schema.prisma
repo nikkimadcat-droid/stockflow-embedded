@@ -108,6 +108,7 @@ model PurchaseOrderItem {
   variantId       String
   productTitle    String
   variantTitle    String
+  vendor          String        @default("")
   sku             String
   supplierCode    String        @default("")
   qtyOrdered      Int

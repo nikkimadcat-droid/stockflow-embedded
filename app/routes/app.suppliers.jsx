@@ -184,20 +184,31 @@ export const action = async ({ request }) => {
     });
 
     if (inventoryItemId) {
-      await admin.graphql(`
-        mutation($id: ID!, $input: InventoryItemInput!) {
-          inventoryItemUpdate(id: $id, input: $input) {
-            inventoryItem { id unitCost { amount } }
-            userErrors { field message }
+      try {
+        const res = await admin.graphql(`
+          mutation($id: ID!, $input: InventoryItemInput!) {
+            inventoryItemUpdate(id: $id, input: $input) {
+              inventoryItem { id unitCost { amount } }
+              userErrors { field message }
+            }
           }
+        `, {
+          variables: {
+            id: inventoryItemId,
+            input: { unitCost: { amount: cost.toString(), currencyCode: "USD" } },
+          },
+        });
+
+        const resData = await res.json();
+        const userErrors = resData.data?.inventoryItemUpdate?.userErrors;
+        if (userErrors?.length) {
+          console.error("inventoryItemUpdate userErrors:", userErrors);
         }
-      `, {
-        variables: {
-          id: inventoryItemId,
-          input: { cost: { amount: cost.toString(), currencyCode: "USD" } },
-        },
-      });
+      } catch (err) {
+        console.error("inventoryItemUpdate failed (cost sync skipped):", err);
+      }
     }
+
     return { ok: true };
   }
 
@@ -560,7 +571,7 @@ export default function Suppliers() {
                                           autoComplete="off"
                                         />
                                       </td>
-                                      <td style={{ padding: "8px 12px", width: "120px" }}>
+                                      <td style={{ padding: "8px 12px", width: "160px" }}>
                                         <TextField
                                           label=""
                                           labelHidden

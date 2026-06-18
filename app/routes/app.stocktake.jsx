@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useLoaderData, useFetcher, useSearchParams, useNavigate, Link } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -18,6 +18,13 @@ import {
   IndexTable,
   EmptyState,
 } from "@shopify/polaris";
+
+// Normalize a Shopify location GID or numeric ID to just the numeric string
+function normalizeLocationId(id) {
+  if (!id) return id;
+  if (String(id).includes("/")) return String(id).split("/").pop();
+  return String(id);
+}
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
@@ -131,14 +138,12 @@ export const action = async ({ request }) => {
       cursor = page.pageInfo.endCursor;
     }
 
-    // filter by vendor/type and exclude bundles
     const filtered = products.filter(p =>
       !p.hasVariantsThatRequiresComponents &&
       (!vendorFilter || p.vendor === vendorFilter) &&
       (!typeFilter || p.productType === typeFilter)
     );
 
-    // collect all variant IDs
     const variantIds = new Set();
     for (const p of filtered) {
       for (const { node: v } of p.variants.edges) {
@@ -146,14 +151,22 @@ export const action = async ({ request }) => {
       }
     }
 
-    // load min/max for this location — only keep variants that have a record
+    // Normalize locationId for DB lookup — check both GID and numeric forms
+    const locationIdGid = locationId.includes("gid://")
+      ? locationId
+      : `gid://shopify/Location/${locationId}`;
+    const locationIdNumeric = normalizeLocationId(locationId);
+
     const minmaxRows = await db.minMax.findMany({
-      where: { shop, locationId, variantId: { in: [...variantIds] } },
+      where: {
+        shop,
+        locationId: { in: [locationIdGid, locationIdNumeric] },
+        variantId: { in: [...variantIds] },
+      },
       select: { variantId: true },
     });
     const minmaxSet = new Set(minmaxRows.map(m => m.variantId));
 
-    // get inventory levels
     const invMap = {};
     let invCursor = null;
     let invHasMore = true;
@@ -175,7 +188,7 @@ export const action = async ({ request }) => {
             }
           }
         }
-      `, { variables: { locationId, cursor: invCursor } });
+      `, { variables: { locationId: locationIdGid, cursor: invCursor } });
 
       const invJson = await invRes.json();
       const levels = invJson.data?.location?.inventoryLevels;
@@ -217,11 +230,14 @@ export const action = async ({ request }) => {
 
   if (intent === "pushAdjustments") {
     const locationId = form.get("locationId");
+    const locationIdGid = locationId.includes("gid://")
+      ? locationId
+      : `gid://shopify/Location/${locationId}`;
     const adjustments = JSON.parse(form.get("adjustments"));
 
     const changes = adjustments.map(a => ({
       inventoryItemId: a.inventoryItemId,
-      locationId,
+      locationId: locationIdGid,
       quantity: Number(a.counted),
     }));
 
@@ -247,7 +263,7 @@ export const action = async ({ request }) => {
     return { ok: true, intent, pushed: true };
   }
 
-  if (intent === "saveStocktake") {
+  if (intent === "saveStocktake" || intent === "autoSaveStocktake") {
     const stocktakeId = form.get("stocktakeId") || null;
     const locationId = form.get("locationId");
     const locationName = form.get("locationName");
@@ -336,6 +352,8 @@ export const action = async ({ request }) => {
   return { ok: false };
 };
 
+const AUTO_SAVE_EVERY = 10;
+
 function SavedStocktakesList({ stocktakes }) {
   return (
     <Card>
@@ -385,6 +403,7 @@ function SavedStocktakesList({ stocktakes }) {
 export default function Stocktake() {
   const data = useLoaderData();
   const fetcher = useFetcher();
+  const autoSaveFetcher = useFetcher();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
 
@@ -402,8 +421,16 @@ export default function Stocktake() {
   const [loaded, setLoaded] = useState(false);
   const [stocktakeId, setStocktakeId] = useState(null);
   const [stocktakeStatus, setStocktakeStatus] = useState("in_progress");
+  const [lastAutoSaveMsg, setLastAutoSaveMsg] = useState(null);
+
+  const countsSinceLastSave = useRef(0);
+  const liveStateRef = useRef({});
 
   const isSubmitting = fetcher.state !== "idle";
+
+  useEffect(() => {
+    liveStateRef.current = { rows, counts, locationId, vendorFilter, typeFilter, stocktakeId, locations };
+  }, [rows, counts, locationId, vendorFilter, typeFilter, stocktakeId, locations]);
 
   useEffect(() => {
     if (isListView) return;
@@ -422,6 +449,7 @@ export default function Stocktake() {
     setCounts({});
     setStocktakeId(null);
     setStocktakeStatus("in_progress");
+    countsSinceLastSave.current = 0;
   }
 
   if (!isListView && fetcher.data?.intent === "loadStocktake" && fetcher.data.loadedStocktake?.id !== stocktakeId) {
@@ -434,10 +462,37 @@ export default function Stocktake() {
     setRows(loadedRows);
     setCounts(loadedCounts);
     setLoaded(true);
+    countsSinceLastSave.current = 0;
   }
 
   if (!isListView && fetcher.data?.intent === "saveStocktake" && fetcher.data.saved && fetcher.data.stocktakeId !== stocktakeId) {
     setStocktakeId(fetcher.data.stocktakeId);
+    countsSinceLastSave.current = 0;
+  }
+
+  if (!isListView && autoSaveFetcher.data?.intent === "autoSaveStocktake" && autoSaveFetcher.data?.saved) {
+    if (autoSaveFetcher.data.stocktakeId !== stocktakeId) {
+      setStocktakeId(autoSaveFetcher.data.stocktakeId);
+      countsSinceLastSave.current = 0;
+    }
+    if (autoSaveFetcher.data.stocktakeId && lastAutoSaveMsg !== autoSaveFetcher.data.stocktakeId + autoSaveFetcher.data.ts) {
+      setLastAutoSaveMsg(autoSaveFetcher.data.stocktakeId + autoSaveFetcher.data.ts);
+    }
+  }
+
+  function triggerAutoSave(currentStocktakeId, currentRows, currentCounts, currentLocationId, currentVendorFilter, currentTypeFilter, currentLocations) {
+    const locationName = currentLocations.find(l => l.id === currentLocationId)?.name ?? "";
+    const fd = new FormData();
+    fd.append("intent", "autoSaveStocktake");
+    if (currentStocktakeId) fd.append("stocktakeId", currentStocktakeId);
+    fd.append("locationId", currentLocationId);
+    fd.append("locationName", locationName);
+    fd.append("vendorFilter", currentVendorFilter);
+    fd.append("typeFilter", currentTypeFilter);
+    fd.append("status", "in_progress");
+    fd.append("rows", JSON.stringify(currentRows));
+    fd.append("counts", JSON.stringify(currentCounts));
+    autoSaveFetcher.submit(fd, { method: "post" });
   }
 
   if (isListView) {
@@ -458,6 +513,7 @@ export default function Stocktake() {
     setCounts({});
     setStocktakeId(null);
     setStocktakeStatus("in_progress");
+    countsSinceLastSave.current = 0;
     const fd = new FormData();
     fd.append("intent", "fetchInventory");
     fd.append("locationId", locationId);
@@ -472,10 +528,22 @@ export default function Stocktake() {
     setRows([]);
     setCounts({});
     setStocktakeId(null);
+    countsSinceLastSave.current = 0;
   }
 
   function handleCount(variantId, val) {
-    setCounts(prev => ({ ...prev, [variantId]: val }));
+    setCounts(prev => {
+      const updated = { ...prev, [variantId]: val };
+
+      countsSinceLastSave.current += 1;
+      if (countsSinceLastSave.current >= AUTO_SAVE_EVERY && autoSaveFetcher.state === "idle") {
+        countsSinceLastSave.current = 0;
+        const { rows: r, locationId: lid, vendorFilter: vf, typeFilter: tf, stocktakeId: sid, locations: locs } = liveStateRef.current;
+        triggerAutoSave(sid, r, updated, lid, vf, tf, locs);
+      }
+
+      return updated;
+    });
   }
 
   function handlePush() {
@@ -511,6 +579,7 @@ export default function Stocktake() {
     fd.append("counts", JSON.stringify(counts));
     fetcher.submit(fd, { method: "post" });
     if (markCompleted) setStocktakeStatus("completed");
+    countsSinceLastSave.current = 0;
   }
 
   const locationOptions = locations.map(l => ({ label: l.name, value: l.id }));
@@ -532,6 +601,8 @@ export default function Stocktake() {
   const saved = fetcher.data?.intent === "saveStocktake" && fetcher.data?.saved;
   const isFetchingInventory = isSubmitting && fetcher.formData?.get("intent") === "fetchInventory";
   const isLoadingSaved = isSubmitting && fetcher.formData?.get("intent") === "loadStocktake";
+  const isAutoSaving = autoSaveFetcher.state !== "idle";
+  const autoSaved = autoSaveFetcher.data?.intent === "autoSaveStocktake" && autoSaveFetcher.data?.saved;
 
   return (
     <>
@@ -643,6 +714,12 @@ export default function Stocktake() {
                           <Badge tone={stocktakeStatus === "completed" ? "success" : "attention"}>
                             {stocktakeStatus === "completed" ? "Completed" : "In progress · saved"}
                           </Badge>
+                        )}
+                        {isAutoSaving && (
+                          <Text tone="subdued" variant="bodySm">Auto-saving…</Text>
+                        )}
+                        {!isAutoSaving && autoSaved && (
+                          <Text tone="subdued" variant="bodySm">✓ Auto-saved</Text>
                         )}
                       </InlineStack>
                       <InlineStack gap="200">
@@ -756,7 +833,7 @@ export default function Stocktake() {
             {loaded && rows.length === 0 && (
               <div style={{ marginTop: "1rem" }}>
                 <Card>
-                  <Text tone="subdued">No products found for the selected filters.</Text>
+                  <Text tone="subdued">No products found for the selected filters. This location may have no min/max levels set, or no products matching the selected vendor/type.</Text>
                 </Card>
               </div>
             )}

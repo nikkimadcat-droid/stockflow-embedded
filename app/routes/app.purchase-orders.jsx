@@ -455,10 +455,11 @@ export const action = async ({ request }) => {
     const variantIds = JSON.parse(form.get("variantIds") || "[]");
     const poId = form.get("poId");
 
-    if (!locationId || variantIds.length === 0) return { ok: true, intent: "fetchInventory", poId, onHand: {} };
+    if (!locationId || variantIds.length === 0) return { ok: true, intent: "fetchInventory", poId, onHand: {}, inventoryItemIds: {} };
 
     const variantIdSet = new Set(variantIds);
     const onHand = {};
+    const inventoryItemIds = {};
     let cursor = null;
     let hasMore = true;
 
@@ -471,7 +472,7 @@ export const action = async ({ request }) => {
               edges {
                 node {
                   quantities(names: ["available"]) { quantity }
-                  item { variant { id } }
+                  item { id variant { id } }
                 }
               }
             }
@@ -486,14 +487,48 @@ export const action = async ({ request }) => {
 
       for (const e of levels?.edges ?? []) {
         const vid = e.node?.item?.variant?.id;
+        const iid = e.node?.item?.id;
         if (vid && variantIdSet.has(vid)) {
           onHand[vid] = e.node.quantities?.[0]?.quantity ?? 0;
+          inventoryItemIds[vid] = iid;
         }
       }
       if (Object.keys(onHand).length === variantIds.length) break;
     }
 
-    return { ok: true, intent: "fetchInventory", poId, onHand };
+    return { ok: true, intent: "fetchInventory", poId, onHand, inventoryItemIds };
+  }
+
+  if (intent === "adjustStock") {
+    const variantId = form.get("variantId");
+    const inventoryItemId = form.get("inventoryItemId");
+    const locationId = form.get("locationId");
+    const newQty = Number(form.get("newQty"));
+    const poId = form.get("poId");
+
+    if (!inventoryItemId || !locationId) return { ok: false, intent: "adjustStock", error: "Missing inventory item or location" };
+
+    const res = await admin.graphql(`
+      mutation($input: InventorySetOnHandQuantitiesInput!) {
+        inventorySetOnHandQuantities(input: $input) {
+          userErrors { field message }
+          inventoryAdjustmentGroup { id }
+        }
+      }
+    `, {
+      variables: {
+        input: {
+          reason: "correction",
+          setQuantities: [{ inventoryItemId, locationId, quantity: newQty }],
+        },
+      },
+    });
+
+    const json = await res.json();
+    const errors = json.data?.inventorySetOnHandQuantities?.userErrors ?? [];
+    if (errors.length > 0) return { ok: false, intent: "adjustStock", poId, variantId, error: errors.map(e => e.message).join(", ") };
+
+    return { ok: true, intent: "adjustStock", poId, variantId, newQty };
   }
 
   if (intent === "receive") {
@@ -608,6 +643,7 @@ export default function PurchaseOrders() {
   const [itemEdits, setItemEdits] = useState({});
   const [removedItems, setRemovedItems] = useState({});
   const [onHandData, setOnHandData] = useState({});
+  const [inventoryItemIdData, setInventoryItemIdData] = useState({});
   const [receiveModal, setReceiveModal] = useState(null);
   const [receiveError, setReceiveError] = useState(null);
   const [skuSearch, setSkuSearch] = useState({});
@@ -615,6 +651,9 @@ export default function PurchaseOrders() {
   const [selectedResult, setSelectedResult] = useState({});
   const [skuQty, setSkuQty] = useState({});
   const [skuCost, setSkuCost] = useState({});
+
+  // Stock adjustment state: { [variantId]: { open: bool, value: string, saving: bool, saved: bool, error: string } }
+  const [stockAdjust, setStockAdjust] = useState({});
 
   const debounceTimers = useRef({});
   const isSubmitting = fetcher.state !== "idle";
@@ -627,6 +666,7 @@ export default function PurchaseOrders() {
     onHandData[fetcherData.poId] === "loading"
   ) {
     setOnHandData((prev) => ({ ...prev, [fetcherData.poId]: fetcherData.onHand }));
+    setInventoryItemIdData((prev) => ({ ...prev, [fetcherData.poId]: fetcherData.inventoryItemIds ?? {} }));
   }
 
   if (fetcher.state === "idle" && fetcherData?.intent === "receive") {
@@ -646,6 +686,39 @@ export default function PurchaseOrders() {
     const poId = fetcherData.poId;
     if (!searchResults[poId] || JSON.stringify(searchResults[poId]) !== JSON.stringify(fetcherData.results)) {
       setSearchResults((prev) => ({ ...prev, [poId]: fetcherData.results ?? [] }));
+    }
+  }
+
+  // When adjustStock comes back, update local on-hand and close the input
+  if (
+    fetcher.state === "idle" &&
+    fetcherData?.intent === "adjustStock" &&
+    fetcherData?.ok &&
+    fetcherData?.variantId
+  ) {
+    const vid = fetcherData.variantId;
+    const poId = fetcherData.poId;
+    if (stockAdjust[vid]?.saving) {
+      setStockAdjust((prev) => ({ ...prev, [vid]: { open: false, value: "", saving: false, saved: true, error: null } }));
+      // Update local on-hand so the row reflects the new count immediately
+      setOnHandData((prev) => ({
+        ...prev,
+        [poId]: { ...(prev[poId] ?? {}), [vid]: fetcherData.newQty },
+      }));
+      // Clear "saved" indicator after 2s
+      setTimeout(() => setStockAdjust((prev) => ({ ...prev, [vid]: { ...prev[vid], saved: false } })), 2000);
+    }
+  }
+
+  if (
+    fetcher.state === "idle" &&
+    fetcherData?.intent === "adjustStock" &&
+    !fetcherData?.ok &&
+    fetcherData?.variantId
+  ) {
+    const vid = fetcherData.variantId;
+    if (stockAdjust[vid]?.saving) {
+      setStockAdjust((prev) => ({ ...prev, [vid]: { ...prev[vid], saving: false, error: fetcherData.error } }));
     }
   }
 
@@ -836,6 +909,31 @@ export default function PurchaseOrders() {
     setSkuCost((prev) => ({ ...prev, [po.id]: "" }));
   }
 
+  function handleOpenStockAdjust(variantId, currentQty) {
+    setStockAdjust((prev) => ({
+      ...prev,
+      [variantId]: { open: true, value: String(currentQty ?? ""), saving: false, saved: false, error: null },
+    }));
+  }
+
+  function handleCancelStockAdjust(variantId) {
+    setStockAdjust((prev) => ({ ...prev, [variantId]: { open: false, value: "", saving: false, saved: false, error: null } }));
+  }
+
+  function handleConfirmStockAdjust(variantId, inventoryItemId, locationId, poId) {
+    const newQty = Number(stockAdjust[variantId]?.value);
+    if (isNaN(newQty) || newQty < 0) return;
+    setStockAdjust((prev) => ({ ...prev, [variantId]: { ...prev[variantId], saving: true, error: null } }));
+    const fd = new FormData();
+    fd.append("intent", "adjustStock");
+    fd.append("variantId", variantId);
+    fd.append("inventoryItemId", inventoryItemId);
+    fd.append("locationId", locationId);
+    fd.append("newQty", String(newQty));
+    fd.append("poId", poId);
+    fetcher.submit(fd, { method: "post" });
+  }
+
   const supplierOptions = suppliers.map((s) => ({ label: s.name, value: s.id }));
   const locationOptions = locations.map((l) => ({ label: l.name, value: l.id }));
   const locationNameMap = Object.fromEntries(locations.map((l) => [l.id, l.name]));
@@ -852,7 +950,7 @@ export default function PurchaseOrders() {
     { label: "Cancelled", value: "cancelled" },
   ];
 
-  function renderItemRow(item, po, poEdits, hasOnHand, poOnHand) {
+  function renderItemRow(item, po, poEdits, hasOnHand, poOnHand, poInventoryItemIds) {
     const qty = poEdits[item.id]?.qtyOrdered !== undefined
       ? poEdits[item.id].qtyOrdered
       : String(item.qtyOrdered);
@@ -861,8 +959,10 @@ export default function PurchaseOrders() {
       : (item.supplierCode ?? "");
     const lineTotal = (Number(qty) * item.qtyCost).toFixed(2);
     const onHandQty = hasOnHand ? (poOnHand[item.variantId] ?? 0) : null;
+    const inventoryItemId = poInventoryItemIds?.[item.variantId];
     const casePackSize = item.casePackSize ?? 1;
     const casesOrdered = casePackSize > 1 ? Math.floor(Number(qty) / casePackSize) : null;
+    const adjust = stockAdjust[item.variantId];
 
     if (item.removed) {
       return (
@@ -891,10 +991,44 @@ export default function PurchaseOrders() {
         <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>
         <td style={{ padding: "8px 12px" }}><Text tone="subdued">{item.sku}</Text></td>
         {hasOnHand && (
-          <td style={{ padding: "8px 12px", width: "80px", textAlign: "center" }}>
-            <Text tone={onHandQty <= 0 ? "critical" : onHandQty < 3 ? "caution" : "success"}>
-              {onHandQty}
-            </Text>
+          <td style={{ padding: "8px 12px", width: "140px" }}>
+            {adjust?.open ? (
+              <InlineStack gap="100" blockAlign="center">
+                <div style={{ width: "60px" }}>
+                  <TextField
+                    label="" labelHidden
+                    type="number"
+                    value={adjust.value}
+                    onChange={(val) => setStockAdjust((prev) => ({ ...prev, [item.variantId]: { ...prev[item.variantId], value: val } }))}
+                    autoComplete="off"
+                    min="0"
+                  />
+                </div>
+                <Button
+                  size="slim"
+                  variant="primary"
+                  onClick={() => handleConfirmStockAdjust(item.variantId, inventoryItemId, po.locationId, po.id)}
+                  loading={adjust.saving}
+                  disabled={adjust.saving}
+                >
+                  ✓
+                </Button>
+                <Button size="slim" variant="plain" onClick={() => handleCancelStockAdjust(item.variantId)}>✕</Button>
+              </InlineStack>
+            ) : (
+              <InlineStack gap="200" blockAlign="center">
+                <Text tone={onHandQty <= 0 ? "critical" : onHandQty < 3 ? "caution" : "success"}>
+                  {onHandQty}
+                </Text>
+                {adjust?.saved && <Text tone="success" variant="bodySm">✓</Text>}
+                {adjust?.error && <Text tone="critical" variant="bodySm">!</Text>}
+                {inventoryItemId && (
+                  <Button size="slim" variant="plain" onClick={() => handleOpenStockAdjust(item.variantId, onHandQty)}>
+                    Adjust
+                  </Button>
+                )}
+              </InlineStack>
+            )}
           </td>
         )}
         <td style={{ padding: "8px 12px", width: "100px" }}>
@@ -1053,6 +1187,7 @@ export default function PurchaseOrders() {
             const poRemoved = removedItems[po.id] ?? new Set();
             const hasChanges = Object.keys(poEdits).length > 0 || poRemoved.size > 0;
             const poOnHand = onHandData[po.id];
+            const poInventoryItemIds = inventoryItemIdData[po.id] ?? {};
             const isLoadingInventory = poOnHand === "loading";
             const hasOnHand = poOnHand && poOnHand !== "loading";
             const locationLabel = po.locationId ? (locationNameMap[po.locationId] ?? "") : null;
@@ -1136,7 +1271,7 @@ export default function PurchaseOrders() {
                       </tr>
                     </thead>
                     <tbody>
-                      {items.map((item) => renderItemRow(item, po, poEdits, hasOnHand, poOnHand))}
+                      {items.map((item) => renderItemRow(item, po, poEdits, hasOnHand, poOnHand, poInventoryItemIds))}
                     </tbody>
                   </table>
                 </BlockStack>
@@ -1198,7 +1333,7 @@ export default function PurchaseOrders() {
                             <InlineStack align="space-between" blockAlign="center">
                               <Text tone="subdued" variant="bodySm">
                                 {hasOnHand
-                                  ? `Live on-hand at ${locationLabel ?? "selected location"}`
+                                  ? `Live on-hand at ${locationLabel ?? "selected location"} — click Adjust next to any item to correct the count`
                                   : po.locationId
                                   ? `On-hand not loaded yet — click to fetch live from Shopify`
                                   : "No location set on this PO"}

@@ -1088,7 +1088,7 @@ export default function PurchaseOrders() {
             : <Text tone="subdued">—</Text>
           }
         </td>
-        <td style={{ padding: "8px 12px", width: "110px" }}>
+        <td style={{ padding: "8px 12px", width: "150px" }}>
           <TextField
             label="" labelHidden
             type="number"

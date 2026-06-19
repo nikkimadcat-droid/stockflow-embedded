@@ -1036,7 +1036,7 @@ export default function PurchaseOrders() {
           <td style={{ padding: "8px 12px", width: "140px" }}>
             {adjust?.open ? (
               <InlineStack gap="100" blockAlign="center">
-                <div style={{ width: "60px" }}>
+                <div style={{ width: "90px" }}>
                   <TextField
                     label="" labelHidden
                     type="number"

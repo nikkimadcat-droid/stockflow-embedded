@@ -115,9 +115,6 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
     }
   }
 
-  const minmaxByVariant = {};
-  for (const mm of minmaxRows) minmaxByVariant[mm.variantId] = mm;
-
   const items = [];
   for (const mm of minmaxRows) {
     const onHand = onHandMap[mm.variantId];
@@ -363,7 +360,7 @@ export const action = async ({ request }) => {
                   edges {
                     node {
                       id sku title
-                      inventoryItem { unitCost { amount } }
+                      inventoryItem { id unitCost { amount } }
                     }
                   }
                 }
@@ -379,7 +376,7 @@ export const action = async ({ request }) => {
               node {
                 id sku title
                 product { title vendor }
-                inventoryItem { unitCost { amount } }
+                inventoryItem { id unitCost { amount } }
               }
             }
           }
@@ -606,18 +603,64 @@ export const action = async ({ request }) => {
     if (removedIds.length > 0) {
       await db.purchaseOrderItem.deleteMany({ where: { id: { in: removedIds } } });
     }
+
     for (const u of updates) {
+      const cost = parseFloat(u.qtyCost) || 0;
+
+      // Save to PO item
       await db.purchaseOrderItem.update({
         where: { id: u.id },
-        data: { qtyOrdered: Number(u.qtyOrdered), supplierCode: u.supplierCode, updatedAt: new Date() },
+        data: {
+          qtyOrdered: Number(u.qtyOrdered),
+          supplierCode: u.supplierCode,
+          qtyCost: cost,
+          updatedAt: new Date(),
+        },
       });
-      if (u.supplierCode !== undefined) {
+
+      // Sync cost back to SupplierSku so future POs pick it up
+      if (u.supplierId) {
         await db.supplierSku.updateMany({
           where: { shop, variantId: u.variantId, supplierId: u.supplierId },
-          data: { supplierCode: u.supplierCode },
+          data: { supplierCode: u.supplierCode, cost },
         });
       }
+
+      // Push unitCost to Shopify — look up inventoryItemId via variant
+      try {
+        const varRes = await admin.graphql(`
+          query($id: ID!) {
+            productVariant(id: $id) {
+              inventoryItem { id }
+            }
+          }
+        `, { variables: { id: u.variantId } });
+        const varJson = await varRes.json();
+        const inventoryItemId = varJson.data?.productVariant?.inventoryItem?.id;
+
+        if (inventoryItemId) {
+          const costRes = await admin.graphql(`
+            mutation($id: ID!, $input: InventoryItemInput!) {
+              inventoryItemUpdate(id: $id, input: $input) {
+                inventoryItem { id unitCost { amount } }
+                userErrors { field message }
+              }
+            }
+          `, {
+            variables: {
+              id: inventoryItemId,
+              input: { unitCost: { amount: cost.toString(), currencyCode: "USD" } },
+            },
+          });
+          const costJson = await costRes.json();
+          const userErrors = costJson.data?.inventoryItemUpdate?.userErrors ?? [];
+          if (userErrors.length) console.error("inventoryItemUpdate errors:", userErrors);
+        }
+      } catch (err) {
+        console.error("Cost sync to Shopify failed (non-fatal):", err);
+      }
     }
+
     return { ok: true, saved: true };
   }
 
@@ -651,8 +694,6 @@ export default function PurchaseOrders() {
   const [selectedResult, setSelectedResult] = useState({});
   const [skuQty, setSkuQty] = useState({});
   const [skuCost, setSkuCost] = useState({});
-
-  // Stock adjustment state: { [variantId]: { open: bool, value: string, saving: bool, saved: bool, error: string } }
   const [stockAdjust, setStockAdjust] = useState({});
 
   const debounceTimers = useRef({});
@@ -689,7 +730,6 @@ export default function PurchaseOrders() {
     }
   }
 
-  // When adjustStock comes back, update local on-hand and close the input
   if (
     fetcher.state === "idle" &&
     fetcherData?.intent === "adjustStock" &&
@@ -700,12 +740,10 @@ export default function PurchaseOrders() {
     const poId = fetcherData.poId;
     if (stockAdjust[vid]?.saving) {
       setStockAdjust((prev) => ({ ...prev, [vid]: { open: false, value: "", saving: false, saved: true, error: null } }));
-      // Update local on-hand so the row reflects the new count immediately
       setOnHandData((prev) => ({
         ...prev,
         [poId]: { ...(prev[poId] ?? {}), [vid]: fetcherData.newQty },
       }));
-      // Clear "saved" indicator after 2s
       setTimeout(() => setStockAdjust((prev) => ({ ...prev, [vid]: { ...prev[vid], saved: false } })), 2000);
     }
   }
@@ -838,6 +876,7 @@ export default function PurchaseOrders() {
         supplierId: po.supplierId,
         qtyOrdered: edits[i.id]?.qtyOrdered !== undefined ? edits[i.id].qtyOrdered : i.qtyOrdered,
         supplierCode: edits[i.id]?.supplierCode !== undefined ? edits[i.id].supplierCode : (i.supplierCode ?? ""),
+        qtyCost: edits[i.id]?.qtyCost !== undefined ? edits[i.id].qtyCost : i.qtyCost,
       }));
 
     const fd = new FormData();
@@ -957,7 +996,10 @@ export default function PurchaseOrders() {
     const supplierCode = poEdits[item.id]?.supplierCode !== undefined
       ? poEdits[item.id].supplierCode
       : (item.supplierCode ?? "");
-    const lineTotal = (Number(qty) * item.qtyCost).toFixed(2);
+    const cost = poEdits[item.id]?.qtyCost !== undefined
+      ? poEdits[item.id].qtyCost
+      : String(item.qtyCost);
+    const lineTotal = (Number(qty) * Number(cost)).toFixed(2);
     const onHandQty = hasOnHand ? (poOnHand[item.variantId] ?? 0) : null;
     const inventoryItemId = poInventoryItemIds?.[item.variantId];
     const casePackSize = item.casePackSize ?? 1;
@@ -967,7 +1009,7 @@ export default function PurchaseOrders() {
     if (item.removed) {
       return (
         <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3", opacity: 0.4 }}>
-          <td colSpan={hasOnHand ? 7 : 6} style={{ padding: "8px 12px" }}>
+          <td colSpan={hasOnHand ? 8 : 7} style={{ padding: "8px 12px" }}>
             <Text tone="subdued"><s>{item.productTitle}</s></Text>
           </td>
           <td style={{ padding: "8px 12px" }}>
@@ -1046,7 +1088,16 @@ export default function PurchaseOrders() {
             : <Text tone="subdued">—</Text>
           }
         </td>
-        <td style={{ padding: "8px 12px" }}><Text>${item.qtyCost.toFixed(2)}</Text></td>
+        <td style={{ padding: "8px 12px", width: "110px" }}>
+          <TextField
+            label="" labelHidden
+            type="number"
+            prefix="$"
+            value={cost}
+            onChange={(val) => handleItemEdit(po.id, item.id, "qtyCost", val)}
+            autoComplete="off"
+          />
+        </td>
         <td style={{ padding: "8px 12px" }}><Text>${lineTotal}</Text></td>
         <td style={{ padding: "8px 12px" }}>
           <Button variant="plain" tone="critical" onClick={() => handleRemoveItem(po.id, item.id)}>
@@ -1198,6 +1249,7 @@ export default function PurchaseOrders() {
               ...i,
               qtyOrdered: poEdits[i.id]?.qtyOrdered !== undefined ? Number(poEdits[i.id].qtyOrdered) : i.qtyOrdered,
               supplierCode: poEdits[i.id]?.supplierCode !== undefined ? poEdits[i.id].supplierCode : (i.supplierCode ?? ""),
+              qtyCost: poEdits[i.id]?.qtyCost !== undefined ? Number(poEdits[i.id].qtyCost) : i.qtyCost,
               removed: poRemoved.has(i.id),
             }));
 

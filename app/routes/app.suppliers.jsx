@@ -212,6 +212,48 @@ export const action = async ({ request }) => {
     return { ok: true };
   }
 
+  if (intent === "update_skus_bulk") {
+    const updates = JSON.parse(formData.get("updates"));
+    // updates: [{ id, supplierCode, cost, inventoryItemId }]
+
+    for (const u of updates) {
+      const cost = parseFloat(u.cost) || 0;
+
+      await prisma.supplierSku.update({
+        where: { id: u.id },
+        data: { supplierCode: u.supplierCode, cost },
+      });
+
+      if (u.inventoryItemId) {
+        try {
+          const res = await admin.graphql(`
+            mutation($id: ID!, $input: InventoryItemInput!) {
+              inventoryItemUpdate(id: $id, input: $input) {
+                inventoryItem { id unitCost { amount } }
+                userErrors { field message }
+              }
+            }
+          `, {
+            variables: {
+              id: u.inventoryItemId,
+              input: { unitCost: { amount: cost.toString(), currencyCode: "USD" } },
+            },
+          });
+
+          const resData = await res.json();
+          const userErrors = resData.data?.inventoryItemUpdate?.userErrors;
+          if (userErrors?.length) {
+            console.error("inventoryItemUpdate userErrors:", userErrors);
+          }
+        } catch (err) {
+          console.error("inventoryItemUpdate bulk failed (cost sync skipped):", err);
+        }
+      }
+    }
+
+    return { ok: true };
+  }
+
   if (intent === "remove_sku") {
     const supplierId = formData.get("supplierId");
     const variantId = formData.get("variantId");
@@ -440,6 +482,34 @@ export default function Suppliers() {
     });
   };
 
+  const handleSaveAll = (skus) => {
+    const dirtySkus = skus.filter((sku) => skuEdits[sku.id] && Object.keys(skuEdits[sku.id]).length > 0);
+    if (dirtySkus.length === 0) return;
+
+    const updates = dirtySkus.map((sku) => {
+      const edits = skuEdits[sku.id] ?? {};
+      const variant = variantMap[sku.variantId] ?? {};
+      return {
+        id: sku.id,
+        supplierCode: edits.supplierCode ?? sku.supplierCode ?? "",
+        cost: edits.cost ?? sku.cost ?? 0,
+        inventoryItemId: variant.inventoryItemId ?? "",
+      };
+    });
+
+    const form = new FormData();
+    form.append("intent", "update_skus_bulk");
+    form.append("updates", JSON.stringify(updates));
+    fetcher.submit(form, { method: "POST" });
+
+    // Clear all edits for this supplier's skus
+    setSkuEdits((prev) => {
+      const n = { ...prev };
+      dirtySkus.forEach((sku) => delete n[sku.id]);
+      return n;
+    });
+  };
+
   const handleRemoveSku = (supplierId, variantId) => {
     const form = new FormData();
     form.append("intent", "remove_sku");
@@ -479,123 +549,131 @@ export default function Suppliers() {
             </Card>
           ) : (
             <BlockStack gap="400">
-              {suppliers.map((s) => (
-                <Card key={s.id}>
-                  <BlockStack gap="400">
-                    <InlineStack align="space-between">
-                      <InlineStack gap="300" align="center">
+              {suppliers.map((s) => {
+                const dirtyCount = s.skus.filter(
+                  (sku) => skuEdits[sku.id] && Object.keys(skuEdits[sku.id]).length > 0
+                ).length;
+
+                return (
+                  <Card key={s.id}>
+                    <BlockStack gap="400">
+                      <InlineStack align="space-between">
+                        <InlineStack gap="300" align="center">
+                          <Button
+                            variant="plain"
+                            onClick={() =>
+                              setExpandedId(expandedId === s.id ? null : s.id)
+                            }
+                          >
+                            {expandedId === s.id ? "▼" : "▶"} {s.name}
+                          </Button>
+                          <Badge>{String(s.skus.length)} SKUs</Badge>
+                        </InlineStack>
                         <Button
-                          variant="plain"
-                          onClick={() =>
-                            setExpandedId(expandedId === s.id ? null : s.id)
-                          }
+                          size="slim"
+                          tone="critical"
+                          onClick={() => handleDeleteSupplier(s.id)}
                         >
-                          {expandedId === s.id ? "▼" : "▶"} {s.name}
+                          Delete
                         </Button>
-                        <Badge>{String(s.skus.length)} SKUs</Badge>
                       </InlineStack>
-                      <Button
-                        size="slim"
-                        tone="critical"
-                        onClick={() => handleDeleteSupplier(s.id)}
-                      >
-                        Delete
-                      </Button>
-                    </InlineStack>
 
-                    {expandedId === s.id && (
-                      <BlockStack gap="400">
-                        <Divider />
-                        <Text variant="headingSm">Add SKUs by vendor</Text>
-                        <Select
-                          label="Shopify vendor"
-                          options={vendorOptions}
-                          value={selectedVendor}
-                          onChange={setSelectedVendor}
-                        />
-                        <Button
-                          variant="primary"
-                          onClick={() => handleAddByVendor(s.id)}
-                          disabled={!selectedVendor}
-                          loading={fetcher.state !== "idle"}
-                        >
-                          Add all SKUs from{" "}
-                          {selectedVendor || "selected vendor"}
-                        </Button>
+                      {expandedId === s.id && (
+                        <BlockStack gap="400">
+                          <Divider />
+                          <Text variant="headingSm">Add SKUs by vendor</Text>
+                          <Select
+                            label="Shopify vendor"
+                            options={vendorOptions}
+                            value={selectedVendor}
+                            onChange={setSelectedVendor}
+                          />
+                          <Button
+                            variant="primary"
+                            onClick={() => handleAddByVendor(s.id)}
+                            disabled={!selectedVendor}
+                            loading={fetcher.state !== "idle"}
+                          >
+                            Add all SKUs from{" "}
+                            {selectedVendor || "selected vendor"}
+                          </Button>
 
-                        {s.skus.length > 0 && (
-                          <BlockStack gap="200">
-                            <Divider />
-                            <Text variant="headingSm">
-                              Linked SKUs ({s.skus.length})
-                            </Text>
-                            <table
-                              style={{ width: "100%", borderCollapse: "collapse" }}
-                            >
-                              <thead>
-                                <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                                  {["SKU", "Product", "Supplier Code", "Cost", ""].map((h) => (
-                                    <th
-                                      key={h}
-                                      style={{ padding: "8px 12px", textAlign: "left" }}
-                                    >
-                                      <Text variant="headingSm">{h}</Text>
-                                    </th>
-                                  ))}
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {s.skus.map((sku) => {
-                                  const variant = variantMap[sku.variantId] ?? {};
-                                  const edits = skuEdits[sku.id] ?? {};
-                                  const isDirty = Object.keys(edits).length > 0;
-                                  return (
-                                    <tr
-                                      key={sku.id}
-                                      style={{ borderBottom: "1px solid #f1f2f3" }}
-                                    >
-                                      <td style={{ padding: "8px 12px" }}>
-                                        <Text>{variant.sku || "—"}</Text>
-                                      </td>
-                                      <td style={{ padding: "8px 12px" }}>
-                                        <Text>{variant.title || "—"}</Text>
-                                      </td>
-                                      <td style={{ padding: "8px 12px", width: "150px" }}>
-                                        <TextField
-                                          label=""
-                                          labelHidden
-                                          value={edits.supplierCode ?? sku.supplierCode ?? ""}
-                                          onChange={(val) =>
-                                            handleSkuEdit(sku.id, "supplierCode", val)
-                                          }
-                                          autoComplete="off"
-                                        />
-                                      </td>
-                                      <td style={{ padding: "8px 12px", width: "160px" }}>
-                                        <TextField
-                                          label=""
-                                          labelHidden
-                                          type="number"
-                                          prefix="$"
-                                          value={String(edits.cost ?? sku.cost ?? 0)}
-                                          onChange={(val) =>
-                                            handleSkuEdit(sku.id, "cost", val)
-                                          }
-                                          autoComplete="off"
-                                        />
-                                      </td>
-                                      <td style={{ padding: "8px 12px", textAlign: "right" }}>
-                                        <InlineStack gap="200">
-                                          {isDirty && (
-                                            <Button
-                                              size="slim"
-                                              variant="primary"
-                                              onClick={() => handleSkuSave(sku)}
-                                              loading={fetcher.state !== "idle"}
-                                            >
-                                              Save
-                                            </Button>
-                                          )}
+                          {s.skus.length > 0 && (
+                            <BlockStack gap="200">
+                              <Divider />
+                              <InlineStack align="space-between">
+                                <Text variant="headingSm">
+                                  Linked SKUs ({s.skus.length})
+                                </Text>
+                                {dirtyCount > 0 && (
+                                  <Button
+                                    variant="primary"
+                                    onClick={() => handleSaveAll(s.skus)}
+                                    loading={fetcher.state !== "idle"}
+                                  >
+                                    Save all ({dirtyCount} changed)
+                                  </Button>
+                                )}
+                              </InlineStack>
+                              <table
+                                style={{ width: "100%", borderCollapse: "collapse" }}
+                              >
+                                <thead>
+                                  <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
+                                    {["SKU", "Product", "Supplier Code", "Cost", ""].map((h) => (
+                                      <th
+                                        key={h}
+                                        style={{ padding: "8px 12px", textAlign: "left" }}
+                                      >
+                                        <Text variant="headingSm">{h}</Text>
+                                      </th>
+                                    ))}
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {s.skus.map((sku) => {
+                                    const variant = variantMap[sku.variantId] ?? {};
+                                    const edits = skuEdits[sku.id] ?? {};
+                                    const isDirty = Object.keys(edits).length > 0;
+                                    return (
+                                      <tr
+                                        key={sku.id}
+                                        style={{
+                                          borderBottom: "1px solid #f1f2f3",
+                                          background: isDirty ? "#fafafa" : "transparent",
+                                        }}
+                                      >
+                                        <td style={{ padding: "8px 12px" }}>
+                                          <Text>{variant.sku || "—"}</Text>
+                                        </td>
+                                        <td style={{ padding: "8px 12px" }}>
+                                          <Text>{variant.title || "—"}</Text>
+                                        </td>
+                                        <td style={{ padding: "8px 12px", width: "150px" }}>
+                                          <TextField
+                                            label=""
+                                            labelHidden
+                                            value={edits.supplierCode ?? sku.supplierCode ?? ""}
+                                            onChange={(val) =>
+                                              handleSkuEdit(sku.id, "supplierCode", val)
+                                            }
+                                            autoComplete="off"
+                                          />
+                                        </td>
+                                        <td style={{ padding: "8px 12px", width: "160px" }}>
+                                          <TextField
+                                            label=""
+                                            labelHidden
+                                            type="number"
+                                            prefix="$"
+                                            value={String(edits.cost ?? sku.cost ?? 0)}
+                                            onChange={(val) =>
+                                              handleSkuEdit(sku.id, "cost", val)
+                                            }
+                                            autoComplete="off"
+                                          />
+                                        </td>
+                                        <td style={{ padding: "8px 12px", textAlign: "right" }}>
                                           <Button
                                             size="slim"
                                             tone="critical"
@@ -605,20 +683,31 @@ export default function Suppliers() {
                                           >
                                             Remove
                                           </Button>
-                                        </InlineStack>
-                                      </td>
-                                    </tr>
-                                  );
-                                })}
-                              </tbody>
-                            </table>
-                          </BlockStack>
-                        )}
-                      </BlockStack>
-                    )}
-                  </BlockStack>
-                </Card>
-              ))}
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                              {dirtyCount > 0 && (
+                                <InlineStack align="end">
+                                  <Button
+                                    variant="primary"
+                                    onClick={() => handleSaveAll(s.skus)}
+                                    loading={fetcher.state !== "idle"}
+                                  >
+                                    Save all ({dirtyCount} changed)
+                                  </Button>
+                                </InlineStack>
+                              )}
+                            </BlockStack>
+                          )}
+                        </BlockStack>
+                      )}
+                    </BlockStack>
+                  </Card>
+                );
+              })}
             </BlockStack>
           )}
         </Layout.Section>

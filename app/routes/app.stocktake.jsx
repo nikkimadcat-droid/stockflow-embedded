@@ -93,137 +93,84 @@ export const action = async ({ request }) => {
     const typeFilter = form.get("typeFilter");
     const shop = session.shop;
 
-    const products = [];
-    let cursor = null;
-    let hasMore = true;
-
-    while (hasMore) {
-      const query = vendorFilter
-        ? `vendor:'${vendorFilter}'`
-        : typeFilter
-        ? `product_type:'${typeFilter}'`
-        : "";
-
-      const prodRes = await admin.graphql(`
-        query($cursor: String, $query: String!) {
-          products(first: 250, after: $cursor, query: $query) {
-            pageInfo { hasNextPage endCursor }
-            edges {
-              node {
-                id
-                title
-                vendor
-                productType
-                hasVariantsThatRequiresComponents
-                variants(first: 100) {
-                  edges {
-                    node {
-                      id
-                      sku
-                      title
-                      inventoryItem { id }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      `, { variables: { cursor, query } });
-
-      const prodJson = await prodRes.json();
-      const page = prodJson.data.products;
-      products.push(...page.edges.map(e => e.node));
-      hasMore = page.pageInfo.hasNextPage;
-      cursor = page.pageInfo.endCursor;
-    }
-
-    const filtered = products.filter(p =>
-      !p.hasVariantsThatRequiresComponents &&
-      (!vendorFilter || p.vendor === vendorFilter) &&
-      (!typeFilter || p.productType === typeFilter)
-    );
-
-    const variantIds = new Set();
-    for (const p of filtered) {
-      for (const { node: v } of p.variants.edges) {
-        variantIds.add(v.id);
-      }
-    }
-
-    // Normalize locationId for DB lookup — check both GID and numeric forms
     const locationIdGid = locationId.includes("gid://")
       ? locationId
       : `gid://shopify/Location/${locationId}`;
     const locationIdNumeric = normalizeLocationId(locationId);
 
+    // Only pull variants that actually have a min or max set for this location.
+    // This replaces walking the whole catalog + whole location inventory —
+    // the min/max table already tells us exactly which variants matter here.
     const minmaxRows = await db.minMax.findMany({
       where: {
         shop,
         locationId: { in: [locationIdGid, locationIdNumeric] },
-        variantId: { in: [...variantIds] },
+        OR: [{ minLevel: { gt: 0 } }, { maxLevel: { gt: 0 } }],
       },
       select: { variantId: true },
     });
-    const minmaxSet = new Set(minmaxRows.map(m => m.variantId));
 
-    const invMap = {};
-    let invCursor = null;
-    let invHasMore = true;
-    while (invHasMore) {
-      const invRes = await admin.graphql(`
-        query($locationId: ID!, $cursor: String) {
-          location(id: $locationId) {
-            inventoryLevels(first: 250, after: $cursor) {
-              pageInfo { hasNextPage endCursor }
-              edges {
-                node {
+    if (minmaxRows.length === 0) {
+      return { ok: true, intent, rows: [] };
+    }
+
+    const variantGids = minmaxRows.map(m => m.variantId);
+
+    // Batch-fetch variant + product + inventory-at-location data directly by ID,
+    // 100 at a time, instead of paging the entire catalog/location.
+    const rowsMap = {};
+    const chunkSize = 100;
+
+    for (let i = 0; i < variantGids.length; i += chunkSize) {
+      const chunk = variantGids.slice(i, i + chunkSize);
+      const res = await admin.graphql(`
+        query($ids: [ID!]!, $locationId: ID!) {
+          nodes(ids: $ids) {
+            ... on ProductVariant {
+              id
+              sku
+              title
+              inventoryItem {
+                id
+                inventoryLevel(locationId: $locationId) {
                   quantities(names: ["available"]) { quantity }
-                  item {
-                    id
-                    variant { id }
-                  }
                 }
+              }
+              product {
+                title
+                vendor
+                productType
+                hasVariantsThatRequiresComponents
               }
             }
           }
         }
-      `, { variables: { locationId: locationIdGid, cursor: invCursor } });
+      `, { variables: { ids: chunk, locationId: locationIdGid } });
 
-      const invJson = await invRes.json();
-      const levels = invJson.data?.location?.inventoryLevels;
-      invHasMore = levels?.pageInfo?.hasNextPage ?? false;
-      invCursor = levels?.pageInfo?.endCursor ?? null;
+      const json = await res.json();
+      for (const node of json.data?.nodes ?? []) {
+        if (!node) continue; // variant was deleted in Shopify since min/max was set
+        const p = node.product;
+        if (!p || p.hasVariantsThatRequiresComponents) continue;
+        if (vendorFilter && p.vendor !== vendorFilter) continue;
+        if (typeFilter && p.productType !== typeFilter) continue;
 
-      for (const e of levels?.edges ?? []) {
-        const n = e.node;
-        const vid = n.item?.variant?.id;
-        if (vid && variantIds.has(vid)) {
-          invMap[vid] = {
-            qty: n.quantities?.[0]?.quantity ?? 0,
-            inventoryItemId: n.item?.id,
-          };
-        }
+        rowsMap[node.id] = {
+          variantId: node.id,
+          productTitle: p.title,
+          variantTitle: node.title === "Default Title" ? "" : node.title,
+          vendor: p.vendor,
+          productType: p.productType,
+          sku: node.sku || "—",
+          onHand: node.inventoryItem?.inventoryLevel?.quantities?.[0]?.quantity ?? 0,
+          inventoryItemId: node.inventoryItem?.id ?? null,
+        };
       }
     }
 
-    const rows = filtered
-      .flatMap(p =>
-        p.variants.edges
-          .map(({ node: v }) => ({ v, p }))
-          .filter(({ v }) => minmaxSet.has(v.id))
-          .map(({ v, p }) => ({
-            variantId: v.id,
-            productTitle: p.title,
-            variantTitle: v.title === "Default Title" ? "" : v.title,
-            vendor: p.vendor,
-            productType: p.productType,
-            sku: v.sku || "—",
-            onHand: invMap[v.id]?.qty ?? 0,
-            inventoryItemId: invMap[v.id]?.inventoryItemId ?? null,
-          }))
-      )
-      .sort((a, b) => a.productTitle.localeCompare(b.productTitle));
+    const rows = Object.values(rowsMap).sort((a, b) =>
+      a.productTitle.localeCompare(b.productTitle)
+    );
 
     return { ok: true, intent, rows };
   }

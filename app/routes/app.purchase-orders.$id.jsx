@@ -5,7 +5,7 @@ import db from "../db.server";
 import {
   Page, Layout, Card, BlockStack, InlineStack,
   Button, Text, Badge, Modal, Select, TextField,
-  Divider, Banner, Spinner,
+  Banner, Spinner,
 } from "@shopify/polaris";
 
 function statusBadge(status) {
@@ -46,7 +46,7 @@ function locationBadge(locationName) {
 function downloadCSV(po, onHandMap) {
   const rows = [
     ["PO Number", "Supplier", "Status", "Created"],
-    [po.poNumber, po.supplier?.name ?? "", po.status, new Date(po.createdAt).toLocaleDateString()],
+    [po.poNumber, po.supplier?.name ?? "", po.status, new Date(po.createdAt).toLocaleDateString("en-US")],
     [],
     ["Vendor", "Supplier Code", "Product", "SKU", "On Hand", "Qty (Eaches)", "Cases", "Unit Cost", "Line Total"],
     ...po.items.map((i) => {
@@ -73,7 +73,6 @@ export const loader = async ({ request, params }) => {
   });
   if (!po || po.shop !== shop) throw new Response("Not found", { status: 404 });
 
-  const suppliers = await db.supplier.findMany({ where: { shop }, orderBy: { name: "asc" } });
   const vendorSuppliers = await db.vendorSupplier.findMany({ where: { shop, isPrimary: true } });
   const primaryVendorMap = {};
   for (const vs of vendorSuppliers) {
@@ -83,7 +82,7 @@ export const loader = async ({ request, params }) => {
   const locRes = await admin.graphql(`query { locations(first: 10) { edges { node { id name } } } }`);
   const locJson = await locRes.json();
   const locations = locJson.data.locations.edges.map((e) => e.node);
-  return { po, suppliers, locations, shop, primaryVendorMap };
+  return { po, locations, primaryVendorMap };
 };
 
 export const action = async ({ request, params }) => {
@@ -307,7 +306,7 @@ export const action = async ({ request, params }) => {
 };
 
 export default function PurchaseOrderDetail() {
-  const { po: initialPo, suppliers, locations, primaryVendorMap } = useLoaderData();
+  const { po: initialPo, locations, primaryVendorMap } = useLoaderData();
   const fetcher = useFetcher();
   const navigate = useNavigate();
 
@@ -569,7 +568,7 @@ export default function PurchaseOrderDetail() {
     return (
       <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
         <td style={{ padding: "8px 12px", width: "130px" }}>
-          <TextField label="" labelHidden value={supplierCode} onChange={(val) => handleItemEdit(item.id, "supplierCode", val)} autoComplete="off" placeholder="—" />
+          <TextField label=" " labelHidden value={supplierCode} onChange={(val) => handleItemEdit(item.id, "supplierCode", val)} autoComplete="off" placeholder="—" />
         </td>
         <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>
         <td style={{ padding: "8px 12px" }}><Text tone="subdued">{item.sku}</Text></td>
@@ -578,7 +577,7 @@ export default function PurchaseOrderDetail() {
             {adjust?.open ? (
               <InlineStack gap="100" blockAlign="center">
                 <div style={{ width: "90px" }}>
-                  <TextField label="" labelHidden type="number" value={adjust.value} onChange={(val) => setStockAdjust((prev) => ({ ...prev, [item.variantId]: { ...prev[item.variantId], value: val } }))} autoComplete="off" min="0" />
+                  <TextField label=" " labelHidden type="number" value={adjust.value} onChange={(val) => setStockAdjust((prev) => ({ ...prev, [item.variantId]: { ...prev[item.variantId], value: val } }))} autoComplete="off" min="0" />
                 </div>
                 <Button size="slim" variant="primary" onClick={() => handleConfirmStockAdjust(item.variantId, inventoryItemId, po.locationId)} loading={adjust.saving} disabled={adjust.saving}>✓</Button>
                 <Button size="slim" variant="plain" onClick={() => handleCancelStockAdjust(item.variantId)}>✕</Button>
@@ -594,13 +593,13 @@ export default function PurchaseOrderDetail() {
           </td>
         )}
         <td style={{ padding: "8px 12px", width: "100px" }}>
-          <TextField label="" labelHidden type="number" value={qty} onChange={(val) => handleItemEdit(item.id, "qtyOrdered", val)} autoComplete="off" />
+          <TextField label=" " labelHidden type="number" value={qty} onChange={(val) => handleItemEdit(item.id, "qtyOrdered", val)} autoComplete="off" />
         </td>
         <td style={{ padding: "8px 12px", width: "70px", textAlign: "center" }}>
           {casesOrdered !== null ? <Text tone="subdued">{casesOrdered}</Text> : <Text tone="subdued">—</Text>}
         </td>
         <td style={{ padding: "8px 12px", width: "150px" }}>
-          <TextField label="" labelHidden type="number" prefix="$" value={cost} onChange={(val) => handleItemEdit(item.id, "qtyCost", val)} autoComplete="off" />
+          <TextField label=" " labelHidden type="number" prefix="$" value={cost} onChange={(val) => handleItemEdit(item.id, "qtyCost", val)} autoComplete="off" />
         </td>
         <td style={{ padding: "8px 12px" }}><Text>${lineTotal}</Text></td>
         <td style={{ padding: "8px 12px" }}>
@@ -668,12 +667,12 @@ export default function PurchaseOrderDetail() {
                 </InlineStack>
                 <Text tone="subdued">{po.supplier?.name} · {activeItems.length} SKUs · {totalUnits} units · ${totalCost.toFixed(2)}</Text>
                 <Text tone="subdued" variant="bodySm">
-                  Created {new Date(po.createdAt).toLocaleDateString()}
+                  Created {new Date(po.createdAt).toLocaleDateString("en-US")}
                   {po.notes ? ` · ${po.notes}` : ""}
                 </Text>
               </BlockStack>
               <InlineStack gap="200" blockAlign="center">
-                <Select label="" labelHidden options={statusOptions} value={po.status} onChange={handleStatusChange} />
+                <Select label=" " labelHidden options={statusOptions} value={po.status} onChange={handleStatusChange} />
                 {po.locationId && (
                   <Button variant="plain" onClick={handleLoadInventory} loading={isLoadingInventory} disabled={isLoadingInventory}>
                     {hasOnHand ? "↺ Refresh on-hand" : "Load on-hand qty"}
@@ -711,7 +710,7 @@ export default function PurchaseOrderDetail() {
                             <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>
                             <td style={{ padding: "8px 12px" }}><Text>{item.sku}</Text></td>
                             <td style={{ padding: "8px 12px", width: "110px" }}>
-                              <TextField label="" labelHidden type="number" value={receiveModal.receiveQtys[item.id] ?? String(item.qtyOrdered)} onChange={(val) => setReceiveModal((prev) => ({ ...prev, receiveQtys: { ...prev.receiveQtys, [item.id]: val } }))} autoComplete="off" min="0" />
+                              <TextField label=" " labelHidden type="number" value={receiveModal.receiveQtys[item.id] ?? String(item.qtyOrdered)} onChange={(val) => setReceiveModal((prev) => ({ ...prev, receiveQtys: { ...prev.receiveQtys, [item.id]: val } }))} autoComplete="off" min="0" />
                             </td>
                           </tr>
                         ))}
@@ -735,11 +734,9 @@ export default function PurchaseOrderDetail() {
                     Live on-hand at {locationName} — click Adjust next to any item to correct the count.
                   </Banner>
                 )}
-
                 {Object.entries(primaryGroups).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) =>
                   renderVendorGroup(vendor, items, false)
                 )}
-
                 {Object.keys(secondaryGroups).length > 0 && (
                   <BlockStack gap="300">
                     <div style={{ padding: "8px 12px", background: "#fff4e5", borderRadius: "6px" }}>
@@ -750,7 +747,6 @@ export default function PurchaseOrderDetail() {
                     )}
                   </BlockStack>
                 )}
-
                 <div style={{ borderTop: "2px solid #e1e3e5", padding: "8px 12px" }}>
                   <InlineStack align="space-between">
                     <Text variant="headingSm">Total</Text>
@@ -760,7 +756,6 @@ export default function PurchaseOrderDetail() {
                     </InlineStack>
                   </InlineStack>
                 </div>
-
                 {hasChanges && (
                   <InlineStack align="end">
                     <Button variant="primary" onClick={handleSaveItems}>Save changes</Button>
@@ -774,7 +769,8 @@ export default function PurchaseOrderDetail() {
             <BlockStack gap="300">
               <Text variant="headingSm">Add item</Text>
               <TextField
-                label="Search by product name or SKU" labelHidden
+                label="Search by product name or SKU"
+                labelHidden
                 value={skuSearch}
                 onChange={handleSearchChange}
                 autoComplete="off"

@@ -98,7 +98,6 @@ export const action = async ({ request, params }) => {
     if (!po) return { ok: false };
     let items = [];
     if (po.mode === "minmax") {
-      // inline build for regenerate
       const supplierSkus = await db.supplierSku.findMany({ where: { shop, supplierId: po.supplierId } });
       const variantIds = supplierSkus.map((s) => s.variantId);
       if (variantIds.length > 0) {
@@ -148,7 +147,6 @@ export const action = async ({ request, params }) => {
   if (intent === "searchProducts") {
     const query = form.get("query");
     const supplierId = form.get("supplierId");
-    const po = await db.purchaseOrder.findUnique({ where: { id }, include: { items: true } });
     const supplierSkus = await db.supplierSku.findMany({ where: { shop, supplierId }, select: { variantId: true, supplierCode: true, cost: true } });
     const supplierSkuMap = new Map();
     for (const s of supplierSkus) {
@@ -252,7 +250,7 @@ export const action = async ({ request, params }) => {
     const receiveQtys = JSON.parse(form.get("receiveQtys"));
     const inventoryItemMap = {};
     for (let i = 0; i < po.items.length; i += 50) {
-      const batch = po.items.slice(i, i + 50).map((i) => i.variantId);
+      const batch = po.items.slice(i, i + 50).map((item) => item.variantId);
       const varRes = await admin.graphql(`query($ids: [ID!]!) { nodes(ids: $ids) { ... on ProductVariant { id inventoryItem { id } } } }`, { variables: { ids: batch } });
       const varJson = await varRes.json();
       for (const node of varJson.data?.nodes ?? []) { if (node?.id && node?.inventoryItem?.id) inventoryItemMap[node.id] = node.inventoryItem.id; }
@@ -329,8 +327,6 @@ export default function PurchaseOrderDetail() {
   const debounceTimer = useRef(null);
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
-
-  // Use live PO from loader; items may update after addItem/regenerate
   const po = initialPo;
 
   if (fetcher.state === "idle" && fetcherData?.intent === "fetchInventory" && onHandData === "loading") {
@@ -644,13 +640,6 @@ export default function PurchaseOrderDetail() {
     <Page
       title={po.poNumber}
       backAction={{ content: "Purchase Orders", onAction: () => navigate("/app/purchase-orders") }}
-      titleMetadata={
-        <InlineStack gap="200" blockAlign="center">
-          {statusBadge(po.status)}
-          {locationName && locationBadge(locationName)}
-          <Badge tone="default">{po.mode}</Badge>
-        </InlineStack>
-      }
       secondaryActions={[
         { content: "↓ CSV", onAction: () => downloadCSV({ ...po, items: activeItems }, hasOnHand ? onHandData : null) },
         ...(po.mode !== "manual" ? [{ content: "↺ Regenerate", onAction: handleRegenerate }] : []),
@@ -664,6 +653,11 @@ export default function PurchaseOrderDetail() {
           <Card>
             <InlineStack align="space-between" blockAlign="center">
               <BlockStack gap="100">
+                <InlineStack gap="200" blockAlign="center">
+                  {statusBadge(po.status)}
+                  {locationName && locationBadge(locationName)}
+                  <Badge tone="default">{po.mode}</Badge>
+                </InlineStack>
                 <Text tone="subdued">{po.supplier?.name} · {activeItems.length} SKUs · {totalUnits} units · ${totalCost.toFixed(2)}</Text>
                 <Text tone="subdued" variant="bodySm">
                   Created {new Date(po.createdAt).toLocaleDateString()}

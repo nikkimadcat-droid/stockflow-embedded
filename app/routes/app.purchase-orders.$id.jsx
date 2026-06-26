@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useLoaderData, useFetcher, useNavigate } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -329,29 +329,38 @@ export default function PurchaseOrderDetail() {
   const fetcherData = fetcher.data;
   const po = initialPo;
 
-  if (fetcher.state === "idle" && fetcherData?.intent === "fetchInventory" && onHandData === "loading") {
-    setOnHandData(fetcherData.onHand);
-    setInventoryItemIds(fetcherData.inventoryItemIds ?? {});
-  }
-  if (fetcher.state === "idle" && fetcherData?.intent === "receive") {
-    if (fetcherData.ok && receiveModal) { setReceiveModal(null); setReceiveError(null); }
-    else if (!fetcherData.ok && fetcherData.error) setReceiveError(fetcherData.error);
-  }
-  if (fetcher.state === "idle" && fetcherData?.intent === "searchProducts") {
-    if (JSON.stringify(searchResults) !== JSON.stringify(fetcherData.results ?? [])) setSearchResults(fetcherData.results ?? []);
-  }
-  if (fetcher.state === "idle" && fetcherData?.intent === "adjustStock" && fetcherData?.ok && fetcherData?.variantId) {
-    const vid = fetcherData.variantId;
-    if (stockAdjust[vid]?.saving) {
-      setStockAdjust((prev) => ({ ...prev, [vid]: { open: false, value: "", saving: false, saved: true, error: null } }));
-      setOnHandData((prev) => ({ ...(prev ?? {}), [vid]: fetcherData.newQty }));
-      setTimeout(() => setStockAdjust((prev) => ({ ...prev, [vid]: { ...prev[vid], saved: false } })), 2000);
+  useEffect(() => {
+    if (fetcher.state === "idle" && fetcherData?.intent === "fetchInventory" && onHandData === "loading") {
+      setOnHandData(fetcherData.onHand);
+      setInventoryItemIds(fetcherData.inventoryItemIds ?? {});
     }
-  }
-  if (fetcher.state === "idle" && fetcherData?.intent === "adjustStock" && !fetcherData?.ok && fetcherData?.variantId) {
-    const vid = fetcherData.variantId;
-    if (stockAdjust[vid]?.saving) setStockAdjust((prev) => ({ ...prev, [vid]: { ...prev[vid], saving: false, error: fetcherData.error } }));
-  }
+  }, [fetcher.state, fetcherData]);
+
+  useEffect(() => {
+    if (fetcher.state === "idle" && fetcherData?.intent === "receive") {
+      if (fetcherData.ok && receiveModal) { setReceiveModal(null); setReceiveError(null); }
+      else if (!fetcherData.ok && fetcherData.error) setReceiveError(fetcherData.error);
+    }
+  }, [fetcher.state, fetcherData]);
+
+  useEffect(() => {
+    if (fetcher.state === "idle" && fetcherData?.intent === "searchProducts") {
+      setSearchResults(fetcherData.results ?? []);
+    }
+  }, [fetcher.state, fetcherData]);
+
+  useEffect(() => {
+    if (fetcher.state === "idle" && fetcherData?.intent === "adjustStock" && fetcherData?.variantId) {
+      const vid = fetcherData.variantId;
+      if (fetcherData.ok && stockAdjust[vid]?.saving) {
+        setStockAdjust((prev) => ({ ...prev, [vid]: { open: false, value: "", saving: false, saved: true, error: null } }));
+        setOnHandData((prev) => ({ ...(prev ?? {}), [vid]: fetcherData.newQty }));
+        setTimeout(() => setStockAdjust((prev) => ({ ...prev, [vid]: { ...prev[vid], saved: false } })), 2000);
+      } else if (!fetcherData.ok && stockAdjust[vid]?.saving) {
+        setStockAdjust((prev) => ({ ...prev, [vid]: { ...prev[vid], saving: false, error: fetcherData.error } }));
+      }
+    }
+  }, [fetcher.state, fetcherData]);
 
   const locationNameMap = Object.fromEntries(locations.map((l) => [l.id, l.name]));
   const locationName = po.locationId ? (locationNameMap[po.locationId] ?? "") : null;
@@ -649,7 +658,6 @@ export default function PurchaseOrderDetail() {
       <Layout>
         <Layout.Section>
 
-          {/* Status bar */}
           <Card>
             <InlineStack align="space-between" blockAlign="center">
               <BlockStack gap="100">
@@ -675,7 +683,6 @@ export default function PurchaseOrderDetail() {
             </InlineStack>
           </Card>
 
-          {/* Receive modal */}
           {receiveModal && (
             <Modal
               open
@@ -716,7 +723,6 @@ export default function PurchaseOrderDetail() {
             </Modal>
           )}
 
-          {/* Items */}
           {po.items.length === 0 ? (
             <Card>
               <Banner tone="info">No items on this PO yet. Use the search below to add items manually.</Banner>
@@ -764,7 +770,6 @@ export default function PurchaseOrderDetail() {
             </Card>
           )}
 
-          {/* Add item */}
           <Card>
             <BlockStack gap="300">
               <Text variant="headingSm">Add item</Text>

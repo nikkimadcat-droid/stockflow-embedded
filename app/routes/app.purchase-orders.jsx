@@ -8,6 +8,19 @@ import {
   Banner, EmptyState, Spinner,
 } from "@shopify/polaris";
 
+export async function clientLoader({ serverLoader }) {
+  return serverLoader();
+}
+clientLoader.hydrate = true;
+
+export function HydrateFallback() {
+  return (
+    <div style={{ textAlign: "center", padding: "4rem" }}>
+      <Spinner size="large" />
+    </div>
+  );
+}
+
 function poNumberGen() {
   const d = new Date();
   return `PO-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}-${Math.floor(Math.random() * 900) + 100}`;

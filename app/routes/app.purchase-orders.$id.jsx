@@ -13,14 +13,6 @@ export async function clientLoader({ serverLoader }) {
 }
 clientLoader.hydrate = true;
 
-export function HydrateFallback() {
-  return (
-    <div style={{ textAlign: "center", padding: "4rem" }}>
-      <Spinner size="large" />
-    </div>
-  );
-}
-
 function statusBadge(status) {
   const map = { draft: "info", ordered: "warning", received: "success", cancelled: "critical" };
   return <Badge tone={map[status] ?? "info"}>{status.charAt(0).toUpperCase() + status.slice(1)}</Badge>;
@@ -319,7 +311,7 @@ export const action = async ({ request, params }) => {
 };
 
 export default function PurchaseOrderDetail() {
-  const { po: initialPo, locations, primaryVendorMap } = useLoaderData();
+  const data = useLoaderData();
   const fetcher = useFetcher();
   const navigate = useNavigate();
 
@@ -339,7 +331,6 @@ export default function PurchaseOrderDetail() {
   const debounceTimer = useRef(null);
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
-  const po = initialPo;
 
   useEffect(() => {
     if (fetcher.state === "idle" && fetcherData?.intent === "fetchInventory" && onHandData === "loading") {
@@ -373,6 +364,15 @@ export default function PurchaseOrderDetail() {
       }
     }
   }, [fetcher.state, fetcherData]);
+
+  if (!data) return (
+    <div style={{ textAlign: "center", padding: "4rem" }}>
+      <Spinner size="large" />
+    </div>
+  );
+
+  const { po: initialPo, locations, primaryVendorMap } = data;
+  const po = initialPo;
 
   const locationNameMap = Object.fromEntries(locations.map((l) => [l.id, l.name]));
   const locationName = po.locationId ? (locationNameMap[po.locationId] ?? "") : null;

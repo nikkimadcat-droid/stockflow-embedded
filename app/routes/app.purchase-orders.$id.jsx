@@ -8,6 +8,19 @@ import {
   Banner, Spinner,
 } from "@shopify/polaris";
 
+export async function clientLoader({ serverLoader }) {
+  return serverLoader();
+}
+clientLoader.hydrate = true;
+
+export function HydrateFallback() {
+  return (
+    <div style={{ textAlign: "center", padding: "4rem" }}>
+      <Spinner size="large" />
+    </div>
+  );
+}
+
 function statusBadge(status) {
   const map = { draft: "info", ordered: "warning", received: "success", cancelled: "critical" };
   return <Badge tone={map[status] ?? "info"}>{status.charAt(0).toUpperCase() + status.slice(1)}</Badge>;

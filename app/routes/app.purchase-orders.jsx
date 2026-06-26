@@ -13,14 +13,6 @@ export async function clientLoader({ serverLoader }) {
 }
 clientLoader.hydrate = true;
 
-export function HydrateFallback() {
-  return (
-    <div style={{ textAlign: "center", padding: "4rem" }}>
-      <Spinner size="large" />
-    </div>
-  );
-}
-
 function poNumberGen() {
   const d = new Date();
   return `PO-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}-${Math.floor(Math.random() * 900) + 100}`;
@@ -196,15 +188,26 @@ export const action = async ({ request }) => {
 };
 
 export default function PurchaseOrders() {
-  const { purchaseOrders, suppliers, locations } = useLoaderData();
+  const data = useLoaderData();
   const fetcher = useFetcher();
   const navigate = useNavigate();
 
   const [showCreate, setShowCreate] = useState(false);
   const [mode, setMode] = useState("minmax");
-  const [supplierId, setSupplierId] = useState(suppliers[0]?.id ?? "");
-  const [locationId, setLocationId] = useState(locations[0]?.id ?? "");
+  const [supplierId, setSupplierId] = useState("");
+  const [locationId, setLocationId] = useState("");
   const [notes, setNotes] = useState("");
+
+  if (!data) return (
+    <div style={{ textAlign: "center", padding: "4rem" }}>
+      <Spinner size="large" />
+    </div>
+  );
+
+  const { purchaseOrders, suppliers, locations } = data;
+
+  if (supplierId === "" && suppliers.length > 0) setSupplierId(suppliers[0].id);
+  if (locationId === "" && locations.length > 0) setLocationId(locations[0].id);
 
   const isSubmitting = fetcher.state !== "idle";
   const locationNameMap = Object.fromEntries(locations.map((l) => [l.id, l.name]));

@@ -307,7 +307,7 @@ export const action = async ({ request, params }) => {
   return { ok: false };
 };
 
-export default function PurchaseOrderDetail() {
+export default function PurchaseOrderDetail() {`n  const data = useLoaderData();`n  console.log("loader data:", data);
   const { po: initialPo, locations, primaryVendorMap } = useLoaderData();
   const fetcher = useFetcher();
   const navigate = useNavigate();

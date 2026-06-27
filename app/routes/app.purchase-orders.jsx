@@ -1096,7 +1096,7 @@ export default function PurchaseOrders() {
         <td style={{ padding: "8px 12px", width: "70px", textAlign: "center" }}>
           {casesOrdered !== null ? <Text tone="subdued">{casesOrdered}</Text> : <Text tone="subdued">—</Text>}
         </td>
-        <td style={{ padding: "8px 12px", width: "150px" }}>
+        <td style={{ padding: "8px 12px", width: "200px" }}>
           <TextField
             label="" labelHidden
             type="number"

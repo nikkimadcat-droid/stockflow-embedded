@@ -307,8 +307,10 @@ export const action = async ({ request, params }) => {
   return { ok: false };
 };
 
-export default function PurchaseOrderDetail() {`n  const data = useLoaderData();`n  console.log("loader data:", data);
-  const { po: initialPo, locations, primaryVendorMap } = useLoaderData();
+export default function PurchaseOrderDetail() {
+  const data = useLoaderData();
+  console.log("loader data:", data);
+
   const fetcher = useFetcher();
   const navigate = useNavigate();
 
@@ -328,7 +330,6 @@ export default function PurchaseOrderDetail() {`n  const data = useLoaderData();
   const debounceTimer = useRef(null);
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
-  const po = initialPo;
 
   useEffect(() => {
     if (fetcher.state === "idle" && fetcherData?.intent === "fetchInventory" && onHandData === "loading") {
@@ -362,6 +363,15 @@ export default function PurchaseOrderDetail() {`n  const data = useLoaderData();
       }
     }
   }, [fetcher.state, fetcherData]);
+
+  if (!data) return (
+    <div style={{ textAlign: "center", padding: "4rem" }}>
+      <Spinner size="large" />
+    </div>
+  );
+
+  const { po: initialPo, locations, primaryVendorMap } = data;
+  const po = initialPo;
 
   const locationNameMap = Object.fromEntries(locations.map((l) => [l.id, l.name]));
   const locationName = po.locationId ? (locationNameMap[po.locationId] ?? "") : null;

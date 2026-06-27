@@ -1,6 +1,5 @@
 ﻿// v2
 import { useState, useRef } from "react";
-import { useState, useRef } from "react";import { useState, useRef } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";

@@ -4,11 +4,8 @@ import { AppProvider as ShopifyAppProvider } from "@shopify/shopify-app-react-ro
 import { AppProvider as PolarisAppProvider } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 import "@shopify/polaris/build/esm/styles.css";
-import "@shopify/polaris/build/esm/styles.css";
 
 export const unstable_ssr = false;
-
-export const loader = async ({ request }) => {
 
 export const loader = async ({ request }) => {
   await authenticate.admin(request);

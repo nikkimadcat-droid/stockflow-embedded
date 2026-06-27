@@ -1,5 +1,7 @@
 import { Links, Meta, Outlet, Scripts, ScrollRestoration } from "react-router";
 
+export const unstable_ssr = false;
+
 export default function App() {
   return (
     <html lang="en">

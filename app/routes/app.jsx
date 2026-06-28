@@ -28,7 +28,6 @@ export default function App() {
           <s-link href="/app/cogs">COGS</s-link>
           <s-link href="/app/minmax">Min / Max Levels</s-link>
           <s-link href="/app/forecasting">Demand Forecasting</s-link>
-          <s-link href="/app/migrate-case-sizes">Migrate Case Sizes</s-link>
         </s-app-nav>
         <Outlet />
       </PolarisAppProvider>

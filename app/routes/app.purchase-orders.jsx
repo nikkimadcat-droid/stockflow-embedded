@@ -609,6 +609,7 @@ export default function PurchaseOrders() {
   const [skuQty, setSkuQty] = useState({});
   const [skuCost, setSkuCost] = useState({});
   const [stockAdjust, setStockAdjust] = useState({});
+  const [showReceived, setShowReceived] = useState(false);
 
   const debounceTimers = useRef({});
   const isSubmitting = fetcher.state !== "idle";
@@ -841,6 +842,10 @@ export default function PurchaseOrders() {
     { label: "Cancelled", value: "cancelled" },
   ];
 
+  // Split POs into active and completed
+  const activePOs = purchaseOrders.filter((po) => po.status !== "received" && po.status !== "cancelled");
+  const completedPOs = purchaseOrders.filter((po) => po.status === "received" || po.status === "cancelled");
+
   function renderItemRow(item, po, poEdits, hasOnHand, poOnHand, poInventoryItemIds) {
     const qty = poEdits[item.id]?.qtyOrdered !== undefined ? poEdits[item.id].qtyOrdered : String(item.qtyOrdered);
     const supplierCode = poEdits[item.id]?.supplierCode !== undefined ? poEdits[item.id].supplierCode : (item.supplierCode ?? "");
@@ -906,6 +911,221 @@ export default function PurchaseOrders() {
           <Button variant="plain" tone="critical" onClick={() => handleRemoveItem(po.id, item.id)}>Remove</Button>
         </td>
       </tr>
+    );
+  }
+
+  function renderPOCard(po) {
+    const isExpanded = expandedId === po.id;
+    const poEdits = itemEdits[po.id] ?? {};
+    const poRemoved = removedItems[po.id] ?? new Set();
+    const hasChanges = Object.keys(poEdits).length > 0 || poRemoved.size > 0;
+    const poOnHand = onHandData[po.id];
+    const poInventoryItemIds = inventoryItemIdData[po.id] ?? {};
+    const isLoadingInventory = poOnHand === "loading";
+    const hasOnHand = poOnHand && poOnHand !== "loading";
+    const locationLabel = po.locationId ? (locationNameMap[po.locationId] ?? "") : null;
+    const canReceive = po.status !== "received" && po.status !== "cancelled" && po.items.length > 0 && po.locationId;
+    const primaryVendors = new Set(primaryVendorMap[po.supplierId] ?? []);
+
+    const displayItems = po.items.map((i) => ({
+      ...i,
+      qtyOrdered: poEdits[i.id]?.qtyOrdered !== undefined ? Number(poEdits[i.id].qtyOrdered) : i.qtyOrdered,
+      supplierCode: poEdits[i.id]?.supplierCode !== undefined ? poEdits[i.id].supplierCode : (i.supplierCode ?? ""),
+      qtyCost: poEdits[i.id]?.qtyCost !== undefined ? Number(poEdits[i.id].qtyCost) : i.qtyCost,
+      removed: poRemoved.has(i.id),
+    }));
+
+    const activeItems = displayItems.filter((i) => !i.removed);
+    const totalCost = activeItems.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0);
+    const totalUnits = activeItems.reduce((s, i) => s + i.qtyOrdered, 0);
+
+    const vendorGroups = {};
+    for (const item of displayItems) {
+      const v = item.vendor || "Other";
+      if (!vendorGroups[v]) vendorGroups[v] = [];
+      vendorGroups[v].push(item);
+    }
+    const primaryGroups = {}, secondaryGroups = {};
+    for (const [vendor, items] of Object.entries(vendorGroups)) {
+      if (primaryVendors.size === 0 || primaryVendors.has(vendor)) primaryGroups[vendor] = items;
+      else secondaryGroups[vendor] = items;
+    }
+
+    const tableHeaders = ["Supplier Code", "Product", "SKU", ...(hasOnHand ? ["On Hand"] : []), "Eaches", "Cases", "Unit Cost", "Line Total", ""];
+    const poSearchResults = searchResults[po.id] ?? [];
+    const poSelected = selectedResult[po.id];
+    const isSearching = isSubmitting && fetcher.formData?.get("intent") === "searchProducts" && fetcher.formData?.get("poId") === po.id;
+    const isDuplicate = poSelected && po.items.some((i) => i.variantId === poSelected.id && !poRemoved.has(i.id));
+
+    function renderVendorGroup(vendor, items, isSecondary) {
+      const activeGroupIds = items.filter((i) => !i.removed).map((i) => i.id);
+      const activeCount = activeGroupIds.length;
+      return (
+        <BlockStack key={vendor} gap="100">
+          <div style={{ background: isSecondary ? "#fff8f0" : "#f6f6f7", padding: "6px 12px", borderRadius: "6px" }}>
+            <InlineStack align="space-between" blockAlign="center">
+              <InlineStack gap="200" blockAlign="center">
+                <Text variant="headingSm">{vendor}</Text>
+                {isSecondary && <Badge tone="warning">Not primary</Badge>}
+                <Text tone="subdued" variant="bodySm">{activeCount} SKU{activeCount !== 1 ? "s" : ""}</Text>
+              </InlineStack>
+              {activeCount > 0 && (
+                <Button variant="plain" tone="critical" onClick={() => handleRemoveVendor(po.id, activeGroupIds)}>Remove all</Button>
+              )}
+            </InlineStack>
+          </div>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
+                {tableHeaders.map((h, i) => (
+                  <th key={i} style={{ padding: "8px 12px", textAlign: i >= (hasOnHand ? 4 : 3) && i <= (hasOnHand ? 5 : 4) ? "center" : "left" }}>
+                    <Text variant="headingSm">{h}</Text>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>{items.map((item) => renderItemRow(item, po, poEdits, hasOnHand, poOnHand, poInventoryItemIds))}</tbody>
+          </table>
+        </BlockStack>
+      );
+    }
+
+    return (
+      <div key={po.id} style={{ marginBottom: "1rem" }}>
+        <Card>
+          <BlockStack gap="300">
+            <InlineStack align="space-between" blockAlign="center">
+              <BlockStack gap="100">
+                <InlineStack gap="200" blockAlign="center">
+                  <Text variant="headingMd">{po.poNumber}</Text>
+                  {statusBadge(po.status)}
+                  <Badge tone="default">{po.mode}</Badge>
+                  {locationLabel && locationBadge(locationLabel)}
+                </InlineStack>
+                <Text tone="subdued">
+                  {po.supplier?.name} · {activeItems.length} SKUs · {totalUnits} units · ${totalCost.toFixed(2)}
+                </Text>
+                <Text tone="subdued" variant="bodySm">
+                  Created {new Date(po.createdAt).toLocaleDateString()}
+                  {po.notes ? ` · ${po.notes}` : ""}
+                </Text>
+              </BlockStack>
+              <InlineStack gap="200">
+                <Select label="" labelHidden options={statusOptions} value={po.status} onChange={(val) => handleStatusChange(po.id, val)} />
+                {canReceive && <Button variant="primary" onClick={() => handleOpenReceive(po)}>✓ Receive</Button>}
+                {po.mode !== "manual" && <Button variant="plain" onClick={() => handleRegenerate(po.id)}>↺ Regenerate</Button>}
+                <Button variant="plain" onClick={() => downloadCSV({ ...po, items: activeItems }, hasOnHand ? poOnHand : null)}>↓ CSV</Button>
+                <Button variant="plain" onClick={() => setExpandedId(isExpanded ? null : po.id)}>
+                  {isExpanded ? "Hide items" : "View items"}
+                </Button>
+                <Button variant="plain" tone="critical" onClick={() => handleDelete(po.id)}>Delete</Button>
+              </InlineStack>
+            </InlineStack>
+
+            {isExpanded && (
+              <>
+                <Divider />
+                {po.items.length === 0 ? (
+                  <Banner tone="info">No items needed — all SKUs for this supplier are at or above their minimum levels.</Banner>
+                ) : (
+                  <BlockStack gap="400">
+                    <InlineStack align="space-between" blockAlign="center">
+                      <Text tone="subdued" variant="bodySm">
+                        {hasOnHand ? `Live on-hand at ${locationLabel ?? "selected location"} — click Adjust next to any item to correct the count` : po.locationId ? `On-hand not loaded yet — click to fetch live from Shopify` : "No location set on this PO"}
+                      </Text>
+                      {po.locationId && (
+                        <Button variant="plain" onClick={() => handleLoadInventory(po)} loading={isLoadingInventory} disabled={isLoadingInventory}>
+                          {hasOnHand ? "↺ Refresh on-hand" : "Load on-hand qty"}
+                        </Button>
+                      )}
+                    </InlineStack>
+
+                    {Object.entries(primaryGroups).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) => renderVendorGroup(vendor, items, false))}
+
+                    {Object.keys(secondaryGroups).length > 0 && (
+                      <BlockStack gap="300">
+                        <div style={{ padding: "8px 12px", background: "#fff4e5", borderRadius: "6px" }}>
+                          <Text variant="headingSm" tone="subdued">Backup / Secondary source</Text>
+                        </div>
+                        {Object.entries(secondaryGroups).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) => renderVendorGroup(vendor, items, true))}
+                      </BlockStack>
+                    )}
+
+                    <div style={{ borderTop: "2px solid #e1e3e5", padding: "8px 12px" }}>
+                      <InlineStack align="space-between">
+                        <Text variant="headingSm">Total</Text>
+                        <InlineStack gap="600">
+                          <Text variant="headingSm">{totalUnits} units</Text>
+                          <Text variant="headingSm">${totalCost.toFixed(2)}</Text>
+                        </InlineStack>
+                      </InlineStack>
+                    </div>
+
+                    {hasChanges && (
+                      <InlineStack align="end">
+                        <Button variant="primary" onClick={() => handleSaveItems(po)}>Save changes</Button>
+                      </InlineStack>
+                    )}
+
+                    <Divider />
+                    <Text variant="headingSm">Add item</Text>
+                    <TextField
+                      label="Search by product name or SKU" labelHidden
+                      value={skuSearch[po.id] ?? ""}
+                      onChange={(val) => handleSearchChange(po.id, po.supplierId, val)}
+                      autoComplete="off"
+                      placeholder="Type product name or SKU..."
+                      suffix={isSearching ? <Spinner size="small" /> : undefined}
+                    />
+
+                    {poSearchResults.length > 0 && (
+                      <div style={{ background: "#fff", border: "1px solid #e1e3e5", borderRadius: "4px", boxShadow: "0 2px 8px rgba(0,0,0,0.1)", maxHeight: "300px", overflowY: "auto", marginTop: "4px" }}>
+                        {poSearchResults.map((result) => {
+                          const alreadyOnPO = po.items.some((i) => i.variantId === result.id && !poRemoved.has(i.id));
+                          return (
+                            <div key={result.id} onClick={() => handleSelectResult(po.id, result)}
+                              style={{ padding: "10px 14px", cursor: "pointer", borderBottom: "1px solid #f1f2f3", background: alreadyOnPO ? "#fff4e5" : "#fff" }}
+                              onMouseEnter={(e) => e.currentTarget.style.background = alreadyOnPO ? "#ffe8cc" : "#f6f6f7"}
+                              onMouseLeave={(e) => e.currentTarget.style.background = alreadyOnPO ? "#fff4e5" : "#fff"}
+                            >
+                              <InlineStack align="space-between">
+                                <Text fontWeight="semibold">{result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}</Text>
+                                {alreadyOnPO && <Badge tone="warning">Already on PO</Badge>}
+                              </InlineStack>
+                              <Text tone="subdued" variant="bodySm">SKU: {result.sku} · ${result.cost.toFixed(2)}{result.supplierCode ? ` · Code: ${result.supplierCode}` : ""}</Text>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {poSelected && (
+                      <Card>
+                        <BlockStack gap="300">
+                          {isDuplicate && <Banner tone="warning">This SKU is already on this PO. Adding it again will create a duplicate line item.</Banner>}
+                          <BlockStack gap="100">
+                            <Text fontWeight="semibold">{poSelected.productTitle}{poSelected.variantTitle ? ` — ${poSelected.variantTitle}` : ""}</Text>
+                            <Text tone="subdued">SKU: {poSelected.sku}{poSelected.supplierCode ? ` · Code: ${poSelected.supplierCode}` : ""}</Text>
+                          </BlockStack>
+                          <InlineStack gap="300" blockAlign="end">
+                            <div style={{ width: "100px" }}>
+                              <TextField label="Qty (eaches)" type="number" value={skuQty[po.id] ?? "1"} onChange={(val) => setSkuQty((prev) => ({ ...prev, [po.id]: val }))} autoComplete="off" min="1" />
+                            </div>
+                            <div style={{ width: "120px" }}>
+                              <TextField label="Unit cost" type="number" prefix="$" value={skuCost[po.id] ?? "0"} onChange={(val) => setSkuCost((prev) => ({ ...prev, [po.id]: val }))} autoComplete="off" />
+                            </div>
+                            <Button variant="primary" onClick={() => handleAddItem(po)} loading={isSubmitting && fetcher.formData?.get("intent") === "addItem"}>Add to PO</Button>
+                          </InlineStack>
+                        </BlockStack>
+                      </Card>
+                    )}
+                  </BlockStack>
+                )}
+              </>
+            )}
+          </BlockStack>
+        </Card>
+      </div>
     );
   }
 
@@ -994,220 +1214,31 @@ export default function PurchaseOrders() {
             </Card>
           )}
 
-          {purchaseOrders.map((po) => {
-            const isExpanded = expandedId === po.id;
-            const poEdits = itemEdits[po.id] ?? {};
-            const poRemoved = removedItems[po.id] ?? new Set();
-            const hasChanges = Object.keys(poEdits).length > 0 || poRemoved.size > 0;
-            const poOnHand = onHandData[po.id];
-            const poInventoryItemIds = inventoryItemIdData[po.id] ?? {};
-            const isLoadingInventory = poOnHand === "loading";
-            const hasOnHand = poOnHand && poOnHand !== "loading";
-            const locationLabel = po.locationId ? (locationNameMap[po.locationId] ?? "") : null;
-            const canReceive = po.status !== "received" && po.status !== "cancelled" && po.items.length > 0 && po.locationId;
-            const primaryVendors = new Set(primaryVendorMap[po.supplierId] ?? []);
+          {/* Active POs */}
+          {activePOs.map((po) => renderPOCard(po))}
 
-            const displayItems = po.items.map((i) => ({
-              ...i,
-              qtyOrdered: poEdits[i.id]?.qtyOrdered !== undefined ? Number(poEdits[i.id].qtyOrdered) : i.qtyOrdered,
-              supplierCode: poEdits[i.id]?.supplierCode !== undefined ? poEdits[i.id].supplierCode : (i.supplierCode ?? ""),
-              qtyCost: poEdits[i.id]?.qtyCost !== undefined ? Number(poEdits[i.id].qtyCost) : i.qtyCost,
-              removed: poRemoved.has(i.id),
-            }));
-
-            const activeItems = displayItems.filter((i) => !i.removed);
-            const totalCost = activeItems.reduce((s, i) => s + i.qtyOrdered * i.qtyCost, 0);
-            const totalUnits = activeItems.reduce((s, i) => s + i.qtyOrdered, 0);
-
-            const vendorGroups = {};
-            for (const item of displayItems) {
-              const v = item.vendor || "Other";
-              if (!vendorGroups[v]) vendorGroups[v] = [];
-              vendorGroups[v].push(item);
-            }
-            const primaryGroups = {}, secondaryGroups = {};
-            for (const [vendor, items] of Object.entries(vendorGroups)) {
-              if (primaryVendors.size === 0 || primaryVendors.has(vendor)) primaryGroups[vendor] = items;
-              else secondaryGroups[vendor] = items;
-            }
-
-            const tableHeaders = ["Supplier Code", "Product", "SKU", ...(hasOnHand ? ["On Hand"] : []), "Eaches", "Cases", "Unit Cost", "Line Total", ""];
-            const poSearchResults = searchResults[po.id] ?? [];
-            const poSelected = selectedResult[po.id];
-            const isSearching = isSubmitting && fetcher.formData?.get("intent") === "searchProducts" && fetcher.formData?.get("poId") === po.id;
-            const isDuplicate = poSelected && po.items.some((i) => i.variantId === poSelected.id && !poRemoved.has(i.id));
-
-            function renderVendorGroup(vendor, items, isSecondary) {
-              const activeGroupIds = items.filter((i) => !i.removed).map((i) => i.id);
-              const activeCount = activeGroupIds.length;
-              return (
-                <BlockStack key={vendor} gap="100">
-                  <div style={{ background: isSecondary ? "#fff8f0" : "#f6f6f7", padding: "6px 12px", borderRadius: "6px" }}>
-                    <InlineStack align="space-between" blockAlign="center">
-                      <InlineStack gap="200" blockAlign="center">
-                        <Text variant="headingSm">{vendor}</Text>
-                        {isSecondary && <Badge tone="warning">Not primary</Badge>}
-                        <Text tone="subdued" variant="bodySm">{activeCount} SKU{activeCount !== 1 ? "s" : ""}</Text>
-                      </InlineStack>
-                      {activeCount > 0 && (
-                        <Button variant="plain" tone="critical" onClick={() => handleRemoveVendor(po.id, activeGroupIds)}>Remove all</Button>
-                      )}
-                    </InlineStack>
-                  </div>
-                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                    <thead>
-                      <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                        {tableHeaders.map((h, i) => (
-                          <th key={i} style={{ padding: "8px 12px", textAlign: i >= (hasOnHand ? 4 : 3) && i <= (hasOnHand ? 5 : 4) ? "center" : "left" }}>
-                            <Text variant="headingSm">{h}</Text>
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>{items.map((item) => renderItemRow(item, po, poEdits, hasOnHand, poOnHand, poInventoryItemIds))}</tbody>
-                  </table>
-                </BlockStack>
-              );
-            }
-
-            return (
-              <div key={po.id} style={{ marginBottom: "1rem" }}>
-                <Card>
-                  <BlockStack gap="300">
-                    <InlineStack align="space-between" blockAlign="center">
-                      <BlockStack gap="100">
-                        <InlineStack gap="200" blockAlign="center">
-                          <Text variant="headingMd">{po.poNumber}</Text>
-                          {statusBadge(po.status)}
-                          <Badge tone="default">{po.mode}</Badge>
-                          {locationLabel && locationBadge(locationLabel)}
-                        </InlineStack>
-                        <Text tone="subdued">
-                          {po.supplier?.name} · {activeItems.length} SKUs · {totalUnits} units · ${totalCost.toFixed(2)}
-                        </Text>
-                        <Text tone="subdued" variant="bodySm">
-                          Created {new Date(po.createdAt).toLocaleDateString()}
-                          {po.notes ? ` · ${po.notes}` : ""}
-                        </Text>
-                      </BlockStack>
-                      <InlineStack gap="200">
-                        <Select label="" labelHidden options={statusOptions} value={po.status} onChange={(val) => handleStatusChange(po.id, val)} />
-                        {canReceive && <Button variant="primary" onClick={() => handleOpenReceive(po)}>✓ Receive</Button>}
-                        {po.mode !== "manual" && <Button variant="plain" onClick={() => handleRegenerate(po.id)}>↺ Regenerate</Button>}
-                        <Button variant="plain" onClick={() => downloadCSV({ ...po, items: activeItems }, hasOnHand ? poOnHand : null)}>↓ CSV</Button>
-                        <Button variant="plain" onClick={() => setExpandedId(isExpanded ? null : po.id)}>
-                          {isExpanded ? "Hide items" : "View items"}
-                        </Button>
-                        <Button variant="plain" tone="critical" onClick={() => handleDelete(po.id)}>Delete</Button>
-                      </InlineStack>
-                    </InlineStack>
-
-                    {isExpanded && (
-                      <>
-                        <Divider />
-                        {po.items.length === 0 ? (
-                          <Banner tone="info">No items needed — all SKUs for this supplier are at or above their minimum levels.</Banner>
-                        ) : (
-                          <BlockStack gap="400">
-                            <InlineStack align="space-between" blockAlign="center">
-                              <Text tone="subdued" variant="bodySm">
-                                {hasOnHand ? `Live on-hand at ${locationLabel ?? "selected location"} — click Adjust next to any item to correct the count` : po.locationId ? `On-hand not loaded yet — click to fetch live from Shopify` : "No location set on this PO"}
-                              </Text>
-                              {po.locationId && (
-                                <Button variant="plain" onClick={() => handleLoadInventory(po)} loading={isLoadingInventory} disabled={isLoadingInventory}>
-                                  {hasOnHand ? "↺ Refresh on-hand" : "Load on-hand qty"}
-                                </Button>
-                              )}
-                            </InlineStack>
-
-                            {Object.entries(primaryGroups).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) => renderVendorGroup(vendor, items, false))}
-
-                            {Object.keys(secondaryGroups).length > 0 && (
-                              <BlockStack gap="300">
-                                <div style={{ padding: "8px 12px", background: "#fff4e5", borderRadius: "6px" }}>
-                                  <Text variant="headingSm" tone="subdued">Backup / Secondary source</Text>
-                                </div>
-                                {Object.entries(secondaryGroups).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) => renderVendorGroup(vendor, items, true))}
-                              </BlockStack>
-                            )}
-
-                            <div style={{ borderTop: "2px solid #e1e3e5", padding: "8px 12px" }}>
-                              <InlineStack align="space-between">
-                                <Text variant="headingSm">Total</Text>
-                                <InlineStack gap="600">
-                                  <Text variant="headingSm">{totalUnits} units</Text>
-                                  <Text variant="headingSm">${totalCost.toFixed(2)}</Text>
-                                </InlineStack>
-                              </InlineStack>
-                            </div>
-
-                            {hasChanges && (
-                              <InlineStack align="end">
-                                <Button variant="primary" onClick={() => handleSaveItems(po)}>Save changes</Button>
-                              </InlineStack>
-                            )}
-
-                            <Divider />
-                            <Text variant="headingSm">Add item</Text>
-                            <TextField
-                              label="Search by product name or SKU" labelHidden
-                              value={skuSearch[po.id] ?? ""}
-                              onChange={(val) => handleSearchChange(po.id, po.supplierId, val)}
-                              autoComplete="off"
-                              placeholder="Type product name or SKU..."
-                              suffix={isSearching ? <Spinner size="small" /> : undefined}
-                            />
-
-                            {poSearchResults.length > 0 && (
-                              <div style={{ background: "#fff", border: "1px solid #e1e3e5", borderRadius: "4px", boxShadow: "0 2px 8px rgba(0,0,0,0.1)", maxHeight: "300px", overflowY: "auto", marginTop: "4px" }}>
-                                {poSearchResults.map((result) => {
-                                  const alreadyOnPO = po.items.some((i) => i.variantId === result.id && !poRemoved.has(i.id));
-                                  return (
-                                    <div key={result.id} onClick={() => handleSelectResult(po.id, result)}
-                                      style={{ padding: "10px 14px", cursor: "pointer", borderBottom: "1px solid #f1f2f3", background: alreadyOnPO ? "#fff4e5" : "#fff" }}
-                                      onMouseEnter={(e) => e.currentTarget.style.background = alreadyOnPO ? "#ffe8cc" : "#f6f6f7"}
-                                      onMouseLeave={(e) => e.currentTarget.style.background = alreadyOnPO ? "#fff4e5" : "#fff"}
-                                    >
-                                      <InlineStack align="space-between">
-                                        <Text fontWeight="semibold">{result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}</Text>
-                                        {alreadyOnPO && <Badge tone="warning">Already on PO</Badge>}
-                                      </InlineStack>
-                                      <Text tone="subdued" variant="bodySm">SKU: {result.sku} · ${result.cost.toFixed(2)}{result.supplierCode ? ` · Code: ${result.supplierCode}` : ""}</Text>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            )}
-
-                            {poSelected && (
-                              <Card>
-                                <BlockStack gap="300">
-                                  {isDuplicate && <Banner tone="warning">This SKU is already on this PO. Adding it again will create a duplicate line item.</Banner>}
-                                  <BlockStack gap="100">
-                                    <Text fontWeight="semibold">{poSelected.productTitle}{poSelected.variantTitle ? ` — ${poSelected.variantTitle}` : ""}</Text>
-                                    <Text tone="subdued">SKU: {poSelected.sku}{poSelected.supplierCode ? ` · Code: ${poSelected.supplierCode}` : ""}</Text>
-                                  </BlockStack>
-                                  <InlineStack gap="300" blockAlign="end">
-                                    <div style={{ width: "100px" }}>
-                                      <TextField label="Qty (eaches)" type="number" value={skuQty[po.id] ?? "1"} onChange={(val) => setSkuQty((prev) => ({ ...prev, [po.id]: val }))} autoComplete="off" min="1" />
-                                    </div>
-                                    <div style={{ width: "120px" }}>
-                                      <TextField label="Unit cost" type="number" prefix="$" value={skuCost[po.id] ?? "0"} onChange={(val) => setSkuCost((prev) => ({ ...prev, [po.id]: val }))} autoComplete="off" />
-                                    </div>
-                                    <Button variant="primary" onClick={() => handleAddItem(po)} loading={isSubmitting && fetcher.formData?.get("intent") === "addItem"}>Add to PO</Button>
-                                  </InlineStack>
-                                </BlockStack>
-                              </Card>
-                            )}
-                          </BlockStack>
-                        )}
-                      </>
-                    )}
-                  </BlockStack>
-                </Card>
+          {/* Received / Cancelled section */}
+          {completedPOs.length > 0 && (
+            <div style={{ marginTop: "2rem" }}>
+              <div
+                onClick={() => setShowReceived((v) => !v)}
+                style={{ cursor: "pointer", userSelect: "none", marginBottom: "1rem" }}
+              >
+                <InlineStack gap="300" blockAlign="center">
+                  <div style={{ height: "1px", background: "#e1e3e5", flex: 1 }} />
+                  <InlineStack gap="200" blockAlign="center">
+                    <Text variant="headingSm" tone="subdued">
+                      Received & Cancelled
+                    </Text>
+                    <Badge tone="subdued">{completedPOs.length}</Badge>
+                    <Text tone="subdued" variant="bodySm">{showReceived ? "▲ hide" : "▼ show"}</Text>
+                  </InlineStack>
+                  <div style={{ height: "1px", background: "#e1e3e5", flex: 1 }} />
+                </InlineStack>
               </div>
-            );
-          })}
+              {showReceived && completedPOs.map((po) => renderPOCard(po))}
+            </div>
+          )}
 
         </Layout.Section>
       </Layout>

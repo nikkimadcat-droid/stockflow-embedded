@@ -72,14 +72,18 @@ export const action = async ({ request }) => {
     const vendorFilter = formData.get("vendorFilter");
     const typeFilter = formData.get("typeFilter");
 
+    // Escape single quotes so vendors like "Stella & Chewy's" don't break the query
+    const escapedVendor = vendorFilter ? vendorFilter.replace(/'/g, "\\'") : "";
+    const escapedType = typeFilter ? typeFilter.replace(/'/g, "\\'") : "";
+
     const products = [];
     let cursor = null;
     let hasMore = true;
     while (hasMore) {
-      const query = vendorFilter
-        ? `vendor:'${vendorFilter}'`
-        : typeFilter
-        ? `product_type:'${typeFilter}'`
+      const query = escapedVendor
+        ? `vendor:'${escapedVendor}'`
+        : escapedType
+        ? `product_type:'${escapedType}'`
         : "";
 
       const prodRes = await admin.graphql(`
@@ -91,6 +95,7 @@ export const action = async ({ request }) => {
                 id
                 title
                 vendor
+                productType
                 variants(first: 100) {
                   edges {
                     node { id sku }
@@ -239,7 +244,6 @@ export default function MinMax() {
   const [loadedLocationId, setLoadedLocationId] = useState("");
   const [showSaved, setShowSaved] = useState(false);
 
-  // keep a ref to edits so we can access current value in the save merge
   const editsRef = useRef(edits);
   editsRef.current = edits;
 
@@ -247,7 +251,6 @@ export default function MinMax() {
   const isSaving = isSubmitting && fetcher.formData?.get("intent") === "save";
   const isLoading = isSubmitting && fetcher.formData?.get("intent") === "fetchProducts";
 
-  // handle fetcher responses
   const lastDataRef = useRef(null);
   if (fetcher.data && fetcher.data !== lastDataRef.current) {
     lastDataRef.current = fetcher.data;
@@ -261,7 +264,6 @@ export default function MinMax() {
     }
 
     if (fetcher.data.intent === "save" && fetcher.data.saved) {
-      // merge saved edits into rows so values persist without reloading
       const currentEdits = editsRef.current;
       setRows(prev => prev.map(r => {
         const e = currentEdits[r.variantId];

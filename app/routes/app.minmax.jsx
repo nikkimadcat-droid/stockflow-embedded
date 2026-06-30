@@ -329,7 +329,8 @@ export default function MinMax() {
   function getStatus(variantId, onHand) {
     const row = rows.find(r => r.variantId === variantId);
     const min = parseInt(edits[variantId]?.minLevel ?? row?.minLevel ?? 0);
-    if (min === 0) return "—";
+    const max = parseInt(edits[variantId]?.maxLevel ?? row?.maxLevel ?? 0);
+    if (min === 0 && max === 0) return "—";
     if (onHand <= min) return "⚠️ Reorder";
     return "OK";
   }

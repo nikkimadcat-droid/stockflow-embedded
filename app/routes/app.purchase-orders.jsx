@@ -147,7 +147,7 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
   for (const mm of minmaxRows) {
     const onHand = onHandMap[mm.variantId];
     if (!onHand) continue;
-    if (onHand.qty >= mm.minLevel) continue;
+    if (onHand.qty > mm.minLevel) continue;
     const needed = mm.maxLevel - onHand.qty;
     if (needed <= 0) continue;
     const casePackSize = mm.casePackSize > 1 ? mm.casePackSize : 1;

@@ -188,8 +188,15 @@ export const action = async ({ request }) => {
   if (intent === "save") {
     const updates = JSON.parse(formData.get("updates"));
     const locationId = formData.get("locationId");
+    const allLocationIds = JSON.parse(formData.get("allLocationIds") || "[]");
+    const otherLocationIds = allLocationIds.filter(id => id !== locationId);
 
     for (const u of updates) {
+      const minLevel = parseInt(u.minLevel) || 0;
+      const maxLevel = parseInt(u.maxLevel) || 0;
+      const casePackSize = parseInt(u.casePackSize) || 1;
+
+      // 1. Save the location actually being edited (min/max + case size, as before)
       await db.minMax.upsert({
         where: {
           shop_variantId_locationId: {
@@ -199,29 +206,49 @@ export const action = async ({ request }) => {
           },
         },
         update: {
-          minLevel: parseInt(u.minLevel) || 0,
-          maxLevel: parseInt(u.maxLevel) || 0,
-          casePackSize: parseInt(u.casePackSize) || 1,
+          minLevel,
+          maxLevel,
+          casePackSize,
         },
         create: {
           shop,
           variantId: u.variantId,
           locationId,
-          minLevel: parseInt(u.minLevel) || 0,
-          maxLevel: parseInt(u.maxLevel) || 0,
-          casePackSize: parseInt(u.casePackSize) || 1,
+          minLevel,
+          maxLevel,
+          casePackSize,
         },
       });
 
+      // 2. Propagate case size to every other location carrying this SKU.
+      //    Uses upsert (not updateMany) so a row is CREATED if that location
+      //    has never had min/max set for this variant before — updateMany
+      //    silently skips rows that don't exist yet, which was the original bug.
+      //    Min/max are intentionally left alone (0 on create) — those stay
+      //    per-location and should never be overwritten by another location's edit.
       if (u.casePackSize) {
-        await db.minMax.updateMany({
-          where: {
-            shop,
-            variantId: u.variantId,
-            NOT: { locationId },
-          },
-          data: { casePackSize: parseInt(u.casePackSize) || 1 },
-        });
+        for (const otherLocationId of otherLocationIds) {
+          await db.minMax.upsert({
+            where: {
+              shop_variantId_locationId: {
+                shop,
+                variantId: u.variantId,
+                locationId: otherLocationId,
+              },
+            },
+            update: {
+              casePackSize,
+            },
+            create: {
+              shop,
+              variantId: u.variantId,
+              locationId: otherLocationId,
+              minLevel: 0,
+              maxLevel: 0,
+              casePackSize,
+            },
+          });
+        }
       }
     }
 
@@ -316,6 +343,7 @@ export default function MinMax() {
     fd.append("intent", "save");
     fd.append("locationId", loadedLocationId);
     fd.append("updates", JSON.stringify(updates));
+    fd.append("allLocationIds", JSON.stringify(locations.map(l => l.id)));
     fetcher.submit(fd, { method: "POST" });
   }
 

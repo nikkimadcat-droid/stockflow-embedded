@@ -1,5 +1,5 @@
-﻿// v2
-import { useState, useRef } from "react";
+﻿// v3 - fixed infinite re-render (moved fetcher sync into useEffect) + missing intent on receive error returns
+import { useState, useRef, useEffect } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -493,7 +493,7 @@ export const action = async ({ request }) => {
     const id = form.get("id");
     const receiveQtys = JSON.parse(form.get("receiveQtys"));
     const po = await db.purchaseOrder.findUnique({ where: { id }, include: { items: true } });
-    if (!po || !po.locationId) return { ok: false, error: "PO not found or no location set" };
+    if (!po || !po.locationId) return { ok: false, intent: "receive", error: "PO not found or no location set" };
     const variantIds = po.items.map((i) => i.variantId);
     const inventoryItemMap = {};
     for (let i = 0; i < variantIds.length; i += 50) {
@@ -514,7 +514,7 @@ export const action = async ({ request }) => {
       if (!inventoryItemId) continue;
       changes.push({ inventoryItemId, locationId: po.locationId, delta: qty });
     }
-    if (changes.length === 0) return { ok: false, error: "No items to receive" };
+    if (changes.length === 0) return { ok: false, intent: "receive", error: "No items to receive" };
     const errors = [];
     for (let i = 0; i < changes.length; i += 100) {
       const adjRes = await admin.graphql(`
@@ -615,35 +615,53 @@ export default function PurchaseOrders() {
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
 
-  if (fetcher.state === "idle" && fetcherData?.intent === "fetchInventory" && fetcherData?.poId && onHandData[fetcherData.poId] === "loading") {
-    setOnHandData((prev) => ({ ...prev, [fetcherData.poId]: fetcherData.onHand }));
-    setInventoryItemIdData((prev) => ({ ...prev, [fetcherData.poId]: fetcherData.inventoryItemIds ?? {} }));
-  }
-  if (fetcher.state === "idle" && fetcherData?.intent === "receive") {
-    if (fetcherData.ok && receiveModal) { setReceiveModal(null); setReceiveError(null); }
-    else if (!fetcherData.ok && fetcherData.error) setReceiveError(fetcherData.error);
-  }
-  if (fetcher.state === "idle" && fetcherData?.intent === "searchProducts" && fetcherData?.poId) {
-    const poId = fetcherData.poId;
-    if (!searchResults[poId] || JSON.stringify(searchResults[poId]) !== JSON.stringify(fetcherData.results)) {
-      setSearchResults((prev) => ({ ...prev, [poId]: fetcherData.results ?? [] }));
+  // All fetcher-response handling lives here, in an effect, instead of running
+  // directly in the render body. Running setState during render (as this used
+  // to) can spiral into an infinite render loop ("Minified React error #301")
+  // once multiple fetcher-driven actions (load on-hand, receive, search, add
+  // item, adjust stock) interleave on the same shared fetcher instance.
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcherData) return;
+
+    if (fetcherData.intent === "fetchInventory" && fetcherData.poId && onHandData[fetcherData.poId] === "loading") {
+      setOnHandData((prev) => ({ ...prev, [fetcherData.poId]: fetcherData.onHand }));
+      setInventoryItemIdData((prev) => ({ ...prev, [fetcherData.poId]: fetcherData.inventoryItemIds ?? {} }));
     }
-  }
-  if (fetcher.state === "idle" && fetcherData?.intent === "adjustStock" && fetcherData?.ok && fetcherData?.variantId) {
-    const vid = fetcherData.variantId;
-    const poId = fetcherData.poId;
-    if (stockAdjust[vid]?.saving) {
-      setStockAdjust((prev) => ({ ...prev, [vid]: { open: false, value: "", saving: false, saved: true, error: null } }));
-      setOnHandData((prev) => ({ ...prev, [poId]: { ...(prev[poId] ?? {}), [vid]: fetcherData.newQty } }));
-      setTimeout(() => setStockAdjust((prev) => ({ ...prev, [vid]: { ...prev[vid], saved: false } })), 2000);
+
+    if (fetcherData.intent === "receive") {
+      if (fetcherData.ok && receiveModal) {
+        setReceiveModal(null);
+        setReceiveError(null);
+      } else if (!fetcherData.ok && fetcherData.error) {
+        setReceiveError(fetcherData.error);
+      }
     }
-  }
-  if (fetcher.state === "idle" && fetcherData?.intent === "adjustStock" && !fetcherData?.ok && fetcherData?.variantId) {
-    const vid = fetcherData.variantId;
-    if (stockAdjust[vid]?.saving) {
-      setStockAdjust((prev) => ({ ...prev, [vid]: { ...prev[vid], saving: false, error: fetcherData.error } }));
+
+    if (fetcherData.intent === "searchProducts" && fetcherData.poId) {
+      const poId = fetcherData.poId;
+      if (!searchResults[poId] || JSON.stringify(searchResults[poId]) !== JSON.stringify(fetcherData.results)) {
+        setSearchResults((prev) => ({ ...prev, [poId]: fetcherData.results ?? [] }));
+      }
     }
-  }
+
+    if (fetcherData.intent === "adjustStock" && fetcherData.ok && fetcherData.variantId) {
+      const vid = fetcherData.variantId;
+      const poId = fetcherData.poId;
+      if (stockAdjust[vid]?.saving) {
+        setStockAdjust((prev) => ({ ...prev, [vid]: { open: false, value: "", saving: false, saved: true, error: null } }));
+        setOnHandData((prev) => ({ ...prev, [poId]: { ...(prev[poId] ?? {}), [vid]: fetcherData.newQty } }));
+        setTimeout(() => setStockAdjust((prev) => ({ ...prev, [vid]: { ...prev[vid], saved: false } })), 2000);
+      }
+    }
+
+    if (fetcherData.intent === "adjustStock" && !fetcherData.ok && fetcherData.variantId) {
+      const vid = fetcherData.variantId;
+      if (stockAdjust[vid]?.saving) {
+        setStockAdjust((prev) => ({ ...prev, [vid]: { ...prev[vid], saving: false, error: fetcherData.error } }));
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetcher.state, fetcherData]);
 
   function handleSearchChange(poId, supplierId, val) {
     setSkuSearch((prev) => ({ ...prev, [poId]: val }));

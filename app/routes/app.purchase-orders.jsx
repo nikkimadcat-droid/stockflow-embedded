@@ -1024,8 +1024,7 @@ export default function PurchaseOrders() {
                   {po.supplier?.name} · {activeItems.length} SKUs · {totalUnits} units · ${totalCost.toFixed(2)}
                 </Text>
                 <Text tone="subdued" variant="bodySm">
-                  Created {new Date(po.createdAt).toLocaleDateString()}
-                  {po.notes ? ` · ${po.notes}` : ""}
+Created {new Date(po.createdAt).toLocaleDateString("en-US")}                  {po.notes ? ` · ${po.notes}` : ""}
                 </Text>
               </BlockStack>
               <InlineStack gap="200">

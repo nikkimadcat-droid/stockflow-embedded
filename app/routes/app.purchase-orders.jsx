@@ -783,6 +783,7 @@ export default function PurchaseOrders() {
   }
 
   function handleConfirmReceive() {
+    console.log("RECEIVE CLICKED", receiveModal);
     const { po, receiveQtys } = receiveModal;
     const fd = new FormData();
     fd.append("intent", "receive");

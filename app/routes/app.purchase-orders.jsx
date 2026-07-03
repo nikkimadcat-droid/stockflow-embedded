@@ -1190,8 +1190,12 @@ export default function PurchaseOrders() {
                 <BlockStack gap="400">
                   <Text>Receiving at: <strong>{locationNameMap[receiveModal.po.locationId] ?? receiveModal.po.locationId}</strong></Text>
                   <Text tone="subdued">Adjust quantities below if you received a partial shipment.</Text>
-                  {receiveError && <Banner tone="critical">{receiveError}</Banner>}
-                  <div style={{ overflowX: "auto" }}>
+{receiveError && <Banner tone="critical">{receiveError}</Banner>}
+{fetcherData?.intent === "receive" && (
+  <Banner tone="info">
+    <pre style={{ whiteSpace: "pre-wrap", fontSize: "11px" }}>{JSON.stringify(fetcherData, null, 2)}</pre>
+  </Banner>
+)}                  <div style={{ overflowX: "auto" }}>
                     <table style={{ width: "100%", borderCollapse: "collapse" }}>
                       <thead>
                         <tr style={{ borderBottom: "1px solid #e1e3e5" }}>

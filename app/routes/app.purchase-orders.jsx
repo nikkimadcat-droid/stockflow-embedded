@@ -1,4 +1,4 @@
-﻿// v3 - fixed infinite re-render (moved fetcher sync into useEffect) + missing intent on receive error returns
+﻿// v4 - added try/catch around receive action so real errors surface instead of vanishing silently
 import { useState, useRef, useEffect } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
@@ -490,47 +490,52 @@ export const action = async ({ request }) => {
   }
 
   if (intent === "receive") {
-    const id = form.get("id");
-    const receiveQtys = JSON.parse(form.get("receiveQtys"));
-    const po = await db.purchaseOrder.findUnique({ where: { id }, include: { items: true } });
-    if (!po || !po.locationId) return { ok: false, intent: "receive", error: "PO not found or no location set" };
-    const variantIds = po.items.map((i) => i.variantId);
-    const inventoryItemMap = {};
-    for (let i = 0; i < variantIds.length; i += 50) {
-      const batch = variantIds.slice(i, i + 50);
-      const varRes = await admin.graphql(`
-        query($ids: [ID!]!) { nodes(ids: $ids) { ... on ProductVariant { id inventoryItem { id } } } }
-      `, { variables: { ids: batch } });
-      const varJson = await varRes.json();
-      for (const node of varJson.data?.nodes ?? []) {
-        if (node?.id && node?.inventoryItem?.id) inventoryItemMap[node.id] = node.inventoryItem.id;
-      }
-    }
-    const changes = [];
-    for (const item of po.items) {
-      const qty = Number(receiveQtys[item.id] ?? item.qtyOrdered);
-      if (qty <= 0) continue;
-      const inventoryItemId = inventoryItemMap[item.variantId];
-      if (!inventoryItemId) continue;
-      changes.push({ inventoryItemId, locationId: po.locationId, delta: qty });
-    }
-    if (changes.length === 0) return { ok: false, intent: "receive", error: "No items to receive" };
-    const errors = [];
-    for (let i = 0; i < changes.length; i += 100) {
-      const adjRes = await admin.graphql(`
-        mutation($input: InventoryAdjustQuantitiesInput!) {
-          inventoryAdjustQuantities(input: $input) {
-            inventoryAdjustmentGroup { id }
-            userErrors { field message }
-          }
+    try {
+      const id = form.get("id");
+      const receiveQtys = JSON.parse(form.get("receiveQtys"));
+      const po = await db.purchaseOrder.findUnique({ where: { id }, include: { items: true } });
+      if (!po || !po.locationId) return { ok: false, intent: "receive", error: "PO not found or no location set" };
+      const variantIds = po.items.map((i) => i.variantId);
+      const inventoryItemMap = {};
+      for (let i = 0; i < variantIds.length; i += 50) {
+        const batch = variantIds.slice(i, i + 50);
+        const varRes = await admin.graphql(`
+          query($ids: [ID!]!) { nodes(ids: $ids) { ... on ProductVariant { id inventoryItem { id } } } }
+        `, { variables: { ids: batch } });
+        const varJson = await varRes.json();
+        for (const node of varJson.data?.nodes ?? []) {
+          if (node?.id && node?.inventoryItem?.id) inventoryItemMap[node.id] = node.inventoryItem.id;
         }
-      `, { variables: { input: { reason: "received", name: "available", changes: changes.slice(i, i + 100) } } });
-      const adjJson = await adjRes.json();
-      errors.push(...(adjJson.data?.inventoryAdjustQuantities?.userErrors ?? []).map((e) => e.message));
+      }
+      const changes = [];
+      for (const item of po.items) {
+        const qty = Number(receiveQtys[item.id] ?? item.qtyOrdered);
+        if (qty <= 0) continue;
+        const inventoryItemId = inventoryItemMap[item.variantId];
+        if (!inventoryItemId) continue;
+        changes.push({ inventoryItemId, locationId: po.locationId, delta: qty });
+      }
+      if (changes.length === 0) return { ok: false, intent: "receive", error: "No items to receive" };
+      const errors = [];
+      for (let i = 0; i < changes.length; i += 100) {
+        const adjRes = await admin.graphql(`
+          mutation($input: InventoryAdjustQuantitiesInput!) {
+            inventoryAdjustQuantities(input: $input) {
+              inventoryAdjustmentGroup { id }
+              userErrors { field message }
+            }
+          }
+        `, { variables: { input: { reason: "received", name: "available", changes: changes.slice(i, i + 100) } } });
+        const adjJson = await adjRes.json();
+        errors.push(...(adjJson.data?.inventoryAdjustQuantities?.userErrors ?? []).map((e) => e.message));
+      }
+      if (errors.length > 0) return { ok: false, intent: "receive", error: errors.join("; ") };
+      await db.purchaseOrder.update({ where: { id }, data: { status: "received", updatedAt: new Date() } });
+      return { ok: true, intent: "receive", poId: id };
+    } catch (err) {
+      console.error("RECEIVE ACTION CRASHED:", err);
+      return { ok: false, intent: "receive", error: `Server error: ${err.message}` };
     }
-    if (errors.length > 0) return { ok: false, intent: "receive", error: errors.join("; ") };
-    await db.purchaseOrder.update({ where: { id }, data: { status: "received", updatedAt: new Date() } });
-    return { ok: true, intent: "receive", poId: id };
   }
 
   if (intent === "updateStatus") {
@@ -783,7 +788,6 @@ export default function PurchaseOrders() {
   }
 
   function handleConfirmReceive() {
-    console.log("RECEIVE CLICKED", receiveModal);
     const { po, receiveQtys } = receiveModal;
     const fd = new FormData();
     fd.append("intent", "receive");
@@ -1104,7 +1108,7 @@ export default function PurchaseOrders() {
                           return (
                             <div key={result.id} onClick={() => handleSelectResult(po.id, result)}
                               style={{ padding: "10px 14px", cursor: "pointer", borderBottom: "1px solid #f1f2f3", background: alreadyOnPO ? "#fff4e5" : "#fff" }}
-                              onMouseEnter={(e) => e.currentTarget.style.background = alreadyOnPO ? "#ffe8cc" : "#f6f6f7"}
+                              onMouseEnter={(e) => e.currentTarget.style.background = alreadyOnPO ? "#ffe8cc" : "#fff"}
                               onMouseLeave={(e) => e.currentTarget.style.background = alreadyOnPO ? "#fff4e5" : "#fff"}
                             >
                               <InlineStack align="space-between">
@@ -1190,12 +1194,13 @@ export default function PurchaseOrders() {
                 <BlockStack gap="400">
                   <Text>Receiving at: <strong>{locationNameMap[receiveModal.po.locationId] ?? receiveModal.po.locationId}</strong></Text>
                   <Text tone="subdued">Adjust quantities below if you received a partial shipment.</Text>
-{receiveError && <Banner tone="critical">{receiveError}</Banner>}
-{fetcherData?.intent === "receive" && (
-  <Banner tone="info">
-    <pre style={{ whiteSpace: "pre-wrap", fontSize: "11px" }}>{JSON.stringify(fetcherData, null, 2)}</pre>
-  </Banner>
-)}                  <div style={{ overflowX: "auto" }}>
+                  {receiveError && <Banner tone="critical">{receiveError}</Banner>}
+                  {fetcherData?.intent === "receive" && (
+                    <Banner tone="info">
+                      <pre style={{ whiteSpace: "pre-wrap", fontSize: "11px" }}>{JSON.stringify(fetcherData, null, 2)}</pre>
+                    </Banner>
+                  )}
+                  <div style={{ overflowX: "auto" }}>
                     <table style={{ width: "100%", borderCollapse: "collapse" }}>
                       <thead>
                         <tr style={{ borderBottom: "1px solid #e1e3e5" }}>

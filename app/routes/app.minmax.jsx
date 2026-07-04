@@ -13,6 +13,7 @@ import {
   TextField,
   Banner,
   Spinner,
+  Badge,
 } from "@shopify/polaris";
 import { useState, useCallback, useRef } from "react";
 
@@ -71,107 +72,46 @@ export const action = async ({ request }) => {
     const locationId = formData.get("locationId");
     const vendorFilter = formData.get("vendorFilter");
     const typeFilter = formData.get("typeFilter");
-    const searchFilter = formData.get("searchFilter");
 
     const escapedVendor = vendorFilter ? vendorFilter.replace(/'/g, "\\'") : "";
     const escapedType = typeFilter ? typeFilter.replace(/'/g, "\\'") : "";
-    const escapedSearch = searchFilter ? searchFilter.trim().replace(/['"]/g, "") : "";
 
-    let products = [];
+    const products = [];
+    let cursor = null;
+    let hasMore = true;
+    while (hasMore) {
+      const query = escapedVendor
+        ? `vendor:'${escapedVendor}'`
+        : escapedType
+        ? `product_type:'${escapedType}'`
+        : "";
 
-    if (escapedSearch) {
-      // Search by product title OR SKU, same pattern as the PO page's item search.
-      // Run both queries and merge, since a name search won't find SKU-only matches
-      // and vice versa.
-      const [titleProducts, skuProducts] = await Promise.all([
-        (async () => {
-          const out = [];
-          let cursor = null, hasMore = true;
-          while (hasMore) {
-            const res = await admin.graphql(`
-              query($cursor: String, $query: String!) {
-                products(first: 250, after: $cursor, query: $query) {
-                  pageInfo { hasNextPage endCursor }
+      const prodRes = await admin.graphql(`
+        query($cursor: String, $query: String!) {
+          products(first: 250, after: $cursor, query: $query) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                id
+                title
+                vendor
+                productType
+                variants(first: 100) {
                   edges {
-                    node {
-                      id title vendor productType
-                      variants(first: 100) { edges { node { id sku } } }
-                    }
+                    node { id sku }
                   }
-                }
-              }
-            `, { variables: { cursor, query: `title:*${escapedSearch}*` } });
-            const json = await res.json();
-            const page = json.data.products;
-            out.push(...page.edges.map(e => e.node));
-            hasMore = page.pageInfo.hasNextPage;
-            cursor = page.pageInfo.endCursor;
-          }
-          return out;
-        })(),
-        (async () => {
-          const out = [];
-          let cursor = null, hasMore = true;
-          while (hasMore) {
-            const res = await admin.graphql(`
-              query($cursor: String, $query: String!) {
-                products(first: 250, after: $cursor, query: $query) {
-                  pageInfo { hasNextPage endCursor }
-                  edges {
-                    node {
-                      id title vendor productType
-                      variants(first: 100) { edges { node { id sku } } }
-                    }
-                  }
-                }
-              }
-            `, { variables: { cursor, query: `sku:*${escapedSearch}*` } });
-            const json = await res.json();
-            const page = json.data.products;
-            out.push(...page.edges.map(e => e.node));
-            hasMore = page.pageInfo.hasNextPage;
-            cursor = page.pageInfo.endCursor;
-          }
-          return out;
-        })(),
-      ]);
-
-      const seen = new Set();
-      products = [...titleProducts, ...skuProducts].filter(p => {
-        if (seen.has(p.id)) return false;
-        seen.add(p.id);
-        return true;
-      });
-    } else {
-      let cursor = null;
-      let hasMore = true;
-      while (hasMore) {
-        const query = escapedVendor
-          ? `vendor:'${escapedVendor}'`
-          : escapedType
-          ? `product_type:'${escapedType}'`
-          : "";
-
-        const prodRes = await admin.graphql(`
-          query($cursor: String, $query: String!) {
-            products(first: 250, after: $cursor, query: $query) {
-              pageInfo { hasNextPage endCursor }
-              edges {
-                node {
-                  id title vendor productType
-                  variants(first: 100) { edges { node { id sku } } }
                 }
               }
             }
           }
-        `, { variables: { cursor, query } });
+        }
+      `, { variables: { cursor, query } });
 
-        const prodJson = await prodRes.json();
-        const page = prodJson.data.products;
-        products.push(...page.edges.map(e => e.node));
-        hasMore = page.pageInfo.hasNextPage;
-        cursor = page.pageInfo.endCursor;
-      }
+      const prodJson = await prodRes.json();
+      const page = prodJson.data.products;
+      products.push(...page.edges.map(e => e.node));
+      hasMore = page.pageInfo.hasNextPage;
+      cursor = page.pageInfo.endCursor;
     }
 
     const filtered = products.filter(p =>
@@ -245,6 +185,116 @@ export const action = async ({ request }) => {
     return { ok: true, intent: "fetchProducts", rows, locationId };
   }
 
+  if (intent === "searchProducts") {
+    const query = formData.get("query");
+    const locationId = formData.get("locationId");
+
+    const [titleRes, skuRes] = await Promise.all([
+      admin.graphql(`
+        query($query: String!) {
+          products(first: 10, query: $query) {
+            edges {
+              node {
+                title vendor productType
+                variants(first: 20) {
+                  edges { node { id sku title } }
+                }
+              }
+            }
+          }
+        }
+      `, { variables: { query: `title:*${query}*` } }),
+      admin.graphql(`
+        query($query: String!) {
+          productVariants(first: 10, query: $query) {
+            edges {
+              node {
+                id sku title
+                product { title vendor productType }
+              }
+            }
+          }
+        }
+      `, { variables: { query: `sku:*${query}*` } }),
+    ]);
+
+    const [titleJson, skuJson] = await Promise.all([titleRes.json(), skuRes.json()]);
+    const seen = new Set();
+    const candidates = [];
+
+    for (const { node: p } of titleJson.data?.products?.edges ?? []) {
+      for (const { node: v } of p.variants.edges) {
+        if (seen.has(v.id)) continue;
+        seen.add(v.id);
+        candidates.push({
+          variantId: v.id,
+          productTitle: p.title,
+          variantTitle: v.title === "Default Title" ? "" : v.title,
+          vendor: p.vendor ?? "",
+          productType: p.productType ?? "",
+          sku: v.sku || "—",
+        });
+      }
+    }
+
+    for (const { node: v } of skuJson.data?.productVariants?.edges ?? []) {
+      if (seen.has(v.id)) continue;
+      seen.add(v.id);
+      candidates.push({
+        variantId: v.id,
+        productTitle: v.product?.title ?? "",
+        variantTitle: v.title === "Default Title" ? "" : v.title,
+        vendor: v.product?.vendor ?? "",
+        productType: v.product?.productType ?? "",
+        sku: v.sku || "—",
+      });
+    }
+
+    const top = candidates.slice(0, 10);
+
+    // Fetch on-hand + existing min/max for the selected location, for just these variants
+    const invMap = {};
+    if (top.length > 0 && locationId) {
+      const chunk = top.map(c => c.variantId);
+      const res = await admin.graphql(`
+        query($ids: [ID!]!, $locationId: ID!) {
+          nodes(ids: $ids) {
+            ... on ProductVariant {
+              id
+              inventoryItem {
+                inventoryLevel(locationId: $locationId) {
+                  quantities(names: ["available"]) { quantity }
+                }
+              }
+            }
+          }
+        }
+      `, { variables: { ids: chunk, locationId } });
+      const json = await res.json();
+      for (const node of json.data?.nodes ?? []) {
+        if (node?.id) {
+          invMap[node.id] = node.inventoryItem?.inventoryLevel?.quantities?.[0]?.quantity ?? 0;
+        }
+      }
+    }
+
+    const savedMinMax = await db.minMax.findMany({
+      where: { shop, locationId, variantId: { in: top.map(c => c.variantId) } },
+    });
+    const minMaxMap = {};
+    for (const mm of savedMinMax) minMaxMap[mm.variantId] = mm;
+
+    const results = top.map(c => ({
+      ...c,
+      onHand: invMap[c.variantId] ?? 0,
+      minLevel: minMaxMap[c.variantId]?.minLevel ?? 0,
+      maxLevel: minMaxMap[c.variantId]?.maxLevel ?? 0,
+      casePackSize: minMaxMap[c.variantId]?.casePackSize ?? 1,
+    }));
+
+    return { ok: true, intent: "searchProducts", results };
+  }
+
   if (intent === "save") {
     const updates = JSON.parse(formData.get("updates"));
     const locationId = formData.get("locationId");
@@ -314,16 +364,20 @@ export const action = async ({ request }) => {
 export default function MinMax() {
   const { locations, vendors, types } = useLoaderData();
   const fetcher = useFetcher();
+  const searchFetcher = useFetcher();
 
   const [selectedLocation, setSelectedLocation] = useState(locations[0]?.id || "");
   const [vendorFilter, setVendorFilter] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
-  const [searchFilter, setSearchFilter] = useState("");
   const [rows, setRows] = useState([]);
   const [edits, setEdits] = useState({});
   const [loaded, setLoaded] = useState(false);
   const [loadedLocationId, setLoadedLocationId] = useState("");
   const [showSaved, setShowSaved] = useState(false);
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const searchDebounceRef = useRef(null);
 
   const editsRef = useRef(edits);
   editsRef.current = edits;
@@ -331,6 +385,7 @@ export default function MinMax() {
   const isSubmitting = fetcher.state !== "idle";
   const isSaving = isSubmitting && fetcher.formData?.get("intent") === "save";
   const isLoading = isSubmitting && fetcher.formData?.get("intent") === "fetchProducts";
+  const isSearching = searchFetcher.state !== "idle";
 
   const lastDataRef = useRef(null);
   if (fetcher.data && fetcher.data !== lastDataRef.current) {
@@ -362,6 +417,10 @@ export default function MinMax() {
     }
   }
 
+  if (searchFetcher.data?.intent === "searchProducts" && searchFetcher.data.results !== searchResults) {
+    setSearchResults(searchFetcher.data.results ?? []);
+  }
+
   function handleLoad() {
     setLoaded(false);
     setRows([]);
@@ -372,8 +431,41 @@ export default function MinMax() {
     fd.append("locationId", selectedLocation);
     fd.append("vendorFilter", vendorFilter);
     fd.append("typeFilter", typeFilter);
-    fd.append("searchFilter", searchFilter);
     fetcher.submit(fd, { method: "POST" });
+  }
+
+  function handleSearchChange(val) {
+    setSearchQuery(val);
+    setSearchResults([]);
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    if (!val.trim() || val.trim().length < 2) return;
+    searchDebounceRef.current = setTimeout(() => {
+      const fd = new FormData();
+      fd.append("intent", "searchProducts");
+      fd.append("query", val.trim());
+      fd.append("locationId", selectedLocation);
+      searchFetcher.submit(fd, { method: "POST" });
+    }, 400);
+  }
+
+  function handleAddSearchedItem(result) {
+    const alreadyOnList = rows.some(r => r.variantId === result.variantId);
+    if (!alreadyOnList) {
+      setRows(prev => [...prev, {
+        variantId: result.variantId,
+        productTitle: result.productTitle,
+        vendor: result.vendor,
+        sku: result.sku,
+        onHand: result.onHand,
+        minLevel: result.minLevel,
+        maxLevel: result.maxLevel,
+        casePackSize: result.casePackSize,
+      }].sort((a, b) => a.productTitle.localeCompare(b.productTitle)));
+      setLoadedLocationId(selectedLocation);
+    }
+    setLoaded(true);
+    setSearchQuery("");
+    setSearchResults([]);
   }
 
   const handleChange = useCallback((variantId, field, value) => {
@@ -462,36 +554,12 @@ export default function MinMax() {
                     }}
                   />
                 </div>
-                <div style={{ minWidth: "240px" }}>
-                  <TextField
-                    label="Search by product name or SKU"
-                    value={searchFilter}
-                    onChange={val => {
-                      setSearchFilter(val);
-                      if (val) {
-                        setVendorFilter("");
-                        setTypeFilter("");
-                      }
-                    }}
-                    autoComplete="off"
-                    placeholder="e.g. Loafer Bed"
-                    clearButton
-                    onClearButtonClick={() => setSearchFilter("")}
-                  />
-                </div>
                 <div style={{ minWidth: "200px" }}>
                   <Select
                     label="Vendor"
                     options={vendorOptions}
                     value={vendorFilter}
-                    disabled={!!searchFilter}
-                    onChange={val => {
-                      setVendorFilter(val);
-                      if (val) {
-                        setTypeFilter("");
-                        setSearchFilter("");
-                      }
-                    }}
+                    onChange={setVendorFilter}
                   />
                 </div>
                 <div style={{ minWidth: "200px" }}>
@@ -499,14 +567,7 @@ export default function MinMax() {
                     label="Product Type"
                     options={typeOptions}
                     value={typeFilter}
-                    disabled={!!searchFilter}
-                    onChange={val => {
-                      setTypeFilter(val);
-                      if (val) {
-                        setVendorFilter("");
-                        setSearchFilter("");
-                      }
-                    }}
+                    onChange={setTypeFilter}
                   />
                 </div>
                 <div style={{ paddingTop: "24px" }}>
@@ -524,6 +585,57 @@ export default function MinMax() {
               )}
             </BlockStack>
           </Card>
+
+          <div style={{ marginTop: "1rem" }}>
+            <Card>
+              <div>
+                <TextField
+                  label="Add a single SKU"
+                  value={searchQuery}
+                  onChange={handleSearchChange}
+                  autoComplete="off"
+                  placeholder="Search by product name or SKU..."
+                  suffix={isSearching ? <Spinner size="small" /> : undefined}
+                  clearButton
+                  onClearButtonClick={() => { setSearchQuery(""); setSearchResults([]); }}
+                />
+                {searchResults.length > 0 && (
+                  <div style={{
+                    marginTop: "8px",
+                    background: "#fff", border: "1px solid #e1e3e5", borderRadius: "4px",
+                    maxHeight: "300px", overflowY: "auto",
+                  }}>
+                    {searchResults.map((result) => {
+                      const alreadyOnList = rows.some(r => r.variantId === result.variantId);
+                      return (
+                        <div
+                          key={result.variantId}
+                          onClick={() => handleAddSearchedItem(result)}
+                          style={{
+                            padding: "10px 14px", cursor: "pointer",
+                            borderBottom: "1px solid #f1f2f3",
+                            background: alreadyOnList ? "#fff4e5" : "#fff",
+                          }}
+                          onMouseEnter={(e) => e.currentTarget.style.background = alreadyOnList ? "#ffe8cc" : "#f6f6f7"}
+                          onMouseLeave={(e) => e.currentTarget.style.background = alreadyOnList ? "#fff4e5" : "#fff"}
+                        >
+                          <InlineStack align="space-between">
+                            <Text fontWeight="semibold">
+                              {result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}
+                            </Text>
+                            {alreadyOnList && <Badge tone="warning">Already added</Badge>}
+                          </InlineStack>
+                          <Text tone="subdued" variant="bodySm">
+                            SKU: {result.sku} · {result.vendor} · On hand: {result.onHand}
+                          </Text>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </Card>
+          </div>
 
           {isLoading && (
             <div style={{ textAlign: "center", padding: "2rem" }}>

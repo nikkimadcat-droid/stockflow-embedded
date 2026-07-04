@@ -71,16 +71,20 @@ export const action = async ({ request }) => {
     const locationId = formData.get("locationId");
     const vendorFilter = formData.get("vendorFilter");
     const typeFilter = formData.get("typeFilter");
+    const skuFilter = formData.get("skuFilter");
 
     // Escape single quotes so vendors like "Stella & Chewy's" don't break the query
     const escapedVendor = vendorFilter ? vendorFilter.replace(/'/g, "\\'") : "";
     const escapedType = typeFilter ? typeFilter.replace(/'/g, "\\'") : "";
+    const escapedSku = skuFilter ? skuFilter.trim().replace(/['"]/g, "") : "";
 
     const products = [];
     let cursor = null;
     let hasMore = true;
     while (hasMore) {
-      const query = escapedVendor
+      const query = escapedSku
+        ? `sku:*${escapedSku}*`
+        : escapedVendor
         ? `vendor:'${escapedVendor}'`
         : escapedType
         ? `product_type:'${escapedType}'`
@@ -119,8 +123,25 @@ export const action = async ({ request }) => {
       (!typeFilter || p.productType === typeFilter)
     );
 
+    // When searching by SKU, only keep the variants that actually match —
+    // a product-level SKU query can return the whole product even though
+    // only one variant's SKU matches the search term.
+    const skuLower = escapedSku.toLowerCase();
+    const productsForRows = escapedSku
+      ? filtered
+          .map(p => ({
+            ...p,
+            variants: {
+              edges: p.variants.edges.filter(({ node: v }) =>
+                (v.sku || "").toLowerCase().includes(skuLower)
+              ),
+            },
+          }))
+          .filter(p => p.variants.edges.length > 0)
+      : filtered;
+
     const variantIds = new Set();
-    for (const p of filtered) {
+    for (const p of productsForRows) {
       for (const { node: v } of p.variants.edges) {
         variantIds.add(v.id);
       }
@@ -167,7 +188,7 @@ export const action = async ({ request }) => {
       minMaxMap[mm.variantId] = mm;
     }
 
-    const rows = filtered
+    const rows = productsForRows
       .flatMap(p =>
         p.variants.edges.map(({ node: v }) => ({
           variantId: v.id,
@@ -196,7 +217,6 @@ export const action = async ({ request }) => {
       const maxLevel = parseInt(u.maxLevel) || 0;
       const casePackSize = parseInt(u.casePackSize) || 1;
 
-      // 1. Save the location actually being edited (min/max + case size, as before)
       await db.minMax.upsert({
         where: {
           shop_variantId_locationId: {
@@ -220,12 +240,6 @@ export const action = async ({ request }) => {
         },
       });
 
-      // 2. Propagate case size to every other location carrying this SKU.
-      //    Uses upsert (not updateMany) so a row is CREATED if that location
-      //    has never had min/max set for this variant before — updateMany
-      //    silently skips rows that don't exist yet, which was the original bug.
-      //    Min/max are intentionally left alone (0 on create) — those stay
-      //    per-location and should never be overwritten by another location's edit.
       if (u.casePackSize) {
         for (const otherLocationId of otherLocationIds) {
           await db.minMax.upsert({
@@ -265,6 +279,7 @@ export default function MinMax() {
   const [selectedLocation, setSelectedLocation] = useState(locations[0]?.id || "");
   const [vendorFilter, setVendorFilter] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
+  const [skuFilter, setSkuFilter] = useState("");
   const [rows, setRows] = useState([]);
   const [edits, setEdits] = useState({});
   const [loaded, setLoaded] = useState(false);
@@ -318,6 +333,7 @@ export default function MinMax() {
     fd.append("locationId", selectedLocation);
     fd.append("vendorFilter", vendorFilter);
     fd.append("typeFilter", typeFilter);
+    fd.append("skuFilter", skuFilter);
     fetcher.submit(fd, { method: "POST" });
   }
 
@@ -407,14 +423,35 @@ export default function MinMax() {
                     }}
                   />
                 </div>
+                <div style={{ minWidth: "220px" }}>
+                  <TextField
+                    label="Search by SKU"
+                    value={skuFilter}
+                    onChange={val => {
+                      setSkuFilter(val);
+                      if (val) {
+                        setVendorFilter("");
+                        setTypeFilter("");
+                      }
+                    }}
+                    autoComplete="off"
+                    placeholder="e.g. YCB-LOAFER-BED"
+                    clearButton
+                    onClearButtonClick={() => setSkuFilter("")}
+                  />
+                </div>
                 <div style={{ minWidth: "200px" }}>
                   <Select
                     label="Vendor"
                     options={vendorOptions}
                     value={vendorFilter}
+                    disabled={!!skuFilter}
                     onChange={val => {
                       setVendorFilter(val);
-                      if (val) setTypeFilter("");
+                      if (val) {
+                        setTypeFilter("");
+                        setSkuFilter("");
+                      }
                     }}
                   />
                 </div>
@@ -423,9 +460,13 @@ export default function MinMax() {
                     label="Product Type"
                     options={typeOptions}
                     value={typeFilter}
+                    disabled={!!skuFilter}
                     onChange={val => {
                       setTypeFilter(val);
-                      if (val) setVendorFilter("");
+                      if (val) {
+                        setVendorFilter("");
+                        setSkuFilter("");
+                      }
                     }}
                   />
                 </div>

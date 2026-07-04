@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+﻿import { useState, useEffect, useRef } from "react";
 import { useLoaderData, useFetcher, useSearchParams, useNavigate, Link } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -777,54 +777,6 @@ export default function Stocktake() {
                     </div>
                   </InlineStack>
 
-                  <div style={{ position: "relative", maxWidth: "400px" }}>
-                    <TextField
-                      label="Add a single SKU"
-                      value={searchQuery}
-                      onChange={handleSearchChange}
-                      autoComplete="off"
-                      placeholder="Search by product name or SKU..."
-                      suffix={isSearching ? <Spinner size="small" /> : undefined}
-                      clearButton
-                      onClearButtonClick={() => { setSearchQuery(""); setSearchResults([]); }}
-                    />
-                    {searchResults.length > 0 && (
-                      <div style={{
-                        position: "absolute", zIndex: 10, top: "100%", left: 0, right: 0,
-                        background: "#fff", border: "1px solid #e1e3e5", borderRadius: "4px",
-                        boxShadow: "0 2px 8px rgba(0,0,0,0.1)", maxHeight: "300px",
-                        overflowY: "auto", marginTop: "4px",
-                      }}>
-                        {searchResults.map((result) => {
-                          const alreadyOnList = rows.some(r => r.variantId === result.variantId);
-                          return (
-                            <div
-                              key={result.variantId}
-                              onClick={() => handleAddSearchedItem(result)}
-                              style={{
-                                padding: "10px 14px", cursor: "pointer",
-                                borderBottom: "1px solid #f1f2f3",
-                                background: alreadyOnList ? "#fff4e5" : "#fff",
-                              }}
-                              onMouseEnter={(e) => e.currentTarget.style.background = alreadyOnList ? "#ffe8cc" : "#f6f6f7"}
-                              onMouseLeave={(e) => e.currentTarget.style.background = alreadyOnList ? "#fff4e5" : "#fff"}
-                            >
-                              <InlineStack align="space-between">
-                                <Text fontWeight="semibold">
-                                  {result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}
-                                </Text>
-                                {alreadyOnList && <Badge tone="warning">Already added</Badge>}
-                              </InlineStack>
-                              <Text tone="subdued" variant="bodySm">
-                                SKU: {result.sku} · {result.vendor} · On hand: {result.onHand}
-                              </Text>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-
                   {loaded && (
                     <InlineStack gap="400" align="space-between" blockAlign="center">
                       <InlineStack gap="200" blockAlign="center">
@@ -861,6 +813,58 @@ export default function Stocktake() {
                   )}
                 </BlockStack>
               </Card>
+
+              <div style={{ marginTop: "1rem" }}>
+                <Card>
+                  <div style={{ position: "relative" }}>
+                    <TextField
+                      label="Add a single SKU"
+                      value={searchQuery}
+                      onChange={handleSearchChange}
+                      autoComplete="off"
+                      placeholder="Search by product name or SKU..."
+                      suffix={isSearching ? <Spinner size="small" /> : undefined}
+                      clearButton
+                      onClearButtonClick={() => { setSearchQuery(""); setSearchResults([]); }}
+                    />
+                    {searchResults.length > 0 && (
+                      <div style={{
+                        position: "absolute", zIndex: 100, top: "100%", left: 0, right: 0,
+                        background: "#fff", border: "1px solid #e1e3e5", borderRadius: "4px",
+                        boxShadow: "0 4px 12px rgba(0,0,0,0.15)", maxHeight: "300px",
+                        overflowY: "auto", marginTop: "4px",
+                      }}>
+                        {searchResults.map((result) => {
+                          const alreadyOnList = rows.some(r => r.variantId === result.variantId);
+                          return (
+                            <div
+                              key={result.variantId}
+                              onClick={() => handleAddSearchedItem(result)}
+                              style={{
+                                padding: "10px 14px", cursor: "pointer",
+                                borderBottom: "1px solid #f1f2f3",
+                                background: alreadyOnList ? "#fff4e5" : "#fff",
+                              }}
+                              onMouseEnter={(e) => e.currentTarget.style.background = alreadyOnList ? "#ffe8cc" : "#f6f6f7"}
+                              onMouseLeave={(e) => e.currentTarget.style.background = alreadyOnList ? "#fff4e5" : "#fff"}
+                            >
+                              <InlineStack align="space-between">
+                                <Text fontWeight="semibold">
+                                  {result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}
+                                </Text>
+                                {alreadyOnList && <Badge tone="warning">Already added</Badge>}
+                              </InlineStack>
+                              <Text tone="subdued" variant="bodySm">
+                                SKU: {result.sku} · {result.vendor} · On hand: {result.onHand}
+                              </Text>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </Card>
+              </div>
             </div>
 
             <div className="print-only" style={{ marginBottom: "16px" }}>

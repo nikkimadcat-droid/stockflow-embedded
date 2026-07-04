@@ -98,9 +98,6 @@ export const action = async ({ request }) => {
       : `gid://shopify/Location/${locationId}`;
     const locationIdNumeric = normalizeLocationId(locationId);
 
-    // Only pull variants that actually have a min or max set for this location.
-    // This replaces walking the whole catalog + whole location inventory —
-    // the min/max table already tells us exactly which variants matter here.
     const minmaxRows = await db.minMax.findMany({
       where: {
         shop,
@@ -116,8 +113,6 @@ export const action = async ({ request }) => {
 
     const variantGids = minmaxRows.map(m => m.variantId);
 
-    // Batch-fetch variant + product + inventory-at-location data directly by ID,
-    // 100 at a time, instead of paging the entire catalog/location.
     const rowsMap = {};
     const chunkSize = 100;
 
@@ -149,7 +144,7 @@ export const action = async ({ request }) => {
 
       const json = await res.json();
       for (const node of json.data?.nodes ?? []) {
-        if (!node) continue; // variant was deleted in Shopify since min/max was set
+        if (!node) continue;
         const p = node.product;
         if (!p || p.hasVariantsThatRequiresComponents) continue;
         if (vendorFilter && p.vendor !== vendorFilter) continue;
@@ -173,6 +168,98 @@ export const action = async ({ request }) => {
     );
 
     return { ok: true, intent, rows };
+  }
+
+  if (intent === "searchProducts") {
+    const query = form.get("query");
+    const locationId = form.get("locationId");
+    const locationIdGid = locationId.includes("gid://")
+      ? locationId
+      : `gid://shopify/Location/${locationId}`;
+
+    const [titleRes, skuRes] = await Promise.all([
+      admin.graphql(`
+        query($query: String!, $locationId: ID!) {
+          products(first: 10, query: $query) {
+            edges {
+              node {
+                title vendor productType hasVariantsThatRequiresComponents
+                variants(first: 20) {
+                  edges {
+                    node {
+                      id sku title
+                      inventoryItem {
+                        id
+                        inventoryLevel(locationId: $locationId) {
+                          quantities(names: ["available"]) { quantity }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `, { variables: { query: `title:*${query}*`, locationId: locationIdGid } }),
+      admin.graphql(`
+        query($query: String!, $locationId: ID!) {
+          productVariants(first: 10, query: $query) {
+            edges {
+              node {
+                id sku title
+                product { title vendor productType hasVariantsThatRequiresComponents }
+                inventoryItem {
+                  id
+                  inventoryLevel(locationId: $locationId) {
+                    quantities(names: ["available"]) { quantity }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `, { variables: { query: `sku:*${query}*`, locationId: locationIdGid } }),
+    ]);
+
+    const [titleJson, skuJson] = await Promise.all([titleRes.json(), skuRes.json()]);
+    const seen = new Set();
+    const results = [];
+
+    for (const { node: p } of titleJson.data?.products?.edges ?? []) {
+      if (p.hasVariantsThatRequiresComponents) continue;
+      for (const { node: v } of p.variants.edges) {
+        if (seen.has(v.id)) continue;
+        seen.add(v.id);
+        results.push({
+          variantId: v.id,
+          productTitle: p.title,
+          variantTitle: v.title === "Default Title" ? "" : v.title,
+          vendor: p.vendor ?? "",
+          productType: p.productType ?? "",
+          sku: v.sku || "—",
+          onHand: v.inventoryItem?.inventoryLevel?.quantities?.[0]?.quantity ?? 0,
+          inventoryItemId: v.inventoryItem?.id ?? null,
+        });
+      }
+    }
+
+    for (const { node: v } of skuJson.data?.productVariants?.edges ?? []) {
+      if (seen.has(v.id) || v.product?.hasVariantsThatRequiresComponents) continue;
+      seen.add(v.id);
+      results.push({
+        variantId: v.id,
+        productTitle: v.product?.title ?? "",
+        variantTitle: v.title === "Default Title" ? "" : v.title,
+        vendor: v.product?.vendor ?? "",
+        productType: v.product?.productType ?? "",
+        sku: v.sku || "—",
+        onHand: v.inventoryItem?.inventoryLevel?.quantities?.[0]?.quantity ?? 0,
+        inventoryItemId: v.inventoryItem?.id ?? null,
+      });
+    }
+
+    return { ok: true, intent, results: results.slice(0, 10) };
   }
 
   if (intent === "pushAdjustments") {
@@ -351,6 +438,7 @@ export default function Stocktake() {
   const data = useLoaderData();
   const fetcher = useFetcher();
   const autoSaveFetcher = useFetcher();
+  const searchFetcher = useFetcher();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
 
@@ -370,10 +458,15 @@ export default function Stocktake() {
   const [stocktakeStatus, setStocktakeStatus] = useState("in_progress");
   const [lastAutoSaveMsg, setLastAutoSaveMsg] = useState(null);
 
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const searchDebounceRef = useRef(null);
+
   const countsSinceLastSave = useRef(0);
   const liveStateRef = useRef({});
 
   const isSubmitting = fetcher.state !== "idle";
+  const isSearching = searchFetcher.state !== "idle";
 
   useEffect(() => {
     liveStateRef.current = { rows, counts, locationId, vendorFilter, typeFilter, stocktakeId, locations };
@@ -427,6 +520,10 @@ export default function Stocktake() {
     }
   }
 
+  if (!isListView && searchFetcher.data?.intent === "searchProducts" && searchFetcher.data.results !== searchResults) {
+    setSearchResults(searchFetcher.data.results ?? []);
+  }
+
   function triggerAutoSave(currentStocktakeId, currentRows, currentCounts, currentLocationId, currentVendorFilter, currentTypeFilter, currentLocations) {
     const locationName = currentLocations.find(l => l.id === currentLocationId)?.name ?? "";
     const fd = new FormData();
@@ -476,6 +573,32 @@ export default function Stocktake() {
     setCounts({});
     setStocktakeId(null);
     countsSinceLastSave.current = 0;
+    setSearchQuery("");
+    setSearchResults([]);
+  }
+
+  function handleSearchChange(val) {
+    setSearchQuery(val);
+    setSearchResults([]);
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    if (!val.trim() || val.trim().length < 2) return;
+    searchDebounceRef.current = setTimeout(() => {
+      const fd = new FormData();
+      fd.append("intent", "searchProducts");
+      fd.append("query", val.trim());
+      fd.append("locationId", locationId);
+      searchFetcher.submit(fd, { method: "post" });
+    }, 400);
+  }
+
+  function handleAddSearchedItem(result) {
+    const alreadyOnList = rows.some(r => r.variantId === result.variantId);
+    if (!alreadyOnList) {
+      setRows(prev => [...prev, result].sort((a, b) => a.productTitle.localeCompare(b.productTitle)));
+    }
+    setLoaded(true);
+    setSearchQuery("");
+    setSearchResults([]);
   }
 
   function handleCount(variantId, val) {
@@ -653,6 +776,55 @@ export default function Stocktake() {
                       </Button>
                     </div>
                   </InlineStack>
+
+                  <div style={{ position: "relative", maxWidth: "400px" }}>
+                    <TextField
+                      label="Add a single SKU"
+                      value={searchQuery}
+                      onChange={handleSearchChange}
+                      autoComplete="off"
+                      placeholder="Search by product name or SKU..."
+                      suffix={isSearching ? <Spinner size="small" /> : undefined}
+                      clearButton
+                      onClearButtonClick={() => { setSearchQuery(""); setSearchResults([]); }}
+                    />
+                    {searchResults.length > 0 && (
+                      <div style={{
+                        position: "absolute", zIndex: 10, top: "100%", left: 0, right: 0,
+                        background: "#fff", border: "1px solid #e1e3e5", borderRadius: "4px",
+                        boxShadow: "0 2px 8px rgba(0,0,0,0.1)", maxHeight: "300px",
+                        overflowY: "auto", marginTop: "4px",
+                      }}>
+                        {searchResults.map((result) => {
+                          const alreadyOnList = rows.some(r => r.variantId === result.variantId);
+                          return (
+                            <div
+                              key={result.variantId}
+                              onClick={() => handleAddSearchedItem(result)}
+                              style={{
+                                padding: "10px 14px", cursor: "pointer",
+                                borderBottom: "1px solid #f1f2f3",
+                                background: alreadyOnList ? "#fff4e5" : "#fff",
+                              }}
+                              onMouseEnter={(e) => e.currentTarget.style.background = alreadyOnList ? "#ffe8cc" : "#f6f6f7"}
+                              onMouseLeave={(e) => e.currentTarget.style.background = alreadyOnList ? "#fff4e5" : "#fff"}
+                            >
+                              <InlineStack align="space-between">
+                                <Text fontWeight="semibold">
+                                  {result.productTitle}{result.variantTitle ? ` — ${result.variantTitle}` : ""}
+                                </Text>
+                                {alreadyOnList && <Badge tone="warning">Already added</Badge>}
+                              </InlineStack>
+                              <Text tone="subdued" variant="bodySm">
+                                SKU: {result.sku} · {result.vendor} · On hand: {result.onHand}
+                              </Text>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
                   {loaded && (
                     <InlineStack gap="400" align="space-between" blockAlign="center">
                       <InlineStack gap="200" blockAlign="center">

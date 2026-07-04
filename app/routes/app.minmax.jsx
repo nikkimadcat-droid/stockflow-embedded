@@ -1,4 +1,4 @@
-import { useLoaderData, useFetcher } from "react-router";
+﻿import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import {
@@ -71,51 +71,107 @@ export const action = async ({ request }) => {
     const locationId = formData.get("locationId");
     const vendorFilter = formData.get("vendorFilter");
     const typeFilter = formData.get("typeFilter");
-    const skuFilter = formData.get("skuFilter");
+    const searchFilter = formData.get("searchFilter");
 
-    // Escape single quotes so vendors like "Stella & Chewy's" don't break the query
     const escapedVendor = vendorFilter ? vendorFilter.replace(/'/g, "\\'") : "";
     const escapedType = typeFilter ? typeFilter.replace(/'/g, "\\'") : "";
-    const escapedSku = skuFilter ? skuFilter.trim().replace(/['"]/g, "") : "";
+    const escapedSearch = searchFilter ? searchFilter.trim().replace(/['"]/g, "") : "";
 
-    const products = [];
-    let cursor = null;
-    let hasMore = true;
-    while (hasMore) {
-      const query = escapedSku
-        ? `sku:*${escapedSku}*`
-        : escapedVendor
-        ? `vendor:'${escapedVendor}'`
-        : escapedType
-        ? `product_type:'${escapedType}'`
-        : "";
+    let products = [];
 
-      const prodRes = await admin.graphql(`
-        query($cursor: String, $query: String!) {
-          products(first: 250, after: $cursor, query: $query) {
-            pageInfo { hasNextPage endCursor }
-            edges {
-              node {
-                id
-                title
-                vendor
-                productType
-                variants(first: 100) {
+    if (escapedSearch) {
+      // Search by product title OR SKU, same pattern as the PO page's item search.
+      // Run both queries and merge, since a name search won't find SKU-only matches
+      // and vice versa.
+      const [titleProducts, skuProducts] = await Promise.all([
+        (async () => {
+          const out = [];
+          let cursor = null, hasMore = true;
+          while (hasMore) {
+            const res = await admin.graphql(`
+              query($cursor: String, $query: String!) {
+                products(first: 250, after: $cursor, query: $query) {
+                  pageInfo { hasNextPage endCursor }
                   edges {
-                    node { id sku }
+                    node {
+                      id title vendor productType
+                      variants(first: 100) { edges { node { id sku } } }
+                    }
                   }
+                }
+              }
+            `, { variables: { cursor, query: `title:*${escapedSearch}*` } });
+            const json = await res.json();
+            const page = json.data.products;
+            out.push(...page.edges.map(e => e.node));
+            hasMore = page.pageInfo.hasNextPage;
+            cursor = page.pageInfo.endCursor;
+          }
+          return out;
+        })(),
+        (async () => {
+          const out = [];
+          let cursor = null, hasMore = true;
+          while (hasMore) {
+            const res = await admin.graphql(`
+              query($cursor: String, $query: String!) {
+                products(first: 250, after: $cursor, query: $query) {
+                  pageInfo { hasNextPage endCursor }
+                  edges {
+                    node {
+                      id title vendor productType
+                      variants(first: 100) { edges { node { id sku } } }
+                    }
+                  }
+                }
+              }
+            `, { variables: { cursor, query: `sku:*${escapedSearch}*` } });
+            const json = await res.json();
+            const page = json.data.products;
+            out.push(...page.edges.map(e => e.node));
+            hasMore = page.pageInfo.hasNextPage;
+            cursor = page.pageInfo.endCursor;
+          }
+          return out;
+        })(),
+      ]);
+
+      const seen = new Set();
+      products = [...titleProducts, ...skuProducts].filter(p => {
+        if (seen.has(p.id)) return false;
+        seen.add(p.id);
+        return true;
+      });
+    } else {
+      let cursor = null;
+      let hasMore = true;
+      while (hasMore) {
+        const query = escapedVendor
+          ? `vendor:'${escapedVendor}'`
+          : escapedType
+          ? `product_type:'${escapedType}'`
+          : "";
+
+        const prodRes = await admin.graphql(`
+          query($cursor: String, $query: String!) {
+            products(first: 250, after: $cursor, query: $query) {
+              pageInfo { hasNextPage endCursor }
+              edges {
+                node {
+                  id title vendor productType
+                  variants(first: 100) { edges { node { id sku } } }
                 }
               }
             }
           }
-        }
-      `, { variables: { cursor, query } });
+        `, { variables: { cursor, query } });
 
-      const prodJson = await prodRes.json();
-      const page = prodJson.data.products;
-      products.push(...page.edges.map(e => e.node));
-      hasMore = page.pageInfo.hasNextPage;
-      cursor = page.pageInfo.endCursor;
+        const prodJson = await prodRes.json();
+        const page = prodJson.data.products;
+        products.push(...page.edges.map(e => e.node));
+        hasMore = page.pageInfo.hasNextPage;
+        cursor = page.pageInfo.endCursor;
+      }
     }
 
     const filtered = products.filter(p =>
@@ -123,25 +179,8 @@ export const action = async ({ request }) => {
       (!typeFilter || p.productType === typeFilter)
     );
 
-    // When searching by SKU, only keep the variants that actually match —
-    // a product-level SKU query can return the whole product even though
-    // only one variant's SKU matches the search term.
-    const skuLower = escapedSku.toLowerCase();
-    const productsForRows = escapedSku
-      ? filtered
-          .map(p => ({
-            ...p,
-            variants: {
-              edges: p.variants.edges.filter(({ node: v }) =>
-                (v.sku || "").toLowerCase().includes(skuLower)
-              ),
-            },
-          }))
-          .filter(p => p.variants.edges.length > 0)
-      : filtered;
-
     const variantIds = new Set();
-    for (const p of productsForRows) {
+    for (const p of filtered) {
       for (const { node: v } of p.variants.edges) {
         variantIds.add(v.id);
       }
@@ -188,7 +227,7 @@ export const action = async ({ request }) => {
       minMaxMap[mm.variantId] = mm;
     }
 
-    const rows = productsForRows
+    const rows = filtered
       .flatMap(p =>
         p.variants.edges.map(({ node: v }) => ({
           variantId: v.id,
@@ -279,7 +318,7 @@ export default function MinMax() {
   const [selectedLocation, setSelectedLocation] = useState(locations[0]?.id || "");
   const [vendorFilter, setVendorFilter] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
-  const [skuFilter, setSkuFilter] = useState("");
+  const [searchFilter, setSearchFilter] = useState("");
   const [rows, setRows] = useState([]);
   const [edits, setEdits] = useState({});
   const [loaded, setLoaded] = useState(false);
@@ -333,7 +372,7 @@ export default function MinMax() {
     fd.append("locationId", selectedLocation);
     fd.append("vendorFilter", vendorFilter);
     fd.append("typeFilter", typeFilter);
-    fd.append("skuFilter", skuFilter);
+    fd.append("searchFilter", searchFilter);
     fetcher.submit(fd, { method: "POST" });
   }
 
@@ -423,21 +462,21 @@ export default function MinMax() {
                     }}
                   />
                 </div>
-                <div style={{ minWidth: "220px" }}>
+                <div style={{ minWidth: "240px" }}>
                   <TextField
-                    label="Search by SKU"
-                    value={skuFilter}
+                    label="Search by product name or SKU"
+                    value={searchFilter}
                     onChange={val => {
-                      setSkuFilter(val);
+                      setSearchFilter(val);
                       if (val) {
                         setVendorFilter("");
                         setTypeFilter("");
                       }
                     }}
                     autoComplete="off"
-                    placeholder="e.g. YCB-LOAFER-BED"
+                    placeholder="e.g. Loafer Bed"
                     clearButton
-                    onClearButtonClick={() => setSkuFilter("")}
+                    onClearButtonClick={() => setSearchFilter("")}
                   />
                 </div>
                 <div style={{ minWidth: "200px" }}>
@@ -445,12 +484,12 @@ export default function MinMax() {
                     label="Vendor"
                     options={vendorOptions}
                     value={vendorFilter}
-                    disabled={!!skuFilter}
+                    disabled={!!searchFilter}
                     onChange={val => {
                       setVendorFilter(val);
                       if (val) {
                         setTypeFilter("");
-                        setSkuFilter("");
+                        setSearchFilter("");
                       }
                     }}
                   />
@@ -460,12 +499,12 @@ export default function MinMax() {
                     label="Product Type"
                     options={typeOptions}
                     value={typeFilter}
-                    disabled={!!skuFilter}
+                    disabled={!!searchFilter}
                     onChange={val => {
                       setTypeFilter(val);
                       if (val) {
                         setVendorFilter("");
-                        setSkuFilter("");
+                        setSearchFilter("");
                       }
                     }}
                   />

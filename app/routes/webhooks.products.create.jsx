@@ -1,0 +1,54 @@
+﻿import { authenticate } from "../shopify.server";
+import db from "../db.server";
+
+export const action = async ({ request }) => {
+  const { shop, topic, payload } = await authenticate.webhook(request);
+
+  console.log(`Received ${topic} webhook for ${shop}`);
+
+  try {
+    const vendorName = payload.vendor || "";
+    const variants = payload.variants || [];
+
+    if (!vendorName || variants.length === 0) {
+      return new Response();
+    }
+
+    const vendorSupplier = await db.vendorSupplier.findFirst({
+      where: { shop, vendorName, isPrimary: true },
+    });
+
+    if (!vendorSupplier) {
+      console.log(`No primary supplier mapped for vendor "${vendorName}" — skipping auto-link for product ${payload.id}`);
+      return new Response();
+    }
+
+    for (const variant of variants) {
+      const variantId = `gid://shopify/ProductVariant/${variant.id}`;
+      await db.supplierSku.upsert({
+        where: {
+          supplierId_variantId_vendorName: {
+            supplierId: vendorSupplier.supplierId,
+            variantId,
+            vendorName,
+          },
+        },
+        update: {},
+        create: {
+          shop,
+          supplierId: vendorSupplier.supplierId,
+          variantId,
+          supplierCode: "",
+          vendorName,
+          cost: 0,
+        },
+      });
+    }
+
+    console.log(`Auto-linked ${variants.length} variant(s) from product ${payload.id} to supplier ${vendorSupplier.supplierId}`);
+  } catch (err) {
+    console.error("PRODUCTS/CREATE WEBHOOK FAILED:", err);
+  }
+
+  return new Response();
+};

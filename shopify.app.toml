@@ -21,6 +21,14 @@ api_version = "2026-04"
   uri = "/webhooks/app/scopes_update"
   topics = [ "app/scopes_update" ]
 
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/products/create"
+  topics = [ "products/create" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/products/update"
+  topics = [ "products/update" ]
+
 [auth]
 redirect_urls = [
   "https://stockflow-embedded-production.up.railway.app/auth/callback"

@@ -816,7 +816,7 @@ export default function Stocktake() {
 
               <div style={{ marginTop: "1rem" }}>
                 <Card>
-                  <div style={{ position: "relative" }}>
+                  <div>
                     <TextField
                       label="Add a single SKU"
                       value={searchQuery}
@@ -829,10 +829,9 @@ export default function Stocktake() {
                     />
                     {searchResults.length > 0 && (
                       <div style={{
-                        position: "absolute", zIndex: 100, top: "100%", left: 0, right: 0,
+                        marginTop: "8px",
                         background: "#fff", border: "1px solid #e1e3e5", borderRadius: "4px",
-                        boxShadow: "0 4px 12px rgba(0,0,0,0.15)", maxHeight: "300px",
-                        overflowY: "auto", marginTop: "4px",
+                        maxHeight: "300px", overflowY: "auto",
                       }}>
                         {searchResults.map((result) => {
                           const alreadyOnList = rows.some(r => r.variantId === result.variantId);

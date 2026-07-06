@@ -1,4 +1,7 @@
-﻿// v4 - added try/catch around receive action so real errors surface instead of vanishing silently
+﻿// v5 - "Received" can no longer be set from the status dropdown or via a raw
+// updateStatus call; it can only be set by the Receive button, which also
+// runs the Shopify inventory delta adjustment. This closes the gap where a
+// PO could be marked received without ever updating on-hand stock.
 import { useState, useRef, useEffect } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
@@ -541,6 +544,13 @@ export const action = async ({ request }) => {
   if (intent === "updateStatus") {
     const id = form.get("id");
     const status = form.get("status");
+    // "received" must only be set through the receive intent above, since
+    // that's the path that actually adjusts Shopify inventory. Block it here
+    // so a stray request (or a future UI change) can't silently skip the
+    // inventory update.
+    if (status === "received") {
+      return { ok: false, intent: "updateStatus", error: "Use the Receive button to mark a PO received — it updates Shopify inventory at the same time." };
+    }
     await db.purchaseOrder.update({ where: { id }, data: { status, updatedAt: new Date() } });
     return { ok: true };
   }
@@ -615,16 +625,12 @@ export default function PurchaseOrders() {
   const [skuCost, setSkuCost] = useState({});
   const [stockAdjust, setStockAdjust] = useState({});
   const [showReceived, setShowReceived] = useState(false);
+  const [statusError, setStatusError] = useState(null);
 
   const debounceTimers = useRef({});
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
 
-  // All fetcher-response handling lives here, in an effect, instead of running
-  // directly in the render body. Running setState during render (as this used
-  // to) can spiral into an infinite render loop ("Minified React error #301")
-  // once multiple fetcher-driven actions (load on-hand, receive, search, add
-  // item, adjust stock) interleave on the same shared fetcher instance.
   useEffect(() => {
     if (fetcher.state !== "idle" || !fetcherData) return;
 
@@ -640,6 +646,11 @@ export default function PurchaseOrders() {
       } else if (!fetcherData.ok && fetcherData.error) {
         setReceiveError(fetcherData.error);
       }
+    }
+
+    if (fetcherData.intent === "updateStatus" && !fetcherData.ok && fetcherData.error) {
+      setStatusError(fetcherData.error);
+      setTimeout(() => setStatusError(null), 5000);
     }
 
     if (fetcherData.intent === "searchProducts" && fetcherData.poId) {
@@ -858,14 +869,17 @@ export default function PurchaseOrders() {
     { label: "Reorder from 30-day sales velocity", value: "sales" },
     { label: "Manual — I'll enter quantities", value: "manual" },
   ];
-  const statusOptions = [
+
+  // "Received" is deliberately excluded from the manually-selectable status
+  // options. It can only be reached via the Receive button (which also runs
+  // the Shopify inventory delta adjustment), never by picking it from this
+  // dropdown — see the server-side guard in the updateStatus action too.
+  const manualStatusOptions = [
     { label: "Draft", value: "draft" },
     { label: "Ordered", value: "ordered" },
-    { label: "Received", value: "received" },
     { label: "Cancelled", value: "cancelled" },
   ];
 
-  // Split POs into active and completed
   const activePOs = purchaseOrders.filter((po) => po.status !== "received" && po.status !== "cancelled");
   const completedPOs = purchaseOrders.filter((po) => po.status === "received" || po.status === "cancelled");
 
@@ -1034,7 +1048,11 @@ export default function PurchaseOrders() {
                 </Text>
               </BlockStack>
               <InlineStack gap="200">
-                <Select label="" labelHidden options={statusOptions} value={po.status} onChange={(val) => handleStatusChange(po.id, val)} />
+                {po.status === "received" ? (
+                  statusBadge(po.status)
+                ) : (
+                  <Select label="" labelHidden options={manualStatusOptions} value={po.status} onChange={(val) => handleStatusChange(po.id, val)} />
+                )}
                 {canReceive && <Button variant="primary" onClick={() => handleOpenReceive(po)}>✓ Receive</Button>}
                 {po.mode !== "manual" && <Button variant="plain" onClick={() => handleRegenerate(po.id)}>↺ Regenerate</Button>}
                 <Button variant="plain" onClick={() => downloadCSV({ ...po, items: activeItems }, hasOnHand ? poOnHand : null)}>↓ CSV</Button>
@@ -1159,6 +1177,12 @@ export default function PurchaseOrders() {
     >
       <Layout>
         <Layout.Section>
+
+          {statusError && (
+            <div style={{ marginBottom: "1rem" }}>
+              <Banner tone="critical" onDismiss={() => setStatusError(null)}>{statusError}</Banner>
+            </div>
+          )}
 
           <Modal
             open={showCreate}

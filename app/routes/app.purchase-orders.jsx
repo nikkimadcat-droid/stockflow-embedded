@@ -934,7 +934,7 @@ export default function PurchaseOrders() {
             )}
           </td>
         )}
-        <td style={{ padding: "8px 12px", width: "100px" }}>
+        <td style={{ padding: "8px 12px", width: "140px" }}>
           <TextField label="" labelHidden type="number" value={qty} onChange={(val) => handleItemEdit(po.id, item.id, "qtyOrdered", val)} autoComplete="off" />
         </td>
         <td style={{ padding: "8px 12px", width: "70px", textAlign: "center" }}>

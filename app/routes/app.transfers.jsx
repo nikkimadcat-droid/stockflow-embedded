@@ -50,13 +50,63 @@ function downloadPickListCSV(transfer, locationName, items) {
   URL.revokeObjectURL(url);
 }
 
+// --- Retry wrapper: Shopify GraphQL throttling shows up as a thrown GraphqlQueryError.
+// Backs off and retries a few times before giving up, instead of 500-ing the whole request.
+async function graphqlWithRetry(admin, query, opts, retries = 4) {
+  let lastErr;
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await admin.graphql(query, opts);
+    } catch (e) {
+      lastErr = e;
+      const isThrottled = e?.message?.includes("Throttled") || e?.response?.status === 429;
+      if (!isThrottled || i === retries - 1) throw e;
+      const delay = 400 * Math.pow(2, i); // 400, 800, 1600, 3200 ms
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
+// --- Cheap, fixed-cost inventory lookup for a known set of variant IDs.
+// Uses the `nodes` query on the variants themselves instead of paginating an
+// entire location's inventoryLevels — avoids throttling on large catalogs.
+async function fetchInventoryForVariantIds(admin, locationId, variantIds) {
+  if (!locationId || variantIds.length === 0) return {};
+  const inv = {};
+  const chunkSize = 100; // keep well under Shopify's node-array + query-cost limits
+  for (let i = 0; i < variantIds.length; i += chunkSize) {
+    const chunk = variantIds.slice(i, i + chunkSize);
+    const res = await graphqlWithRetry(admin, `
+      query($ids: [ID!]!, $locationId: ID!) {
+        nodes(ids: $ids) {
+          ... on ProductVariant {
+            id
+            inventoryItem {
+              inventoryLevel(locationId: $locationId) {
+                quantities(names: ["available"]) { quantity }
+              }
+            }
+          }
+        }
+      }
+    `, { variables: { ids: chunk, locationId } });
+    const json = await res.json();
+    for (const node of json.data?.nodes ?? []) {
+      if (!node?.id) continue;
+      inv[node.id] = node.inventoryItem?.inventoryLevel?.quantities?.[0]?.quantity ?? 0;
+    }
+  }
+  return inv;
+}
+
 async function buildDistributionItems(admin, db, shop, fromLocationId, toLocationId, vendorNames) {
   const products = [];
   for (const vendor of vendorNames) {
     let cursor = null;
     let hasMore = true;
     while (hasMore) {
-      const res = await admin.graphql(`
+      const res = await graphqlWithRetry(admin, `
         query($cursor: String, $query: String!) {
           products(first: 250, after: $cursor, query: $query) {
             pageInfo { hasNextPage endCursor }
@@ -85,82 +135,33 @@ async function buildDistributionItems(admin, db, shop, fromLocationId, toLocatio
       variantMap[v.id] = { variantId: v.id, productTitle: p.title, vendor: p.vendor, sku: v.sku || "—" };
     }
   }
-  const variantIds = new Set(Object.keys(variantMap));
+  const variantIds = Object.keys(variantMap);
 
   const destMinMax = {};
   const minmaxRows = await db.minMax.findMany({
-    where: { shop, locationId: toLocationId, variantId: { in: [...variantIds] } },
+    where: { shop, locationId: toLocationId, variantId: { in: variantIds } },
   });
   for (const mm of minmaxRows) destMinMax[mm.variantId] = mm;
 
   const srcMinMax = {};
   const srcMinmaxRows = await db.minMax.findMany({
-    where: { shop, locationId: fromLocationId, variantId: { in: [...variantIds] } },
+    where: { shop, locationId: fromLocationId, variantId: { in: variantIds } },
   });
   for (const mm of srcMinmaxRows) srcMinMax[mm.variantId] = mm;
 
-  const destInv = {};
-  let cursor = null;
-  let hasMore = true;
-  while (hasMore) {
-    const res = await admin.graphql(`
-      query($locationId: ID!, $cursor: String) {
-        location(id: $locationId) {
-          inventoryLevels(first: 250, after: $cursor) {
-            pageInfo { hasNextPage endCursor }
-            edges {
-              node {
-                quantities(names: ["available"]) { quantity }
-                item { variant { id } }
-              }
-            }
-          }
-        }
-      }
-    `, { variables: { locationId: toLocationId, cursor } });
-    const json = await res.json();
-    const levels = json.data?.location?.inventoryLevels;
-    hasMore = levels?.pageInfo?.hasNextPage ?? false;
-    cursor = levels?.pageInfo?.endCursor ?? null;
-    for (const e of levels?.edges ?? []) {
-      const vid = e.node.item?.variant?.id;
-      if (vid && variantIds.has(vid)) destInv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
-    }
-  }
+  // Only fetch inventory for variants that actually have a dest min/max set —
+  // this is usually a much smaller set than the full vendor catalog.
+  const relevantVariantIds = variantIds.filter(vid => destMinMax[vid]);
 
-  const srcInv = {};
-  let srcCursor = null;
-  let srcHasMore = true;
-  while (srcHasMore) {
-    const res = await admin.graphql(`
-      query($locationId: ID!, $cursor: String) {
-        location(id: $locationId) {
-          inventoryLevels(first: 250, after: $cursor) {
-            pageInfo { hasNextPage endCursor }
-            edges {
-              node {
-                quantities(names: ["available"]) { quantity }
-                item { variant { id } }
-              }
-            }
-          }
-        }
-      }
-    `, { variables: { locationId: fromLocationId, cursor: srcCursor } });
-    const json = await res.json();
-    const levels = json.data?.location?.inventoryLevels;
-    srcHasMore = levels?.pageInfo?.hasNextPage ?? false;
-    srcCursor = levels?.pageInfo?.endCursor ?? null;
-    for (const e of levels?.edges ?? []) {
-      const vid = e.node.item?.variant?.id;
-      if (vid && variantIds.has(vid)) srcInv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
-    }
-  }
+  const [destInv, srcInv] = await Promise.all([
+    fetchInventoryForVariantIds(admin, toLocationId, relevantVariantIds),
+    fetchInventoryForVariantIds(admin, fromLocationId, relevantVariantIds),
+  ]);
 
   const items = [];
-  for (const [vid, info] of Object.entries(variantMap)) {
+  for (const vid of relevantVariantIds) {
+    const info = variantMap[vid];
     const mm = destMinMax[vid];
-    if (!mm) continue;
     const destOnHand = destInv[vid] ?? 0;
     if (destOnHand >= mm.minLevel) continue;
     const destNeed = mm.maxLevel - destOnHand;
@@ -198,7 +199,7 @@ async function resolveSkusToVariants(admin, skus) {
   for (let i = 0; i < skus.length; i += chunkSize) {
     const chunk = skus.slice(i, i + chunkSize);
     const query = chunk.map(s => `sku:'${s.replace(/'/g, "\\'")}'`).join(" OR ");
-    const res = await admin.graphql(`
+    const res = await graphqlWithRetry(admin, `
       query($query: String!) {
         productVariants(first: 250, query: $query) {
           edges {
@@ -224,45 +225,11 @@ async function resolveSkusToVariants(admin, skus) {
   return variantMap;
 }
 
-async function fetchInventoryForVariants(admin, locationId, variantIds) {
-  const idSet = new Set(variantIds);
-  const inv = {};
-  let cursor = null;
-  let hasMore = true;
-  while (hasMore) {
-    const res = await admin.graphql(`
-      query($locationId: ID!, $cursor: String) {
-        location(id: $locationId) {
-          inventoryLevels(first: 250, after: $cursor) {
-            pageInfo { hasNextPage endCursor }
-            edges {
-              node {
-                quantities(names: ["available"]) { quantity }
-                item { variant { id } }
-              }
-            }
-          }
-        }
-      }
-    `, { variables: { locationId, cursor } });
-    const json = await res.json();
-    const levels = json.data?.location?.inventoryLevels;
-    hasMore = levels?.pageInfo?.hasNextPage ?? false;
-    cursor = levels?.pageInfo?.endCursor ?? null;
-    for (const e of levels?.edges ?? []) {
-      const vid = e.node?.item?.variant?.id;
-      if (vid && idSet.has(vid)) inv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
-    }
-    if (Object.keys(inv).length === idSet.size) break;
-  }
-  return inv;
-}
-
 export const loader = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
 
-  const locRes = await admin.graphql(`
+  const locRes = await graphqlWithRetry(admin, `
     query { locations(first: 10) { edges { node { id name } } } }
   `);
   const locJson = await locRes.json();
@@ -272,7 +239,7 @@ export const loader = async ({ request }) => {
   let cursor = null;
   let hasMore = true;
   while (hasMore) {
-    const res = await admin.graphql(`
+    const res = await graphqlWithRetry(admin, `
       query($cursor: String) {
         products(first: 250, after: $cursor) {
           pageInfo { hasNextPage endCursor }
@@ -426,8 +393,8 @@ export const action = async ({ request }) => {
     const variantIds = [...new Set(transfer.items.map(i => i.variantId))];
 
     const [srcInv, destInv] = await Promise.all([
-      fetchInventoryForVariants(admin, transfer.fromLocationId, variantIds),
-      fetchInventoryForVariants(admin, transfer.toLocationId, variantIds),
+      fetchInventoryForVariantIds(admin, transfer.fromLocationId, variantIds),
+      fetchInventoryForVariantIds(admin, transfer.toLocationId, variantIds),
     ]);
 
     const [srcMM, destMM] = await Promise.all([
@@ -476,8 +443,8 @@ export const action = async ({ request }) => {
 
     const variantIds = matched.map(m => m.variantId);
     const [srcInv, destInv] = await Promise.all([
-      fetchInventoryForVariants(admin, fromLocationId, variantIds),
-      fetchInventoryForVariants(admin, toLocationId, variantIds),
+      fetchInventoryForVariantIds(admin, fromLocationId, variantIds),
+      fetchInventoryForVariantIds(admin, toLocationId, variantIds),
     ]);
 
     const existing = await db.transferItem.findMany({ where: { transferId } });
@@ -515,7 +482,7 @@ export const action = async ({ request }) => {
     const toLocationId = form.get("toLocationId");
 
     const [titleRes, skuRes] = await Promise.all([
-      admin.graphql(`
+      graphqlWithRetry(admin, `
         query($query: String!) {
           products(first: 10, query: $query) {
             edges {
@@ -529,7 +496,7 @@ export const action = async ({ request }) => {
           }
         }
       `, { variables: { query: `title:*${query}*` } }),
-      admin.graphql(`
+      graphqlWithRetry(admin, `
         query($query: String!) {
           productVariants(first: 10, query: $query) {
             edges {
@@ -562,44 +529,12 @@ export const action = async ({ request }) => {
       variants.push({ id: v.id, sku: v.sku, productTitle: v.product?.title ?? "", variantTitle: v.title === "Default Title" ? "" : v.title, vendor: v.product?.vendor ?? "" });
     }
 
-    const variantIdSet = new Set(variants.map(v => v.id));
-
-    const fetchInvForVariants = async (locationId) => {
-      const inv = {};
-      let cursor = null;
-      let hasMore = true;
-      while (hasMore) {
-        const invRes = await admin.graphql(`
-          query($locationId: ID!, $cursor: String) {
-            location(id: $locationId) {
-              inventoryLevels(first: 250, after: $cursor) {
-                pageInfo { hasNextPage endCursor }
-                edges {
-                  node {
-                    quantities(names: ["available"]) { quantity }
-                    item { variant { id } }
-                  }
-                }
-              }
-            }
-          }
-        `, { variables: { locationId, cursor } });
-        const invJson = await invRes.json();
-        const levels = invJson.data?.location?.inventoryLevels;
-        hasMore = levels?.pageInfo?.hasNextPage ?? false;
-        cursor = levels?.pageInfo?.endCursor ?? null;
-        for (const e of levels?.edges ?? []) {
-          const vid = e.node?.item?.variant?.id;
-          if (vid && variantIdSet.has(vid)) inv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
-        }
-        if (Object.keys(inv).length === variants.length) break;
-      }
-      return inv;
-    };
-
+    // Fixed-cost lookup for just the handful of matched variants — no more
+    // walking an entire location's inventory on every keystroke.
+    const idList = variants.map(v => v.id);
     const [srcOnHandMap, destOnHandMap] = await Promise.all([
-      fetchInvForVariants(fromLocationId),
-      toLocationId ? fetchInvForVariants(toLocationId) : Promise.resolve({}),
+      fetchInventoryForVariantIds(admin, fromLocationId, idList),
+      toLocationId ? fetchInventoryForVariantIds(admin, toLocationId, idList) : Promise.resolve({}),
     ]);
 
     const results = variants.slice(0, 10).map(v => ({
@@ -621,16 +556,28 @@ export const action = async ({ request }) => {
     const srcOnHand = Number(form.get("srcOnHand")) || 0;
     const destOnHand = Number(form.get("destOnHand")) || 0;
 
-    await db.transferItem.create({
-      data: {
-        transferId, variantId,
-        productTitle, variantTitle,
-        vendor, sku, qty,
-        srcOnHand, destOnHand,
-        srcMin: 0, destNeed: 0,
-        updatedAt: new Date(),
-      },
-    });
+    // If this variant is already on the transfer, combine quantities instead
+    // of creating a duplicate row (mirrors the CSV upload behavior).
+    const existing = await db.transferItem.findFirst({ where: { transferId, variantId } });
+
+    if (existing) {
+      await db.transferItem.update({
+        where: { id: existing.id },
+        data: { qty: existing.qty + qty, srcOnHand, destOnHand, updatedAt: new Date() },
+      });
+    } else {
+      await db.transferItem.create({
+        data: {
+          transferId, variantId,
+          productTitle, variantTitle,
+          vendor, sku, qty,
+          srcOnHand, destOnHand,
+          srcMin: 0, destNeed: 0,
+          updatedAt: new Date(),
+        },
+      });
+    }
+
     return { ok: true, intent: "addItem", transferId };
   }
 
@@ -664,14 +611,14 @@ export const action = async ({ request }) => {
 
     const errors = [];
     for (const item of transfer.items) {
-      const res = await admin.graphql(`
+      const res = await graphqlWithRetry(admin, `
         query($id: ID!) { productVariant(id: $id) { inventoryItem { id } } }
       `, { variables: { id: item.variantId } });
       const json = await res.json();
       const inventoryItemId = json.data?.productVariant?.inventoryItem?.id;
       if (!inventoryItemId) continue;
 
-      const adjRes = await admin.graphql(`
+      const adjRes = await graphqlWithRetry(admin, `
         mutation($input: InventoryAdjustQuantitiesInput!) {
           inventoryAdjustQuantities(input: $input) {
             inventoryAdjustmentGroup { id }

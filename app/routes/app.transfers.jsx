@@ -191,6 +191,73 @@ async function buildDistributionItems(admin, db, shop, fromLocationId, toLocatio
   return items;
 }
 
+// --- CSV upload helper: resolve a list of SKUs to Shopify variants ---
+async function resolveSkusToVariants(admin, skus) {
+  const variantMap = {};
+  const chunkSize = 40; // keep the query string comfortably under Shopify's search limits
+  for (let i = 0; i < skus.length; i += chunkSize) {
+    const chunk = skus.slice(i, i + chunkSize);
+    const query = chunk.map(s => `sku:'${s.replace(/'/g, "\\'")}'`).join(" OR ");
+    const res = await admin.graphql(`
+      query($query: String!) {
+        productVariants(first: 250, query: $query) {
+          edges {
+            node {
+              id sku title
+              product { title vendor }
+            }
+          }
+        }
+      }
+    `, { variables: { query } });
+    const json = await res.json();
+    for (const { node: v } of json.data?.productVariants?.edges ?? []) {
+      if (!v.sku) continue;
+      variantMap[v.sku.trim().toLowerCase()] = {
+        variantId: v.id,
+        productTitle: v.product?.title ?? "",
+        variantTitle: v.title === "Default Title" ? "" : v.title,
+        vendor: v.product?.vendor ?? "",
+      };
+    }
+  }
+  return variantMap;
+}
+
+async function fetchInventoryForVariants(admin, locationId, variantIds) {
+  const idSet = new Set(variantIds);
+  const inv = {};
+  let cursor = null;
+  let hasMore = true;
+  while (hasMore) {
+    const res = await admin.graphql(`
+      query($locationId: ID!, $cursor: String) {
+        location(id: $locationId) {
+          inventoryLevels(first: 250, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                quantities(names: ["available"]) { quantity }
+                item { variant { id } }
+              }
+            }
+          }
+        }
+      }
+    `, { variables: { locationId, cursor } });
+    const json = await res.json();
+    const levels = json.data?.location?.inventoryLevels;
+    hasMore = levels?.pageInfo?.hasNextPage ?? false;
+    cursor = levels?.pageInfo?.endCursor ?? null;
+    for (const e of levels?.edges ?? []) {
+      const vid = e.node?.item?.variant?.id;
+      if (vid && idSet.has(vid)) inv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
+    }
+    if (Object.keys(inv).length === idSet.size) break;
+  }
+  return inv;
+}
+
 export const loader = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
@@ -357,44 +424,10 @@ export const action = async ({ request }) => {
     if (!transfer) return { ok: false };
 
     const variantIds = [...new Set(transfer.items.map(i => i.variantId))];
-    const variantIdSet = new Set(variantIds);
-
-    const fetchInv = async (locationId) => {
-      const inv = {};
-      let cursor = null;
-      let hasMore = true;
-      while (hasMore) {
-        const res = await admin.graphql(`
-          query($locationId: ID!, $cursor: String) {
-            location(id: $locationId) {
-              inventoryLevels(first: 250, after: $cursor) {
-                pageInfo { hasNextPage endCursor }
-                edges {
-                  node {
-                    quantities(names: ["available"]) { quantity }
-                    item { variant { id } }
-                  }
-                }
-              }
-            }
-          }
-        `, { variables: { locationId, cursor } });
-        const json = await res.json();
-        const levels = json.data?.location?.inventoryLevels;
-        hasMore = levels?.pageInfo?.hasNextPage ?? false;
-        cursor = levels?.pageInfo?.endCursor ?? null;
-        for (const e of levels?.edges ?? []) {
-          const vid = e.node.item?.variant?.id;
-          if (vid && variantIdSet.has(vid)) inv[vid] = e.node.quantities?.[0]?.quantity ?? 0;
-        }
-        if (Object.keys(inv).length === variantIds.length) break;
-      }
-      return inv;
-    };
 
     const [srcInv, destInv] = await Promise.all([
-      fetchInv(transfer.fromLocationId),
-      fetchInv(transfer.toLocationId),
+      fetchInventoryForVariants(admin, transfer.fromLocationId, variantIds),
+      fetchInventoryForVariants(admin, transfer.toLocationId, variantIds),
     ]);
 
     const [srcMM, destMM] = await Promise.all([
@@ -417,6 +450,62 @@ export const action = async ({ request }) => {
     }
 
     return { ok: true, intent: "loadOnHand", transferId: id };
+  }
+
+  if (intent === "uploadCsvItems") {
+    const transferId = form.get("transferId");
+    const fromLocationId = form.get("fromLocationId");
+    const toLocationId = form.get("toLocationId");
+    const rows = JSON.parse(form.get("items") || "[]"); // [{ sku, qty }]
+
+    const skus = [...new Set(rows.map(r => (r.sku || "").trim()).filter(Boolean))];
+    const variantMap = await resolveSkusToVariants(admin, skus);
+
+    const notFound = [];
+    const matched = [];
+    for (const row of rows) {
+      const key = (row.sku || "").trim().toLowerCase();
+      const v = variantMap[key];
+      if (!v) { notFound.push(row.sku); continue; }
+      matched.push({ ...v, sku: row.sku, qty: Number(row.qty) || 0 });
+    }
+
+    if (matched.length === 0) {
+      return { ok: true, intent: "uploadCsvItems", transferId, added: 0, notFound };
+    }
+
+    const variantIds = matched.map(m => m.variantId);
+    const [srcInv, destInv] = await Promise.all([
+      fetchInventoryForVariants(admin, fromLocationId, variantIds),
+      fetchInventoryForVariants(admin, toLocationId, variantIds),
+    ]);
+
+    const existing = await db.transferItem.findMany({ where: { transferId } });
+    const existingByVariant = Object.fromEntries(existing.map(i => [i.variantId, i]));
+
+    for (const m of matched) {
+      const srcOnHand = srcInv[m.variantId] ?? 0;
+      const destOnHand = destInv[m.variantId] ?? 0;
+      const ex = existingByVariant[m.variantId];
+      if (ex) {
+        await db.transferItem.update({
+          where: { id: ex.id },
+          data: { qty: ex.qty + m.qty, srcOnHand, destOnHand, updatedAt: new Date() },
+        });
+      } else {
+        await db.transferItem.create({
+          data: {
+            transferId, variantId: m.variantId,
+            productTitle: m.productTitle, variantTitle: m.variantTitle || "",
+            vendor: m.vendor, sku: m.sku, qty: m.qty,
+            srcOnHand, destOnHand, srcMin: 0, destNeed: 0,
+            updatedAt: new Date(),
+          },
+        });
+      }
+    }
+
+    return { ok: true, intent: "uploadCsvItems", transferId, added: matched.length, notFound };
   }
 
   if (intent === "searchProducts") {
@@ -641,6 +730,8 @@ export default function Transfers() {
   const [selectedResult, setSelectedResult] = useState({});
   const [itemQty, setItemQty] = useState({});
   const [loadedOnHand, setLoadedOnHand] = useState(new Set());
+  const [csvNotFound, setCsvNotFound] = useState({});
+  const [csvAdded, setCsvAdded] = useState({});
 
   const [newTemplateName, setNewTemplateName] = useState("");
   const [newTemplateFrom, setNewTemplateFrom] = useState(locations[0]?.id ?? "");
@@ -649,6 +740,7 @@ export default function Transfers() {
   const [editVendors, setEditVendors] = useState(new Set());
 
   const debounceTimers = useRef({});
+  const fileInputRefs = useRef({});
   const isSubmitting = fetcher.state !== "idle";
   const fetcherData = fetcher.data;
 
@@ -663,6 +755,17 @@ export default function Transfers() {
     const tid = fetcherData.transferId;
     if (!loadedOnHand.has(tid)) {
       setLoadedOnHand(prev => new Set([...prev, tid]));
+    }
+  }
+
+  if (fetcher.state === "idle" && fetcherData?.intent === "uploadCsvItems" && fetcherData?.transferId) {
+    const tid = fetcherData.transferId;
+    const nf = fetcherData.notFound ?? [];
+    const added = fetcherData.added ?? 0;
+    if (JSON.stringify(csvNotFound[tid]) !== JSON.stringify(nf) || csvAdded[tid] !== added) {
+      setCsvNotFound(prev => ({ ...prev, [tid]: nf }));
+      setCsvAdded(prev => ({ ...prev, [tid]: added }));
+      setLoadedOnHand(prev => { const s = new Set(prev); s.delete(tid); return s; });
     }
   }
 
@@ -853,6 +956,88 @@ export default function Transfers() {
     fetcher.submit(fd, { method: "post" });
   }
 
+  // --- CSV parsing (handles quoted fields with embedded commas, matches StockFlow PO export layout) ---
+  function parseCsv(text) {
+    const rows = [];
+    let row = [];
+    let field = "";
+    let inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; }
+          else inQuotes = false;
+        } else {
+          field += c;
+        }
+      } else {
+        if (c === '"') {
+          inQuotes = true;
+        } else if (c === ",") {
+          row.push(field);
+          field = "";
+        } else if (c === "\n" || c === "\r") {
+          if (c === "\r" && text[i + 1] === "\n") i++;
+          row.push(field);
+          field = "";
+          rows.push(row);
+          row = [];
+        } else {
+          field += c;
+        }
+      }
+    }
+    if (field.length > 0 || row.length > 0) {
+      row.push(field);
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  function handleCsvFile(transfer, file) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result);
+      const rows = parseCsv(text);
+      const headerIdx = rows.findIndex(r => (r[0] || "").trim() === "Vendor");
+      if (headerIdx === -1) {
+        alert("Couldn't find the item header row (expected a column starting with 'Vendor'). Is this a StockFlow PO export?");
+        return;
+      }
+      const header = rows[headerIdx].map(h => h.trim());
+      const skuCol = header.indexOf("SKU");
+      const qtyCol = header.indexOf("Qty (Eaches)");
+      if (skuCol === -1 || qtyCol === -1) {
+        alert("Couldn't find SKU / Qty (Eaches) columns in this CSV.");
+        return;
+      }
+      const items = [];
+      for (let i = headerIdx + 1; i < rows.length; i++) {
+        const r = rows[i];
+        if (!r || r.every(c => !c || !c.trim())) continue;
+        const sku = (r[skuCol] || "").trim();
+        if (!sku || sku.toUpperCase() === "TOTAL") continue;
+        const qty = Number(r[qtyCol]);
+        if (!qty || qty <= 0) continue;
+        items.push({ sku, qty });
+      }
+      if (items.length === 0) {
+        alert("No item rows found in this CSV.");
+        return;
+      }
+      const fd = new FormData();
+      fd.append("intent", "uploadCsvItems");
+      fd.append("transferId", transfer.id);
+      fd.append("fromLocationId", transfer.fromLocationId);
+      fd.append("toLocationId", transfer.toLocationId);
+      fd.append("items", JSON.stringify(items));
+      fetcher.submit(fd, { method: "post" });
+    };
+    reader.readAsText(file);
+  }
+
   function locationName(id) {
     return locations.find(l => l.id === id)?.name ?? id;
   }
@@ -868,6 +1053,7 @@ export default function Transfers() {
 
   const pushError = fetcher.data?.errors;
   const isLoadingOnHand = isSubmitting && fetcher.formData?.get("intent") === "loadOnHand";
+  const isUploadingCsv = isSubmitting && fetcher.formData?.get("intent") === "uploadCsvItems";
 
   return (
     <Page
@@ -939,7 +1125,7 @@ export default function Transfers() {
                 <Select label="From location" options={locationOptions} value={adHocFrom} onChange={setAdHocFrom} />
                 <Select label="To location" options={locationOptions} value={adHocTo} onChange={setAdHocTo} />
                 <Banner tone="info">
-                  A blank transfer will be created. Search for items to add once it's open.
+                  A blank transfer will be created. Search for items to add once it's open, or upload a distributor CSV.
                 </Banner>
                 <TextField
                   label="Notes (optional)"
@@ -1054,6 +1240,7 @@ export default function Transfers() {
 
             const hasOnHandData = transfer.items.some(i => i.srcOnHand > 0 || i.destOnHand > 0);
             const isThisLoadingOnHand = isLoadingOnHand && fetcher.formData?.get("id") === transfer.id;
+            const isThisUploadingCsv = isUploadingCsv && fetcher.formData?.get("transferId") === transfer.id;
 
             const byVendor = {};
             for (const item of activeItems) {
@@ -1071,6 +1258,9 @@ export default function Transfers() {
             const canPush = transfer.status === "draft" && activeItems.length > 0;
             const srcName = locationName(transfer.fromLocationId);
             const destName = locationName(transfer.toLocationId);
+
+            const notFound = csvNotFound[transfer.id] ?? [];
+            const lastAdded = csvAdded[transfer.id];
 
             return (
               <div key={transfer.id} style={{ marginBottom: "1rem" }}>
@@ -1098,6 +1288,24 @@ export default function Transfers() {
                         {transfer.templateId && (
                           <Button variant="plain" onClick={() => handleRegenerate(transfer.id)}>↺ Regenerate</Button>
                         )}
+                        <input
+                          type="file"
+                          accept=".csv"
+                          style={{ display: "none" }}
+                          ref={el => (fileInputRefs.current[transfer.id] = el)}
+                          onChange={e => {
+                            handleCsvFile(transfer, e.target.files?.[0]);
+                            e.target.value = "";
+                          }}
+                        />
+                        <Button
+                          variant="plain"
+                          onClick={() => fileInputRefs.current[transfer.id]?.click()}
+                          loading={isThisUploadingCsv}
+                          disabled={isThisUploadingCsv}
+                        >
+                          ↑ Upload CSV
+                        </Button>
                         <Button variant="plain" onClick={() => downloadPickListCSV(transfer, destName, activeItems)}>
                           ↓ Pick List CSV
                         </Button>
@@ -1112,6 +1320,29 @@ export default function Transfers() {
                         <Button variant="plain" tone="critical" onClick={() => handleDelete(transfer.id)}>Delete</Button>
                       </InlineStack>
                     </InlineStack>
+
+                    {isThisUploadingCsv && (
+                      <Banner tone="info">
+                        <InlineStack gap="200" blockAlign="center">
+                          <Spinner size="small" />
+                          <Text>Matching CSV rows to products…</Text>
+                        </InlineStack>
+                      </Banner>
+                    )}
+
+                    {!isThisUploadingCsv && lastAdded !== undefined && (
+                      <Banner tone={notFound.length > 0 ? "warning" : "success"} onDismiss={() => {
+                        setCsvAdded(prev => { const n = { ...prev }; delete n[transfer.id]; return n; });
+                        setCsvNotFound(prev => { const n = { ...prev }; delete n[transfer.id]; return n; });
+                      }}>
+                        <BlockStack gap="100">
+                          <Text>{lastAdded} item{lastAdded === 1 ? "" : "s"} added from CSV.</Text>
+                          {notFound.length > 0 && (
+                            <Text>SKUs not found in Shopify: {notFound.join(", ")}</Text>
+                          )}
+                        </BlockStack>
+                      </Banner>
+                    )}
 
                     {isExpanded && (
                       <>
@@ -1147,7 +1378,7 @@ export default function Transfers() {
                           ))}
 
                           {activeItems.length === 0 && !tSelected && (
-                            <Banner tone="info">No items yet — search below to add products.</Banner>
+                            <Banner tone="info">No items yet — search below to add products, or upload a distributor CSV.</Banner>
                           )}
 
                           {Object.entries(byVendor).sort(([a], [b]) => a.localeCompare(b)).map(([vendor, items]) => (

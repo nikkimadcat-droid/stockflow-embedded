@@ -600,6 +600,15 @@ export const action = async ({ request }) => {
   if (intent === "updateStatus") {
     const id = form.get("id");
     const status = form.get("status");
+    const transfer = await db.transfer.findUnique({ where: { id } });
+    if (!transfer) return { ok: false };
+
+    // Mirror the PO page rule: can't be marked received until it's actually
+    // been pushed to Shopify (i.e. no longer sitting in draft).
+    if (status === "received" && transfer.status === "draft") {
+      return { ok: false, errors: ["This transfer must be pushed to Shopify before it can be marked as received."] };
+    }
+
     await db.transfer.update({ where: { id }, data: { status, updatedAt: new Date() } });
     return { ok: true };
   }
@@ -608,6 +617,12 @@ export const action = async ({ request }) => {
     const id = form.get("id");
     const transfer = await db.transfer.findUnique({ where: { id }, include: { items: true } });
     if (!transfer) return { ok: false };
+
+    // Guard against double-push (duplicate submit, retried request, etc.) —
+    // a transfer can only move from draft once.
+    if (transfer.status !== "draft") {
+      return { ok: false, errors: ["This transfer has already been pushed to Shopify."] };
+    }
 
     const errors = [];
     for (const item of transfer.items) {
@@ -991,12 +1006,21 @@ export default function Transfers() {
 
   const locationOptions = locations.map(l => ({ label: l.name, value: l.id }));
   const templateOptions = templates.map(t => ({ label: t.name, value: t.id }));
-  const statusOptions = [
-    { label: "Draft", value: "draft" },
-    { label: "Sent", value: "sent" },
-    { label: "Received", value: "received" },
-    { label: "Cancelled", value: "cancelled" },
-  ];
+
+  function statusOptionsFor(currentStatus) {
+    const all = [
+      { label: "Draft", value: "draft" },
+      { label: "Sent", value: "sent" },
+      { label: "Received", value: "received" },
+      { label: "Cancelled", value: "cancelled" },
+    ];
+    // Mirrors the PO page: can't jump to "received" until it's been pushed
+    // to Shopify (status "sent" or later).
+    if (currentStatus === "draft") {
+      return all.filter(o => o.value !== "received");
+    }
+    return all;
+  }
 
   const pushError = fetcher.data?.errors;
   const isLoadingOnHand = isSubmitting && fetcher.formData?.get("intent") === "loadOnHand";
@@ -1231,7 +1255,7 @@ export default function Transfers() {
                         </Text>
                       </BlockStack>
                       <InlineStack gap="200" wrap>
-                        <Select label="" labelHidden options={statusOptions} value={transfer.status} onChange={val => handleStatusChange(transfer.id, val)} />
+                        <Select label="" labelHidden options={statusOptionsFor(transfer.status)} value={transfer.status} onChange={val => handleStatusChange(transfer.id, val)} />
                         {transfer.templateId && (
                           <Button variant="plain" onClick={() => handleRegenerate(transfer.id)}>↺ Regenerate</Button>
                         )}

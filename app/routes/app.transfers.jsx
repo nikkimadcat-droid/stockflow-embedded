@@ -1226,8 +1226,7 @@ export default function Transfers() {
               fetcher.formData?.get("intent") === "searchProducts" &&
               fetcher.formData?.get("transferId") === transfer.id;
 
-            const canPush = transfer.status === "draft" && activeItems.length > 0;
-            const srcName = locationName(transfer.fromLocationId);
+const canPush = activeItems.length > 0;            const srcName = locationName(transfer.fromLocationId);
             const destName = locationName(transfer.toLocationId);
 
             const notFound = csvNotFound[transfer.id] ?? [];

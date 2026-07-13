@@ -1,4 +1,12 @@
-﻿// v5 - "Received" can no longer be set from the status dropdown or via a raw
+﻿// v6 - Eligibility for min/max PO generation, sales-velocity PO generation,
+// and the manual "Add item" search is now driven by the Vendor -> Supplier
+// mapping (VendorSupplier), not by whether a SupplierSku row happens to
+// exist. SupplierSku is now purely optional enrichment (cost/supplier code).
+// This closes the gap where a brand-new Shopify item — tagged with a vendor
+// that's already mapped to a supplier, with a min/max set — would silently
+// never appear on a PO because nothing had created a SupplierSku row for it.
+//
+// "Received" can no longer be set from the status dropdown or via a raw
 // updateStatus call; it can only be set by the Receive button, which also
 // runs the Shopify inventory delta adjustment. This closes the gap where a
 // PO could be marked received without ever updating on-hand stock.
@@ -104,13 +112,23 @@ function bestSkuRec(supplierSkus, variantId) {
 }
 
 async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
-  const supplierSkus = await db.supplierSku.findMany({ where: { shop, supplierId } });
-  const variantIds = supplierSkus.map((s) => s.variantId);
-  if (variantIds.length === 0) return [];
+  // Eligibility is driven by vendor -> supplier mapping (VendorSupplier),
+  // not by whether a SupplierSku row happens to exist. A brand new item
+  // just needs a min/max set + its Shopify vendor mapped to a supplier —
+  // no manual SupplierSku entry required.
   const minmaxRows = await db.minMax.findMany({
-    where: { shop, locationId, variantId: { in: variantIds } },
+    where: { shop, locationId },
   });
   if (minmaxRows.length === 0) return [];
+
+  const vendorLinks = await db.vendorSupplier.findMany({ where: { shop, supplierId } });
+  const vendorNames = new Set(vendorLinks.map((v) => v.vendorName));
+  if (vendorNames.size === 0) return [];
+
+  // SupplierSku is now optional — only used to enrich cost/supplierCode
+  // when available. A missing row no longer hides an otherwise-eligible item.
+  const supplierSkus = await db.supplierSku.findMany({ where: { shop, supplierId } });
+
   const onHandMap = {};
   let cursor = null;
   let hasMore = true;
@@ -146,10 +164,12 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
       };
     }
   }
+
   const items = [];
   for (const mm of minmaxRows) {
     const onHand = onHandMap[mm.variantId];
     if (!onHand) continue;
+    if (!vendorNames.has(onHand.vendor)) continue; // vendor not mapped to this supplier
     if (onHand.qty > mm.minLevel) continue;
     const needed = mm.maxLevel - onHand.qty;
     if (needed <= 0) continue;
@@ -172,9 +192,14 @@ async function buildMinmaxItems(admin, db, shop, supplierId, locationId) {
 }
 
 async function buildSalesItems(admin, db, shop, supplierId) {
+  // Same fix as buildMinmaxItems: eligibility comes from vendor -> supplier
+  // mapping, not from a pre-existing SupplierSku row.
+  const vendorLinks = await db.vendorSupplier.findMany({ where: { shop, supplierId } });
+  const vendorNames = new Set(vendorLinks.map((v) => v.vendorName));
+  if (vendorNames.size === 0) return [];
+
   const supplierSkus = await db.supplierSku.findMany({ where: { shop, supplierId } });
-  const variantIds = new Set(supplierSkus.map((s) => s.variantId));
-  if (variantIds.size === 0) return [];
+
   const since = new Date();
   since.setDate(since.getDate() - 30);
   const sinceStr = since.toISOString();
@@ -209,12 +234,13 @@ async function buildSalesItems(admin, db, shop, supplierId) {
       for (const li of o.node.lineItems.edges) {
         const n = li.node;
         const vid = n.variant?.id;
-        if (!vid || !variantIds.has(vid)) continue;
+        const vendor = n.variant?.product?.vendor ?? "";
+        if (!vid || !vendorNames.has(vendor)) continue;
         salesMap[vid] = salesMap[vid] ?? {
           qty: 0,
           productTitle: n.variant?.product?.title ?? "",
           variantTitle: n.variant?.title ?? "",
-          vendor: n.variant?.product?.vendor ?? "",
+          vendor,
           sku: n.variant?.sku ?? "",
         };
         salesMap[vid].qty += n.quantity;
@@ -345,6 +371,15 @@ export const action = async ({ request }) => {
     const query = form.get("query");
     const supplierId = form.get("supplierId");
     const poId = form.get("poId");
+
+    // Eligibility for the manual "Add item" search now matches PO
+    // generation: gated by vendor -> supplier mapping, not by whether a
+    // SupplierSku row already exists. SupplierSku is only used below to
+    // pre-fill cost/supplier code when available.
+    const vendorLinks = await db.vendorSupplier.findMany({ where: { shop, supplierId } });
+    const vendorNames = new Set(vendorLinks.map((v) => v.vendorName));
+    if (vendorNames.size === 0) return { ok: true, intent: "searchProducts", poId, results: [] };
+
     const supplierSkus = await db.supplierSku.findMany({
       where: { shop, supplierId },
       select: { variantId: true, supplierCode: true, cost: true },
@@ -356,7 +391,6 @@ export const action = async ({ request }) => {
         supplierSkuMap.set(s.variantId, s);
       }
     }
-    if (supplierSkuMap.size === 0) return { ok: true, intent: "searchProducts", poId, results: [] };
     const [titleRes, skuRes] = await Promise.all([
       admin.graphql(`
         query($query: String!) {
@@ -393,17 +427,18 @@ export const action = async ({ request }) => {
     const results = [];
     for (const { node: p } of titleJson.data?.products?.edges ?? []) {
       for (const { node: v } of p.variants.edges) {
-        if (seen.has(v.id) || !supplierSkuMap.has(v.id)) continue;
+        if (seen.has(v.id) || !vendorNames.has(p.vendor)) continue;
         seen.add(v.id);
         const skuRec = supplierSkuMap.get(v.id);
         results.push({ id: v.id, sku: v.sku, productTitle: p.title, variantTitle: v.title === "Default Title" ? "" : v.title, vendor: p.vendor ?? "", supplierCode: skuRec?.supplierCode ?? "", cost: skuRec?.cost ?? parseFloat(v.inventoryItem?.unitCost?.amount ?? 0) });
       }
     }
     for (const { node: v } of skuJson.data?.productVariants?.edges ?? []) {
-      if (seen.has(v.id) || !supplierSkuMap.has(v.id)) continue;
+      const vendor = v.product?.vendor ?? "";
+      if (seen.has(v.id) || !vendorNames.has(vendor)) continue;
       seen.add(v.id);
       const skuRec = supplierSkuMap.get(v.id);
-      results.push({ id: v.id, sku: v.sku, productTitle: v.product?.title ?? "", variantTitle: v.title === "Default Title" ? "" : v.title, vendor: v.product?.vendor ?? "", supplierCode: skuRec?.supplierCode ?? "", cost: skuRec?.cost ?? parseFloat(v.inventoryItem?.unitCost?.amount ?? 0) });
+      results.push({ id: v.id, sku: v.sku, productTitle: v.product?.title ?? "", variantTitle: v.title === "Default Title" ? "" : v.title, vendor, supplierCode: skuRec?.supplierCode ?? "", cost: skuRec?.cost ?? parseFloat(v.inventoryItem?.unitCost?.amount ?? 0) });
     }
     return { ok: true, intent: "searchProducts", poId, results: results.slice(0, 10) };
   }

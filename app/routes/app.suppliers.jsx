@@ -148,6 +148,11 @@ export const action = async ({ request }) => {
 
   if (intent === "add_by_vendor") {
     const supplierId = formData.get("supplierId");
+    // BUG FIX: this was previously hardcoded to "" instead of using the
+    // vendor actually selected in the UI, which meant every SupplierSku
+    // row saved here was invisible to anything grouping by real vendor
+    // name (including the Vendor Sources page below).
+    const vendorName = formData.get("vendorName") || "";
     const variants = JSON.parse(formData.get("variants"));
     for (const v of variants) {
       await prisma.supplierSku.upsert({
@@ -155,7 +160,7 @@ export const action = async ({ request }) => {
           supplierId_variantId_vendorName: {
             supplierId,
             variantId: v.id,
-            vendorName: "",
+            vendorName,
           },
         },
         update: { cost: v.cost, supplierCode: v.sku || "" },
@@ -163,12 +168,26 @@ export const action = async ({ request }) => {
           shop,
           supplierId,
           variantId: v.id,
-          vendorName: "",
+          vendorName,
           supplierCode: v.sku || "",
           cost: v.cost,
         },
       });
     }
+
+    // Also write directly to VendorSupplier — this is the table PO
+    // generation (buildMinmaxItems / buildSalesItems / searchProducts)
+    // actually checks for eligibility. Previously you'd have to separately
+    // visit Vendor Sources and click a radio button to get this row
+    // created; now "Add all SKUs from X" maps the vendor immediately.
+    if (vendorName) {
+      await prisma.vendorSupplier.upsert({
+        where: { shop_vendorName_supplierId: { shop, vendorName, supplierId } },
+        update: {},
+        create: { shop, vendorName, supplierId, isPrimary: true },
+      });
+    }
+
     return { ok: true };
   }
 
@@ -453,6 +472,7 @@ export default function Suppliers() {
     const form = new FormData();
     form.append("intent", "add_by_vendor");
     form.append("supplierId", supplierId);
+    form.append("vendorName", selectedVendor);
     form.append("variants", JSON.stringify(variants));
     fetcher.submit(form, { method: "POST" });
     setSelectedVendor("");

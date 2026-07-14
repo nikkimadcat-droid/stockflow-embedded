@@ -618,110 +618,134 @@ export default function Suppliers() {
                             {selectedVendor || "selected vendor"}
                           </Button>
 
-                          {s.skus.length > 0 && (
-                            <BlockStack gap="200">
-                              <Divider />
-                              <InlineStack align="space-between">
-                                <Text variant="headingSm">
-                                  Linked SKUs ({s.skus.length})
-                                </Text>
-                                {dirtyCount > 0 && (
-                                  <Button
-                                    variant="primary"
-                                    onClick={() => handleSaveAll(s.skus)}
-                                    loading={fetcher.state !== "idle"}
-                                  >
-                                    Save all ({dirtyCount} changed)
-                                  </Button>
-                                )}
-                              </InlineStack>
-                              <table
-                                style={{ width: "100%", borderCollapse: "collapse" }}
-                              >
-                                <thead>
-                                  <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-                                    {["SKU", "Product", "Supplier Code", "Cost", ""].map((h) => (
-                                      <th
-                                        key={h}
-                                        style={{ padding: "8px 12px", textAlign: "left" }}
-                                      >
-                                        <Text variant="headingSm">{h}</Text>
-                                      </th>
-                                    ))}
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {s.skus.map((sku) => {
-                                    const variant = variantMap[sku.variantId] ?? {};
-                                    const edits = skuEdits[sku.id] ?? {};
-                                    const isDirty = Object.keys(edits).length > 0;
-                                    return (
-                                      <tr
-                                        key={sku.id}
-                                        style={{
-                                          borderBottom: "1px solid #f1f2f3",
-                                          background: isDirty ? "#fafafa" : "transparent",
-                                        }}
-                                      >
-                                        <td style={{ padding: "8px 12px" }}>
-                                          <Text>{variant.sku || "—"}</Text>
-                                        </td>
-                                        <td style={{ padding: "8px 12px" }}>
-                                          <Text>{variant.title || "—"}</Text>
-                                        </td>
-                                        <td style={{ padding: "8px 12px", width: "150px" }}>
-                                          <TextField
-                                            label=""
-                                            labelHidden
-                                            value={edits.supplierCode ?? sku.supplierCode ?? ""}
-                                            onChange={(val) =>
-                                              handleSkuEdit(sku.id, "supplierCode", val)
-                                            }
-                                            autoComplete="off"
-                                          />
-                                        </td>
-                                        <td style={{ padding: "8px 12px", width: "160px" }}>
-                                          <TextField
-                                            label=""
-                                            labelHidden
-                                            type="number"
-                                            prefix="$"
-                                            value={String(edits.cost ?? sku.cost ?? 0)}
-                                            onChange={(val) =>
-                                              handleSkuEdit(sku.id, "cost", val)
-                                            }
-                                            autoComplete="off"
-                                          />
-                                        </td>
-                                        <td style={{ padding: "8px 12px", textAlign: "right" }}>
-                                          <Button
-                                            size="slim"
-                                            tone="critical"
-                                            onClick={() =>
-                                              handleRemoveSku(s.id, sku.variantId)
-                                            }
-                                          >
-                                            Remove
-                                          </Button>
-                                        </td>
-                                      </tr>
-                                    );
-                                  })}
-                                </tbody>
-                              </table>
-                              {dirtyCount > 0 && (
-                                <InlineStack align="end">
-                                  <Button
-                                    variant="primary"
-                                    onClick={() => handleSaveAll(s.skus)}
-                                    loading={fetcher.state !== "idle"}
-                                  >
-                                    Save all ({dirtyCount} changed)
-                                  </Button>
+                          {s.skus.length > 0 && (() => {
+                            const groups = {};
+                            for (const sku of s.skus) {
+                              const vendor = sku.vendorName?.trim() || "(no vendor set)";
+                              if (!groups[vendor]) groups[vendor] = [];
+                              groups[vendor].push(sku);
+                            }
+                            const sortedVendors = Object.keys(groups).sort((a, b) => a.localeCompare(b));
+
+                            return (
+                              <BlockStack gap="300">
+                                <Divider />
+                                <InlineStack align="space-between">
+                                  <Text variant="headingSm">
+                                    Linked SKUs ({s.skus.length})
+                                  </Text>
+                                  {dirtyCount > 0 && (
+                                    <Button
+                                      variant="primary"
+                                      onClick={() => handleSaveAll(s.skus)}
+                                      loading={fetcher.state !== "idle"}
+                                    >
+                                      Save all ({dirtyCount} changed)
+                                    </Button>
+                                  )}
                                 </InlineStack>
-                              )}
-                            </BlockStack>
-                          )}
+
+                                {sortedVendors.map((vendorName) => {
+                                  const groupSkus = groups[vendorName];
+                                  const isUnmapped = vendorName === "(no vendor set)";
+                                  return (
+                                    <BlockStack key={vendorName} gap="100">
+                                      <div style={{ background: isUnmapped ? "#fff4e5" : "#f6f6f7", padding: "6px 12px", borderRadius: "6px" }}>
+                                        <InlineStack gap="200" blockAlign="center">
+                                          <Text variant="headingSm">{vendorName}</Text>
+                                          {isUnmapped && <Badge tone="warning">Legacy — no vendor recorded</Badge>}
+                                          <Text tone="subdued" variant="bodySm">
+                                            {groupSkus.length} SKU{groupSkus.length !== 1 ? "s" : ""}
+                                          </Text>
+                                        </InlineStack>
+                                      </div>
+                                      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                                        <thead>
+                                          <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
+                                            {["SKU", "Product", "Supplier Code", "Cost", ""].map((h) => (
+                                              <th key={h} style={{ padding: "8px 12px", textAlign: "left" }}>
+                                                <Text variant="headingSm">{h}</Text>
+                                              </th>
+                                            ))}
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {groupSkus.map((sku) => {
+                                            const variant = variantMap[sku.variantId] ?? {};
+                                            const edits = skuEdits[sku.id] ?? {};
+                                            const isDirty = Object.keys(edits).length > 0;
+                                            return (
+                                              <tr
+                                                key={sku.id}
+                                                style={{
+                                                  borderBottom: "1px solid #f1f2f3",
+                                                  background: isDirty ? "#fafafa" : "transparent",
+                                                }}
+                                              >
+                                                <td style={{ padding: "8px 12px" }}>
+                                                  <Text>{variant.sku || "—"}</Text>
+                                                </td>
+                                                <td style={{ padding: "8px 12px" }}>
+                                                  <Text>{variant.title || "—"}</Text>
+                                                </td>
+                                                <td style={{ padding: "8px 12px", width: "150px" }}>
+                                                  <TextField
+                                                    label=""
+                                                    labelHidden
+                                                    value={edits.supplierCode ?? sku.supplierCode ?? ""}
+                                                    onChange={(val) =>
+                                                      handleSkuEdit(sku.id, "supplierCode", val)
+                                                    }
+                                                    autoComplete="off"
+                                                  />
+                                                </td>
+                                                <td style={{ padding: "8px 12px", width: "160px" }}>
+                                                  <TextField
+                                                    label=""
+                                                    labelHidden
+                                                    type="number"
+                                                    prefix="$"
+                                                    value={String(edits.cost ?? sku.cost ?? 0)}
+                                                    onChange={(val) =>
+                                                      handleSkuEdit(sku.id, "cost", val)
+                                                    }
+                                                    autoComplete="off"
+                                                  />
+                                                </td>
+                                                <td style={{ padding: "8px 12px", textAlign: "right" }}>
+                                                  <Button
+                                                    size="slim"
+                                                    tone="critical"
+                                                    onClick={() =>
+                                                      handleRemoveSku(s.id, sku.variantId)
+                                                    }
+                                                  >
+                                                    Remove
+                                                  </Button>
+                                                </td>
+                                              </tr>
+                                            );
+                                          })}
+                                        </tbody>
+                                      </table>
+                                    </BlockStack>
+                                  );
+                                })}
+
+                                {dirtyCount > 0 && (
+                                  <InlineStack align="end">
+                                    <Button
+                                      variant="primary"
+                                      onClick={() => handleSaveAll(s.skus)}
+                                      loading={fetcher.state !== "idle"}
+                                    >
+                                      Save all ({dirtyCount} changed)
+                                    </Button>
+                                  </InlineStack>
+                                )}
+                              </BlockStack>
+                            );
+                          })()}
                         </BlockStack>
                       )}
                     </BlockStack>

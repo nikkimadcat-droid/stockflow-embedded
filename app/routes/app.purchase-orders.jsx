@@ -944,7 +944,7 @@ export default function PurchaseOrders() {
 
     return (
       <tr key={item.id} style={{ borderBottom: "1px solid #f1f2f3" }}>
-        <td style={{ padding: "8px 12px", width: "130px" }}>
+        <td style={{ padding: "8px 12px", width: "180px" }}>
           <TextField label="" labelHidden value={supplierCode} onChange={(val) => handleItemEdit(po.id, item.id, "supplierCode", val)} autoComplete="off" placeholder="—" />
         </td>
         <td style={{ padding: "8px 12px" }}><Text>{item.productTitle}</Text></td>

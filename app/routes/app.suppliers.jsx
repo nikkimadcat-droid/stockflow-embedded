@@ -116,6 +116,7 @@ export const loader = async ({ request }) => {
           displayName: v.displayName,
           cost,
           inventoryItemId: v.inventoryItem?.id,
+          vendor: p.vendor,
         };
       }
     }
@@ -148,10 +149,6 @@ export const action = async ({ request }) => {
 
   if (intent === "add_by_vendor") {
     const supplierId = formData.get("supplierId");
-    // BUG FIX: this was previously hardcoded to "" instead of using the
-    // vendor actually selected in the UI, which meant every SupplierSku
-    // row saved here was invisible to anything grouping by real vendor
-    // name (including the Vendor Sources page below).
     const vendorName = formData.get("vendorName") || "";
     const variants = JSON.parse(formData.get("variants"));
     for (const v of variants) {
@@ -175,11 +172,43 @@ export const action = async ({ request }) => {
       });
     }
 
-    // Also write directly to VendorSupplier — this is the table PO
-    // generation (buildMinmaxItems / buildSalesItems / searchProducts)
-    // actually checks for eligibility. Previously you'd have to separately
-    // visit Vendor Sources and click a radio button to get this row
-    // created; now "Add all SKUs from X" maps the vendor immediately.
+    if (vendorName) {
+      await prisma.vendorSupplier.upsert({
+        where: { shop_vendorName_supplierId: { shop, vendorName, supplierId } },
+        update: {},
+        create: { shop, vendorName, supplierId, isPrimary: true },
+      });
+    }
+
+    return { ok: true };
+  }
+
+  if (intent === "add_single_sku") {
+    const supplierId = formData.get("supplierId");
+    const variantId = formData.get("variantId");
+    const vendorName = formData.get("vendorName") || "";
+    const sku = formData.get("sku") || "";
+    const cost = parseFloat(formData.get("cost")) || 0;
+
+    await prisma.supplierSku.upsert({
+      where: {
+        supplierId_variantId_vendorName: {
+          supplierId,
+          variantId,
+          vendorName,
+        },
+      },
+      update: { cost, supplierCode: sku },
+      create: {
+        shop,
+        supplierId,
+        variantId,
+        vendorName,
+        supplierCode: sku,
+        cost,
+      },
+    });
+
     if (vendorName) {
       await prisma.vendorSupplier.upsert({
         where: { shop_vendorName_supplierId: { shop, vendorName, supplierId } },
@@ -233,7 +262,6 @@ export const action = async ({ request }) => {
 
   if (intent === "update_skus_bulk") {
     const updates = JSON.parse(formData.get("updates"));
-    // updates: [{ id, supplierCode, cost, inventoryItemId }]
 
     for (const u of updates) {
       const cost = parseFloat(u.cost) || 0;
@@ -276,7 +304,8 @@ export const action = async ({ request }) => {
   if (intent === "remove_sku") {
     const supplierId = formData.get("supplierId");
     const variantId = formData.get("variantId");
-    await prisma.supplierSku.deleteMany({ where: { supplierId, variantId } });
+    const vendorName = formData.get("vendorName") || "";
+    await prisma.supplierSku.deleteMany({ where: { supplierId, variantId, vendorName } });
     return { ok: true };
   }
 
@@ -317,10 +346,10 @@ export default function Suppliers() {
   const [selectedVendor, setSelectedVendor] = useState("");
   const [skuEdits, setSkuEdits] = useState({});
   const [vendorSearch, setVendorSearch] = useState("");
+  const [singleSkuSearch, setSingleSkuSearch] = useState("");
 
   const saved = fetcher.state === "idle" && fetcher.data?.ok;
 
-  // ── Vendor sources view ──────────────────────────────────────────────
   if (data.view === "vendors") {
     const { vendorSupplierMap, primaryMap, supplierLookup } = data;
 
@@ -439,7 +468,6 @@ export default function Suppliers() {
     );
   }
 
-  // ── Suppliers view ───────────────────────────────────────────────────
   const { suppliers, vendorMap, variantMap } = data;
 
   const vendors = Object.keys(vendorMap).sort();
@@ -476,6 +504,18 @@ export default function Suppliers() {
     form.append("variants", JSON.stringify(variants));
     fetcher.submit(form, { method: "POST" });
     setSelectedVendor("");
+  };
+
+  const handleAddSingleSku = (supplierId, variantId, variant) => {
+    const form = new FormData();
+    form.append("intent", "add_single_sku");
+    form.append("supplierId", supplierId);
+    form.append("variantId", variantId);
+    form.append("vendorName", variant.vendor || "");
+    form.append("sku", variant.sku || "");
+    form.append("cost", variant.cost ?? 0);
+    fetcher.submit(form, { method: "POST" });
+    setSingleSkuSearch("");
   };
 
   const handleSkuEdit = (id, field, value) => {
@@ -522,7 +562,6 @@ export default function Suppliers() {
     form.append("updates", JSON.stringify(updates));
     fetcher.submit(form, { method: "POST" });
 
-    // Clear all edits for this supplier's skus
     setSkuEdits((prev) => {
       const n = { ...prev };
       dirtySkus.forEach((sku) => delete n[sku.id]);
@@ -530,11 +569,12 @@ export default function Suppliers() {
     });
   };
 
-  const handleRemoveSku = (supplierId, variantId) => {
+  const handleRemoveSku = (supplierId, variantId, vendorName) => {
     const form = new FormData();
     form.append("intent", "remove_sku");
     form.append("supplierId", supplierId);
     form.append("variantId", variantId);
+    form.append("vendorName", vendorName || "");
     fetcher.submit(form, { method: "POST" });
   };
 
@@ -617,6 +657,65 @@ export default function Suppliers() {
                             Add all SKUs from{" "}
                             {selectedVendor || "selected vendor"}
                           </Button>
+
+                          <Divider />
+                          <Text variant="headingSm">Add a single SKU</Text>
+                          <TextField
+                            label="Search by SKU or product name"
+                            labelHidden
+                            value={singleSkuSearch}
+                            onChange={setSingleSkuSearch}
+                            placeholder="Search SKU or product name..."
+                            autoComplete="off"
+                            clearButton
+                            onClearButtonClick={() => setSingleSkuSearch("")}
+                          />
+                          {singleSkuSearch.trim().length > 1 && (() => {
+                            const q = singleSkuSearch.trim().toLowerCase();
+                            const matches = Object.entries(variantMap)
+                              .filter(([, v]) => {
+                                return (
+                                  (v.sku && v.sku.toLowerCase().includes(q)) ||
+                                  (v.title && v.title.toLowerCase().includes(q)) ||
+                                  (v.displayName && v.displayName.toLowerCase().includes(q))
+                                );
+                              })
+                              .slice(0, 8);
+
+                            if (matches.length === 0) {
+                              return <Text tone="subdued">No matching products found.</Text>;
+                            }
+
+                            return (
+                              <BlockStack gap="200">
+                                {matches.map(([variantId, v]) => {
+                                  const alreadyLinked = s.skus.some(
+                                    (sku) => sku.variantId === variantId && sku.vendorName === (v.vendor || "")
+                                  );
+                                  return (
+                                    <InlineStack key={variantId} align="space-between" blockAlign="center">
+                                      <BlockStack gap="0">
+                                        <Text fontWeight="semibold">
+                                          {v.sku || "(no SKU)"} — {v.title}
+                                        </Text>
+                                        <Text tone="subdued" variant="bodySm">
+                                          {v.vendor || "no vendor set"}
+                                        </Text>
+                                      </BlockStack>
+                                      <Button
+                                        size="slim"
+                                        disabled={alreadyLinked}
+                                        onClick={() => handleAddSingleSku(s.id, variantId, v)}
+                                        loading={fetcher.state !== "idle"}
+                                      >
+                                        {alreadyLinked ? "Already added" : "Add"}
+                                      </Button>
+                                    </InlineStack>
+                                  );
+                                })}
+                              </BlockStack>
+                            );
+                          })()}
 
                           {s.skus.length > 0 && (() => {
                             const groups = {};
@@ -717,7 +816,7 @@ export default function Suppliers() {
                                                     size="slim"
                                                     tone="critical"
                                                     onClick={() =>
-                                                      handleRemoveSku(s.id, sku.variantId)
+                                                      handleRemoveSku(s.id, sku.variantId, sku.vendorName)
                                                     }
                                                   >
                                                     Remove

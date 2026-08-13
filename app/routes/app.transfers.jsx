@@ -618,9 +618,11 @@ export const action = async ({ request }) => {
     const transfer = await db.transfer.findUnique({ where: { id }, include: { items: true } });
     if (!transfer) return { ok: false };
 
-    // Guard against double-push (duplicate submit, retried request, etc.) —
-    // a transfer can only move from draft once.
-    if (transfer.status !== "draft") {
+    // Guard against double-push (duplicate submit, retried request, page
+    // refresh, etc.) — once pushedAt is set, it can never be pushed again,
+    // regardless of what the status dropdown says (status can be changed
+    // manually to "sent" independent of an actual push).
+    if (transfer.pushedAt) {
       return { ok: false, errors: ["This transfer has already been pushed to Shopify."] };
     }
 
@@ -658,7 +660,10 @@ export const action = async ({ request }) => {
     }
 
     if (errors.length > 0) return { ok: false, errors };
-    await db.transfer.update({ where: { id }, data: { status: "sent", updatedAt: new Date() } });
+    await db.transfer.update({
+      where: { id },
+      data: { status: "sent", pushedAt: new Date(), updatedAt: new Date() },
+    });
     return { ok: true, pushed: true };
   }
 
@@ -1226,7 +1231,11 @@ export default function Transfers() {
               fetcher.formData?.get("intent") === "searchProducts" &&
               fetcher.formData?.get("transferId") === transfer.id;
 
-const canPush = activeItems.length > 0;            const srcName = locationName(transfer.fromLocationId);
+            // Once pushedAt is set, this transfer can never be pushed again —
+            // regardless of what the status dropdown shows (status can be
+            // changed manually to "sent" independent of an actual push).
+            const canPush = activeItems.length > 0 && !transfer.pushedAt;
+            const srcName = locationName(transfer.fromLocationId);
             const destName = locationName(transfer.toLocationId);
 
             const notFound = csvNotFound[transfer.id] ?? [];
@@ -1279,11 +1288,15 @@ const canPush = activeItems.length > 0;            const srcName = locationName(
                         <Button variant="plain" onClick={() => downloadPickListCSV(transfer, destName, activeItems)}>
                           ↓ Pick List CSV
                         </Button>
-                        {canPush && (
+                        {transfer.pushedAt ? (
+                          <Badge tone="success">
+                            {`Pushed ${new Date(transfer.pushedAt).toLocaleDateString()}`}
+                          </Badge>
+                        ) : canPush ? (
                           <Button variant="primary" onClick={() => handlePushToShopify(transfer.id)}>
                             Push to Shopify
                           </Button>
-                        )}
+                        ) : null}
                         <Button variant="plain" onClick={() => setExpandedId(isExpanded ? null : transfer.id)}>
                           {isExpanded ? "Hide items" : "View items"}
                         </Button>

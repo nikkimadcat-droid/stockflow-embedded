@@ -1,4 +1,4 @@
-﻿import "dotenv/config";
+import "dotenv/config";
 import { PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();
@@ -112,7 +112,12 @@ async function main() {
     "gid://shopify/Collection/424681439483",
     "gid://shopify/Collection/424681537787",
     "gid://shopify/Collection/426536468731",
-  ];
+    "gid://shopify/Collection/457955246331",
+    "gid://shopify/Collection/457955213563",
+"gid://shopify/Collection/457954722043",
+    "gid://shopify/Collection/424681242875",
+    "gid://shopify/Collection/459167924475",
+  ]; 
 
   for (const collectionId of collectionIds) {
     let cursor = null;
@@ -219,5 +224,6 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
+
 
 

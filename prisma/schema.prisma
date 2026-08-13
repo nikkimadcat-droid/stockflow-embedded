@@ -138,6 +138,7 @@ model TransferTemplateVendor {
 }
 
 model Transfer {
+  pushedAt  DateTime?
   id             String            @id @default(cuid())
   shop           String
   transferNumber String

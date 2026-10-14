@@ -112,7 +112,7 @@ async function buildDistributionItems(admin, db, shop, fromLocationId, toLocatio
             pageInfo { hasNextPage endCursor }
             edges {
               node {
-                id title vendor
+                id title vendor status
                 variants(first: 100) {
                   edges { node { id sku } }
                 }
@@ -120,10 +120,11 @@ async function buildDistributionItems(admin, db, shop, fromLocationId, toLocatio
             }
           }
         }
-      `, { variables: { cursor, query: `vendor:'${vendor}'` } });
+      `, { variables: { cursor, query: `vendor:'${vendor}' AND NOT status:archived` } });
       const json = await res.json();
       const page = json.data.products;
-      products.push(...page.edges.map(e => e.node));
+      // Never pull archived products into a transfer.
+      products.push(...page.edges.map(e => e.node).filter(p => p.status !== "ARCHIVED"));
       hasMore = page.pageInfo.hasNextPage;
       cursor = page.pageInfo.endCursor;
     }
@@ -198,14 +199,15 @@ async function resolveSkusToVariants(admin, skus) {
   const chunkSize = 40; // keep the query string comfortably under Shopify's search limits
   for (let i = 0; i < skus.length; i += chunkSize) {
     const chunk = skus.slice(i, i + chunkSize);
-    const query = chunk.map(s => `sku:'${s.replace(/'/g, "\\'")}'`).join(" OR ");
+    const skuQuery = chunk.map(s => `sku:'${s.replace(/'/g, "\\'")}'`).join(" OR ");
+    const query = `(${skuQuery}) AND NOT product_status:archived`;
     const res = await graphqlWithRetry(admin, `
       query($query: String!) {
         productVariants(first: 250, query: $query) {
           edges {
             node {
               id sku title
-              product { title vendor }
+              product { title vendor status }
             }
           }
         }
@@ -214,6 +216,7 @@ async function resolveSkusToVariants(admin, skus) {
     const json = await res.json();
     for (const { node: v } of json.data?.productVariants?.edges ?? []) {
       if (!v.sku) continue;
+      if (v.product?.status === "ARCHIVED") continue; // archived SKUs show as "not found"
       variantMap[v.sku.trim().toLowerCase()] = {
         variantId: v.id,
         productTitle: v.product?.title ?? "",
@@ -487,7 +490,7 @@ export const action = async ({ request }) => {
           products(first: 10, query: $query) {
             edges {
               node {
-                title vendor
+                title vendor status
                 variants(first: 20) {
                   edges { node { id sku title } }
                 }
@@ -495,19 +498,19 @@ export const action = async ({ request }) => {
             }
           }
         }
-      `, { variables: { query: `title:*${query}*` } }),
+      `, { variables: { query: `title:*${query}* AND NOT status:archived` } }),
       graphqlWithRetry(admin, `
         query($query: String!) {
           productVariants(first: 10, query: $query) {
             edges {
               node {
                 id sku title
-                product { title vendor }
+                product { title vendor status }
               }
             }
           }
         }
-      `, { variables: { query: `sku:${query}*` } }),
+      `, { variables: { query: `sku:${query}* AND NOT product_status:archived` } }),
     ]);
 
     const [titleJson, skuJson] = await Promise.all([titleRes.json(), skuRes.json()]);
@@ -516,6 +519,7 @@ export const action = async ({ request }) => {
     const variants = [];
 
     for (const { node: p } of titleJson.data?.products?.edges ?? []) {
+      if (p.status === "ARCHIVED") continue;
       for (const { node: v } of p.variants.edges) {
         if (seen.has(v.id)) continue;
         seen.add(v.id);
@@ -524,6 +528,7 @@ export const action = async ({ request }) => {
     }
 
     for (const { node: v } of skuJson.data?.productVariants?.edges ?? []) {
+      if (v.product?.status === "ARCHIVED") continue;
       if (seen.has(v.id)) continue;
       seen.add(v.id);
       variants.push({ id: v.id, sku: v.sku, productTitle: v.product?.title ?? "", variantTitle: v.title === "Default Title" ? "" : v.title, vendor: v.product?.vendor ?? "" });

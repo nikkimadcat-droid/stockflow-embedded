@@ -57,10 +57,14 @@ export const action = async ({ request }) => {
         },
       });
       if (cached) {
+        const cachedRows = Array.isArray(cached.rows) ? cached.rows : [];
+        // Rebuild type + vendor lists from the cached rows so dropdowns always fill
+        const cachedTypes = [...new Set(cachedRows.map(r => r.productType).filter(Boolean))].sort();
+        const cachedVendors = [...new Set(cachedRows.map(r => r.vendor).filter(Boolean))].sort();
         return {
-          rows: cached.rows,
-          productTypes: cached.productTypes,
-          vendors: cached.vendors ?? [],
+          rows: cachedRows,
+          productTypes: cachedTypes,
+          vendors: cachedVendors,
           lowCount: cached.lowCount,
           avgST: cached.avgST,
           totalUnits: cached.totalUnits,
@@ -227,12 +231,9 @@ export const action = async ({ request }) => {
   const productTypes = [...new Set(rows.map(r => r.productType).filter(Boolean))].sort();
   const vendors = [...new Set(rows.map(r => r.vendor).filter(Boolean))].sort();
   const lowCount = rows.filter(r => r.isBelowMin || r.isOutOfStock).length;
-  const avgST = rows.filter(r => r.sellThrough !== null).length > 0
-    ? Math.round(
-        rows.filter(r => r.sellThrough !== null)
-          .reduce((s, r) => s + r.sellThrough, 0) /
-        rows.filter(r => r.sellThrough !== null).length
-      )
+  const withST = rows.filter(r => r.sellThrough !== null);
+  const avgST = withST.length > 0
+    ? Math.round(withST.reduce((s, r) => s + r.sellThrough, 0) / withST.length)
     : null;
   const totalUnits = rows.reduce((s, r) => s + r.unitsSold, 0);
 
@@ -260,27 +261,33 @@ export default function Index() {
   const [search, setSearch] = useState("");
   const [savedTypes, setSavedTypes] = useState([]);
   const [savedVendors, setSavedVendors] = useState([]);
+  const [copyMsg, setCopyMsg] = useState("");
 
+  // Merge new types/vendors into the dropdown lists instead of replacing them,
+  // so a filtered run doesn't shrink the list down to one option
   useEffect(() => {
-    if (fetcher.data?.productTypes?.length > 0) {
-      setSavedTypes(fetcher.data.productTypes);
+    const t = fetcher.data?.productTypes ?? [];
+    const v = fetcher.data?.vendors ?? [];
+    if (t.length > 0) {
+      setSavedTypes(prev => [...new Set([...prev, ...t])].sort());
     }
-    if (fetcher.data?.vendors?.length > 0) {
-      setSavedVendors(fetcher.data.vendors);
+    if (v.length > 0) {
+      setSavedVendors(prev => [...new Set([...prev, ...v])].sort());
     }
   }, [fetcher.data]);
 
   const isLoading = fetcher.state !== "idle";
   const result = fetcher.data;
   const rows = result?.rows ?? [];
+  const listsLoaded = savedTypes.length > 0 || savedVendors.length > 0;
 
   const locationOptions = locations.map(l => ({ label: l.name, value: l.id }));
   const typeOptions = [
-    { label: "All product types", value: "" },
+    { label: listsLoaded ? "All product types" : "All (run once to load list)", value: "" },
     ...savedTypes.map(t => ({ label: t, value: t })),
   ];
   const vendorOptions = [
-    { label: "All vendors", value: "" },
+    { label: listsLoaded ? "All vendors" : "All (run once to load list)", value: "" },
     ...savedVendors.map(v => ({ label: v, value: v })),
   ];
   const dayOptions = [
@@ -305,11 +312,87 @@ export default function Index() {
     if (!search) return true;
     const q = search.toLowerCase();
     return (
-      r.sku.toLowerCase().includes(q) ||
-      r.productTitle.toLowerCase().includes(q) ||
-      r.vendor.toLowerCase().includes(q)
+      (r.sku || "").toLowerCase().includes(q) ||
+      (r.productTitle || "").toLowerCase().includes(q) ||
+      (r.vendor || "").toLowerCase().includes(q)
     );
   });
+
+  // ---------- Export helpers ----------
+  function statusText(r) {
+    if (r.isOutOfStock) return "Out of stock";
+    if (r.isBelowMin) return `Low - min ${r.minLevel}`;
+    return "OK";
+  }
+
+  function buildTable(sep) {
+    const header = ["SKU", "Product", "Variant", "Vendor", "Type", "On hand",
+      `Sold (${result?.days ?? days}d)`, "Sell-through %", "Status"];
+    const clean = (val) => {
+      const s = val === null || val === undefined ? "" : String(val);
+      if (sep === ",") {
+        return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      }
+      return s.replace(/[\t\n]/g, " ");
+    };
+    const lines = [header.map(clean).join(sep)];
+    for (const r of filtered) {
+      lines.push([
+        r.sku, r.productTitle, r.variantTitle, r.vendor, r.productType,
+        r.onHand, r.unitsSold, r.sellThrough ?? "", statusText(r),
+      ].map(clean).join(sep));
+    }
+    return lines.join("\n");
+  }
+
+  function fileName() {
+    const loc = locations.find(l => l.id === locationId)?.name ?? "location";
+    const parts = [loc, productType, vendor, `${result?.days ?? days}d`]
+      .filter(Boolean)
+      .map(p => p.replace(/[^a-z0-9]+/gi, "-"));
+    return `sell-through_${parts.join("_")}.csv`;
+  }
+
+  function handleDownload() {
+    try {
+      const blob = new Blob([buildTable(",")], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName();
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) {
+      setCopyMsg("Download blocked — use Copy table instead");
+    }
+  }
+
+  async function handleCopy() {
+    const text = buildTable("\t");
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyMsg(`Copied ${filtered.length} rows`);
+    } catch (e) {
+      // Fallback for when the Shopify frame blocks the clipboard API
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        setCopyMsg(`Copied ${filtered.length} rows`);
+      } catch (e2) {
+        setCopyMsg("Copy failed");
+      }
+      document.body.removeChild(ta);
+    }
+    setTimeout(() => setCopyMsg(""), 4000);
+  }
+  // ------------------------------------
 
   function stBadge(pct) {
     if (pct === null) return <Badge tone="info">No sales</Badge>;
@@ -429,7 +512,8 @@ export default function Index() {
               </InlineStack>
               {!result && (
                 <Text tone="subdued" variant="bodySm">
-                  Filter by location, product type, vendor, or any combination. Results cache for 4 hours.
+                  Run once with everything set to "All" to load the product type and vendor lists,
+                  then narrow down. Results cache for 4 hours.
                 </Text>
               )}
             </BlockStack>
@@ -503,13 +587,22 @@ export default function Index() {
             <Layout.Section>
               <Card>
                 <BlockStack gap="400">
-                  <TextField
-                    label="" labelHidden
-                    placeholder="Filter by SKU, product, or vendor…"
-                    value={search} onChange={setSearch}
-                    clearButton onClearButtonClick={() => setSearch("")}
-                    autoComplete="off"
-                  />
+                  <InlineStack gap="300" blockAlign="center" wrap={false}>
+                    <Box width="100%">
+                      <TextField
+                        label="" labelHidden
+                        placeholder="Filter by SKU, product, or vendor…"
+                        value={search} onChange={setSearch}
+                        clearButton onClearButtonClick={() => setSearch("")}
+                        autoComplete="off"
+                      />
+                    </Box>
+                    <Button onClick={handleDownload}>Download CSV</Button>
+                    <Button onClick={handleCopy}>Copy table</Button>
+                  </InlineStack>
+                  {copyMsg && (
+                    <Text tone="subdued" variant="bodySm">{copyMsg}</Text>
+                  )}
                   <Divider />
                   <DataTable
                     columnContentTypes={["text","text","text","numeric","numeric","text","text"]}

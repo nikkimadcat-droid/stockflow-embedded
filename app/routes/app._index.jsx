@@ -8,6 +8,36 @@ import {
   DataTable, TextField, Divider, Box,
 } from "@shopify/polaris";
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// GraphQL helper: retries when Shopify throttles, surfaces real errors
+async function gql(admin, query, variables = {}) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await admin.graphql(query, { variables });
+      const json = await res.json();
+      const errs = Array.isArray(json.errors) ? json.errors : [];
+      const throttled = errs.some(e => e?.extensions?.code === "THROTTLED");
+      if (throttled) {
+        await sleep(1500 * (attempt + 1));
+        continue;
+      }
+      if (!json.data && json.errors) {
+        throw new Error(JSON.stringify(json.errors).slice(0, 300));
+      }
+      return json;
+    } catch (e) {
+      lastErr = e;
+      await sleep(1500 * (attempt + 1));
+    }
+  }
+  throw lastErr ?? new Error("Shopify request failed after retries");
+}
+
+// Escape apostrophes for Shopify search syntax (e.g. Stella & Chewy's)
+const esc = (s) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
 
@@ -48,206 +78,172 @@ export const action = async ({ request }) => {
   const forceRefresh = form.get("forceRefresh") === "true";
   const cacheKey = `${locationGid}__${productType}__${vendor}__${days}`;
 
-  if (!forceRefresh) {
-    try {
-      const cached = await db.snapshotCache.findFirst({
-        where: {
-          cacheKey,
-          createdAt: { gt: new Date(Date.now() - 4 * 60 * 60 * 1000) },
-        },
-      });
-      if (cached) {
-        const cachedRows = Array.isArray(cached.rows) ? cached.rows : [];
-        // Rebuild type + vendor lists from the cached rows so dropdowns always fill
-        const cachedTypes = [...new Set(cachedRows.map(r => r.productType).filter(Boolean))].sort();
-        const cachedVendors = [...new Set(cachedRows.map(r => r.vendor).filter(Boolean))].sort();
-        return {
-          rows: cachedRows,
-          productTypes: cachedTypes,
-          vendors: cachedVendors,
-          lowCount: cached.lowCount,
-          avgST: cached.avgST,
-          totalUnits: cached.totalUnits,
-          days,
-          fromCache: true,
-          cachedAt: cached.createdAt,
-        };
-      }
-    } catch (e) {}
-  }
-
-  const since = new Date();
-  since.setDate(since.getDate() - days);
-  const sinceStr = since.toISOString();
-
-  // Build query clause — AND logic when both set
-  let queryParts = [];
-  if (productType) queryParts.push(`product_type:'${productType}'`);
-  if (vendor) queryParts.push(`vendor:'${vendor}'`);
-  const typeClause = queryParts.length > 0 ? queryParts.join(" AND ") : null;
-
-  let products = [];
-  let cursor = null;
-  let hasNext = true;
-
-  while (hasNext) {
-    const res = await admin.graphql(`
-      query($cursor: String, $query: String) {
-        products(first: 50, after: $cursor, query: $query) {
-          pageInfo { hasNextPage endCursor }
-          edges {
-            node {
-              id title vendor productType
-              variants(first: 50) {
-                edges { node { id sku title inventoryItem { id } } }
-              }
-            }
-          }
-        }
-      }
-    `, { variables: { cursor, query: typeClause } });
-
-    const json = await res.json();
-    const page = json.data?.products;
-    hasNext = page?.pageInfo?.hasNextPage ?? false;
-    cursor = page?.pageInfo?.endCursor ?? null;
-    products = products.concat(page?.edges?.map(e => e.node) ?? []);
-  }
-
-  const variantMap = {};
-  const inventoryItemIds = [];
-  for (const p of products) {
-    for (const ve of p.variants.edges) {
-      const v = ve.node;
-      variantMap[v.id] = {
-        sku: v.sku,
-        productTitle: p.title,
-        variantTitle: v.title === "Default Title" ? "" : v.title,
-        vendor: p.vendor,
-        productType: p.productType,
-        inventoryItemId: v.inventoryItem?.id,
-      };
-      if (v.inventoryItem?.id) inventoryItemIds.push(v.inventoryItem.id);
-    }
-  }
-
-  const onHandMap = {};
-  for (let i = 0; i < inventoryItemIds.length; i += 50) {
-    const batch = inventoryItemIds.slice(i, i + 50);
-    const idsQuery = batch.map(id => `id:${id.split("/").pop()}`).join(" OR ");
-    const res = await admin.graphql(`
-      query($ids: String!, $locationId: ID!) {
-        inventoryItems(first: 50, query: $ids) {
-          edges {
-            node {
-              id
-              inventoryLevel(locationId: $locationId) {
-                quantities(names: ["available"]) { name quantity }
-              }
-            }
-          }
-        }
-      }
-    `, { variables: { ids: idsQuery, locationId: locationGid } });
-
-    const json = await res.json();
-    for (const e of json.data?.inventoryItems?.edges ?? []) {
-      const qty = e.node.inventoryLevel?.quantities
-        ?.find(q => q.name === "available")?.quantity ?? 0;
-      onHandMap[e.node.id] = qty;
-    }
-  }
-
-  const soldMap = {};
-  const locationNumericId = locationGid.split("/").pop();
-  const orderQuery = `created_at:>${sinceStr} location_id:${locationNumericId}`;
-  let oCursor = null;
-  let oHasNext = true;
-
-  while (oHasNext) {
-    const res = await admin.graphql(`
-      query($cursor: String, $query: String!) {
-        orders(first: 50, after: $cursor, query: $query) {
-          pageInfo { hasNextPage endCursor }
-          edges {
-            node {
-              lineItems(first: 100) {
-                edges { node { quantity variant { id } } }
-              }
-            }
-          }
-        }
-      }
-    `, { variables: { cursor: oCursor, query: orderQuery } });
-
-    const json = await res.json();
-    const page = json.data?.orders;
-    oHasNext = page?.pageInfo?.hasNextPage ?? false;
-    oCursor = page?.pageInfo?.endCursor ?? null;
-
-    for (const o of page?.edges ?? []) {
-      for (const li of o.node.lineItems.edges) {
-        const vid = li.node.variant?.id;
-        if (!vid) continue;
-        soldMap[vid] = (soldMap[vid] ?? 0) + li.node.quantity;
-      }
-    }
-  }
-
-  const minMaxRecords = await db.minMax.findMany();
-  const minMaxMap = {};
-  for (const r of minMaxRecords) {
-    minMaxMap[`${r.variantId}__${r.locationId}`] = r.minLevel;
-  }
-
-  const rows = [];
-  for (const [variantId, info] of Object.entries(variantMap)) {
-    const onHand = onHandMap[info.inventoryItemId] ?? 0;
-    const unitsSold = soldMap[variantId] ?? 0;
-    const total = onHand + unitsSold;
-    const sellThrough = total > 0 ? Math.round((unitsSold / total) * 100) : null;
-    const minKey = `${variantId}__${locationGid}`;
-    const minLevel = minMaxMap[minKey] ?? null;
-    const isBelowMin = minLevel !== null && onHand < minLevel;
-    const isOutOfStock = onHand <= 0 && unitsSold > 0;
-
-    rows.push({
-      variantId, sku: info.sku || "—",
-      productTitle: info.productTitle,
-      variantTitle: info.variantTitle,
-      vendor: info.vendor,
-      productType: info.productType,
-      onHand, unitsSold, sellThrough,
-      isBelowMin, isOutOfStock, minLevel,
-    });
-  }
-
-  rows.sort((a, b) => {
-    if (a.isOutOfStock !== b.isOutOfStock) return a.isOutOfStock ? -1 : 1;
-    if (a.isBelowMin !== b.isBelowMin) return a.isBelowMin ? -1 : 1;
-    return (b.sellThrough ?? -1) - (a.sellThrough ?? -1);
-  });
-
-  const productTypes = [...new Set(rows.map(r => r.productType).filter(Boolean))].sort();
-  const vendors = [...new Set(rows.map(r => r.vendor).filter(Boolean))].sort();
-  const lowCount = rows.filter(r => r.isBelowMin || r.isOutOfStock).length;
-  const withST = rows.filter(r => r.sellThrough !== null);
-  const avgST = withST.length > 0
-    ? Math.round(withST.reduce((s, r) => s + r.sellThrough, 0) / withST.length)
-    : null;
-  const totalUnits = rows.reduce((s, r) => s + r.unitsSold, 0);
-
   try {
-    await db.snapshotCache.upsert({
-      where: { cacheKey },
-      update: { rows, lowCount, avgST, totalUnits, productTypes, createdAt: new Date() },
-      create: { cacheKey, rows, lowCount, avgST, totalUnits, productTypes },
-    });
-  } catch (e) {
-    console.error("Cache write failed:", e);
-  }
+    if (!forceRefresh) {
+      try {
+        const cached = await db.snapshotCache.findFirst({
+          where: {
+            cacheKey,
+            createdAt: { gt: new Date(Date.now() - 4 * 60 * 60 * 1000) },
+          },
+        });
+        if (cached) {
+          const cachedRows = Array.isArray(cached.rows) ? cached.rows : [];
+          const cachedTypes = [...new Set(cachedRows.map(r => r.productType).filter(Boolean))].sort();
+          const cachedVendors = [...new Set(cachedRows.map(r => r.vendor).filter(Boolean))].sort();
+          return {
+            rows: cachedRows,
+            productTypes: cachedTypes,
+            vendors: cachedVendors,
+            lowCount: cached.lowCount,
+            avgST: cached.avgST,
+            totalUnits: cached.totalUnits,
+            days,
+            fromCache: true,
+            cachedAt: cached.createdAt,
+          };
+        }
+      } catch (e) {}
+    }
 
-  return { rows, lowCount, avgST, totalUnits, productTypes, vendors, days, fromCache: false };
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+    const sinceStr = since.toISOString();
+
+    // Build filter clause — AND logic when both set
+    const queryParts = [];
+    if (productType) queryParts.push(`product_type:'${esc(productType)}'`);
+    if (vendor) queryParts.push(`vendor:'${esc(vendor)}'`);
+    const typeClause = queryParts.length > 0 ? queryParts.join(" AND ") : null;
+
+    // ONE pass: variants + product info + stock at this location
+    const rowsBase = [];
+    let cursor = null;
+    let hasNext = true;
+
+    while (hasNext) {
+      const json = await gql(admin, `
+        query($cursor: String, $query: String, $locationId: ID!) {
+          productVariants(first: 100, after: $cursor, query: $query) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                id sku title
+                product { title vendor productType }
+                inventoryItem {
+                  id
+                  inventoryLevel(locationId: $locationId) {
+                    quantities(names: ["available"]) { name quantity }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `, { cursor, query: typeClause, locationId: locationGid });
+
+      const page = json.data?.productVariants;
+      hasNext = page?.pageInfo?.hasNextPage ?? false;
+      cursor = page?.pageInfo?.endCursor ?? null;
+
+      for (const e of page?.edges ?? []) {
+        const v = e.node;
+        const onHand = v.inventoryItem?.inventoryLevel?.quantities
+          ?.find(q => q.name === "available")?.quantity ?? 0;
+        rowsBase.push({
+          variantId: v.id,
+          sku: v.sku || "—",
+          productTitle: v.product?.title ?? "",
+          variantTitle: v.title === "Default Title" ? "" : v.title,
+          vendor: v.product?.vendor ?? "",
+          productType: v.product?.productType ?? "",
+          onHand,
+        });
+      }
+    }
+
+    // Sales at this location in the period
+    const soldMap = {};
+    const locationNumericId = locationGid.split("/").pop();
+    const orderQuery = `created_at:>${sinceStr} location_id:${locationNumericId}`;
+    let oCursor = null;
+    let oHasNext = true;
+
+    while (oHasNext) {
+      const json = await gql(admin, `
+        query($cursor: String, $query: String!) {
+          orders(first: 50, after: $cursor, query: $query) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                lineItems(first: 100) {
+                  edges { node { quantity variant { id } } }
+                }
+              }
+            }
+          }
+        }
+      `, { cursor: oCursor, query: orderQuery });
+
+      const page = json.data?.orders;
+      oHasNext = page?.pageInfo?.hasNextPage ?? false;
+      oCursor = page?.pageInfo?.endCursor ?? null;
+
+      for (const o of page?.edges ?? []) {
+        for (const li of o.node.lineItems.edges) {
+          const vid = li.node.variant?.id;
+          if (!vid) continue;
+          soldMap[vid] = (soldMap[vid] ?? 0) + li.node.quantity;
+        }
+      }
+    }
+
+    const minMaxRecords = await db.minMax.findMany();
+    const minMaxMap = {};
+    for (const r of minMaxRecords) {
+      minMaxMap[`${r.variantId}__${r.locationId}`] = r.minLevel;
+    }
+
+    const rows = rowsBase.map(r => {
+      const unitsSold = soldMap[r.variantId] ?? 0;
+      const total = r.onHand + unitsSold;
+      const sellThrough = total > 0 ? Math.round((unitsSold / total) * 100) : null;
+      const minLevel = minMaxMap[`${r.variantId}__${locationGid}`] ?? null;
+      const isBelowMin = minLevel !== null && r.onHand < minLevel;
+      const isOutOfStock = r.onHand <= 0 && unitsSold > 0;
+      return { ...r, unitsSold, sellThrough, isBelowMin, isOutOfStock, minLevel };
+    });
+
+    rows.sort((a, b) => {
+      if (a.isOutOfStock !== b.isOutOfStock) return a.isOutOfStock ? -1 : 1;
+      if (a.isBelowMin !== b.isBelowMin) return a.isBelowMin ? -1 : 1;
+      return (b.sellThrough ?? -1) - (a.sellThrough ?? -1);
+    });
+
+    const productTypes = [...new Set(rows.map(r => r.productType).filter(Boolean))].sort();
+    const vendors = [...new Set(rows.map(r => r.vendor).filter(Boolean))].sort();
+    const lowCount = rows.filter(r => r.isBelowMin || r.isOutOfStock).length;
+    const withST = rows.filter(r => r.sellThrough !== null);
+    const avgST = withST.length > 0
+      ? Math.round(withST.reduce((s, r) => s + r.sellThrough, 0) / withST.length)
+      : null;
+    const totalUnits = rows.reduce((s, r) => s + r.unitsSold, 0);
+
+    try {
+      await db.snapshotCache.upsert({
+        where: { cacheKey },
+        update: { rows, lowCount, avgST, totalUnits, productTypes, createdAt: new Date() },
+        create: { cacheKey, rows, lowCount, avgST, totalUnits, productTypes },
+      });
+    } catch (e) {
+      console.error("Cache write failed:", e);
+    }
+
+    return { rows, lowCount, avgST, totalUnits, productTypes, vendors, days, fromCache: false };
+  } catch (e) {
+    console.error("Snapshot failed:", e);
+    return { error: e?.message || String(e) };
+  }
 };
 
 export default function Index() {
@@ -263,8 +259,7 @@ export default function Index() {
   const [savedVendors, setSavedVendors] = useState([]);
   const [copyMsg, setCopyMsg] = useState("");
 
-  // Merge new types/vendors into the dropdown lists instead of replacing them,
-  // so a filtered run doesn't shrink the list down to one option
+  // Merge new types/vendors into the dropdown lists instead of replacing them
   useEffect(() => {
     const t = fetcher.data?.productTypes ?? [];
     const v = fetcher.data?.vendors ?? [];
@@ -278,6 +273,7 @@ export default function Index() {
 
   const isLoading = fetcher.state !== "idle";
   const result = fetcher.data;
+  const errorMsg = result?.error ?? null;
   const rows = result?.rows ?? [];
   const listsLoaded = savedTypes.length > 0 || savedVendors.length > 0;
 
@@ -375,7 +371,6 @@ export default function Index() {
       await navigator.clipboard.writeText(text);
       setCopyMsg(`Copied ${filtered.length} rows`);
     } catch (e) {
-      // Fallback for when the Shopify frame blocks the clipboard API
       const ta = document.createElement("textarea");
       ta.value = text;
       ta.style.position = "fixed";
@@ -520,6 +515,14 @@ export default function Index() {
           </Card>
         </Layout.Section>
 
+        {errorMsg && !isLoading && (
+          <Layout.Section>
+            <Banner title="Snapshot failed" tone="critical">
+              <Text>{errorMsg}</Text>
+            </Banner>
+          </Layout.Section>
+        )}
+
         {isLoading && (
           <Layout.Section>
             <Card>
@@ -533,7 +536,7 @@ export default function Index() {
           </Layout.Section>
         )}
 
-        {!isLoading && rows.length > 0 && (
+        {!isLoading && !errorMsg && rows.length > 0 && (
           <>
             <Layout.Section>
               <InlineGrid columns={4} gap="400">
@@ -621,7 +624,7 @@ export default function Index() {
           </>
         )}
 
-        {!isLoading && result && rows.length === 0 && (
+        {!isLoading && result && !errorMsg && rows.length === 0 && (
           <Layout.Section>
             <Card>
               <Text tone="subdued">

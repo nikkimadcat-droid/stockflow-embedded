@@ -269,11 +269,61 @@ export const action = async ({ request }) => {
       : `gid://shopify/Location/${locationId}`;
     const adjustments = JSON.parse(form.get("adjustments"));
 
-    const changes = adjustments.map(a => ({
-      inventoryItemId: a.inventoryItemId,
-      locationId: locationIdGid,
-      quantity: Number(a.counted),
-    }));
+    // Step 1: find items that aren't stocked at this location in Shopify
+    const itemIds = [...new Set(adjustments.map(a => a.inventoryItemId).filter(Boolean))];
+    const notStocked = [];
+
+    for (let i = 0; i < itemIds.length; i += 100) {
+      const chunk = itemIds.slice(i, i + 100);
+      const res = await admin.graphql(`
+        query($ids: [ID!]!, $locationId: ID!) {
+          nodes(ids: $ids) {
+            ... on InventoryItem {
+              id
+              inventoryLevel(locationId: $locationId) { id }
+            }
+          }
+        }
+      `, { variables: { ids: chunk, locationId: locationIdGid } });
+      const json = await res.json();
+      for (const n of json.data?.nodes ?? []) {
+        if (n && !n.inventoryLevel) notStocked.push(n.id);
+      }
+    }
+
+    // Step 2: turn those items on at this location
+    const activateErrors = [];
+    let activated = 0;
+    for (const inventoryItemId of notStocked) {
+      const res = await admin.graphql(`
+        mutation($inventoryItemId: ID!, $locationId: ID!) {
+          inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId) {
+            inventoryLevel { id }
+            userErrors { field message }
+          }
+        }
+      `, { variables: { inventoryItemId, locationId: locationIdGid } });
+      const json = await res.json();
+      const errs = json.data?.inventoryActivate?.userErrors ?? [];
+      if (errs.length > 0) {
+        activateErrors.push(...errs.map(e => ({ ...e, message: `Couldn't stock item at location: ${e.message}` })));
+      } else {
+        activated += 1;
+      }
+    }
+
+    if (activateErrors.length > 0) {
+      return { ok: false, intent, errors: activateErrors };
+    }
+
+    // Step 3: set the counted quantities
+    const changes = adjustments
+      .filter(a => a.inventoryItemId)
+      .map(a => ({
+        inventoryItemId: a.inventoryItemId,
+        locationId: locationIdGid,
+        quantity: Number(a.counted),
+      }));
 
     const res = await admin.graphql(`
       mutation($input: InventorySetOnHandQuantitiesInput!) {
@@ -293,8 +343,8 @@ export const action = async ({ request }) => {
 
     const json = await res.json();
     const errors = json.data?.inventorySetOnHandQuantities?.userErrors ?? [];
-    if (errors.length > 0) return { ok: false, intent, errors };
-    return { ok: true, intent, pushed: true };
+    if (errors.length > 0) return { ok: false, intent, errors, activated };
+    return { ok: true, intent, pushed: true, activated };
   }
 
   if (intent === "saveStocktake" || intent === "autoSaveStocktake") {
@@ -667,6 +717,7 @@ export default function Stocktake() {
   ).length;
 
   const pushed = fetcher.data?.intent === "pushAdjustments" && fetcher.data?.pushed;
+  const pushActivated = fetcher.data?.intent === "pushAdjustments" ? (fetcher.data?.activated ?? 0) : 0;
   const pushErrors = fetcher.data?.intent === "pushAdjustments" ? fetcher.data?.errors : null;
   const saved = fetcher.data?.intent === "saveStocktake" && fetcher.data?.saved;
   const isFetchingInventory = isSubmitting && fetcher.formData?.get("intent") === "fetchInventory";
@@ -722,7 +773,10 @@ export default function Stocktake() {
             )}
             {pushed && (
               <div className="no-print" style={{ marginBottom: "1rem" }}>
-                <Banner tone="success">Inventory updated in Shopify successfully.</Banner>
+                <Banner tone="success">
+                  Inventory updated in Shopify successfully.
+                  {pushActivated > 0 ? ` ${pushActivated} item(s) weren't stocked at this location yet and were turned on first.` : ""}
+                </Banner>
               </div>
             )}
             {pushErrors?.length > 0 && (
